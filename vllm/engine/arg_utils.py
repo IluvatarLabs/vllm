@@ -933,6 +933,34 @@ class EngineArgs:
         vllm_group.add_argument('--structured-outputs-config',
                                 **vllm_kwargs["structured_outputs_config"])
 
+        # SCV and NWOR optimization flags
+        vllm_group.add_argument(
+            '--scv-enabled',
+            action='store_true',
+            help='Enable SCV (Speculative Chunk Verify) optimization'
+        )
+        vllm_group.add_argument(
+            '--verify-chunk-size',
+            type=int,
+            default=4,
+            help='Chunk size for SCV verification (default: 4)'
+        )
+        vllm_group.add_argument(
+            '--use-shadow-kv',
+            action='store_true',
+            help='Enable NWOR (No-Write-On-Reject) optimization via ShadowKV'
+        )
+        vllm_group.add_argument(
+            '--enable-nvtx-ranges',
+            action='store_true',
+            help='Enable NVTX profiling ranges for Nsight analysis'
+        )
+        vllm_group.add_argument(
+            '--debug-alloc-counters',
+            action='store_true',
+            help='Enable debug allocator counters for memory analysis'
+        )
+
         # Other arguments
         parser.add_argument('--disable-log-stats',
                             action='store_true',

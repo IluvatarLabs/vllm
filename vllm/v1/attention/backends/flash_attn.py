@@ -18,6 +18,11 @@ from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
                                            get_flash_attn_version,
                                            is_flash_attn_varlen_func_available)
 
+# NWOR imports
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache.write_router import KVWriteRouter
+
 if is_flash_attn_varlen_func_available():
     from vllm.attention.utils.fa_utils import (flash_attn_varlen_func,
                                                get_scheduler_metadata,
@@ -429,6 +434,8 @@ class FlashAttentionImpl(AttentionImpl):
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
+        kv_router: Optional["KVWriteRouter"] = None,  # NWOR addition
+        layer_idx: Optional[int] = None,  # NWOR addition
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -494,13 +501,28 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
+
+            # NWOR: Route KV writes through router if provided
+            if kv_router is not None and layer_idx is not None:
+                # Route through KV router (may stage in ShadowKV)
+                num_tokens = attn_metadata.slot_mapping.shape[0]
+                slot_mapping = attn_metadata.slot_mapping
+                for t in range(num_tokens):
+                    # Extract single token KV slice and its slot mapping
+                    k_slice = key[t:t+1]
+                    v_slice = value[t:t+1]
+                    slot_mapping_1t = slot_mapping[t] if slot_mapping.ndim > 1 else slot_mapping[t:t+1]
+                    # Route write (immediate or deferred based on router mode)
+                    kv_router.write(layer_idx, t, k_slice, v_slice, slot_mapping_1t)
+            else:
+                # Original direct write path
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,
             )
