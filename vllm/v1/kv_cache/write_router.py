@@ -1,11 +1,11 @@
 """
-KV Write Router for vLLM v0.10.2 - NWOR Implementation
+KV Write Router for vLLM v0.11+ - NWOR Implementation
 Routes KV cache writes through ShadowKV during speculative verification
 """
 
 from typing import Optional
 import torch
-from vllm._C import cache_ops  # v0.10.2 cache operations
+import vllm._custom_ops as ops  # reshape_and_cache_flash is here
 
 
 class PersistentKVWriter:
@@ -49,8 +49,8 @@ class PersistentKVWriter:
         # Get layer KV cache tensors
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
 
-        # Call the fused cache writer used by flash-attn backends in v0.10.2
-        cache_ops.reshape_and_cache_flash(
+        # Call the fused cache writer used by flash-attn backends
+        ops.reshape_and_cache_flash(
             k_slice,
             v_slice,
             key_cache,
@@ -74,7 +74,7 @@ class PersistentKVWriter:
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
 
         # Bulk write using the same op
-        cache_ops.reshape_and_cache_flash(
+        ops.reshape_and_cache_flash(
             K_run,
             V_run,
             key_cache,
