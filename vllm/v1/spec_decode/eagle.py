@@ -32,6 +32,12 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+# SCV and NWOR imports
+from contextlib import nullcontext
+from vllm.v1.spec_decode.config import SpecDecodeOptConfig
+from vllm.v1.kv_cache.shadow_kv import ShadowKV
+from vllm.v1.kv_cache.write_router import KVWriteRouter, PersistentKVWriter
+
 logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
@@ -156,6 +162,40 @@ class EagleProposer:
             device=device,
             dtype=torch.int32,
         ).repeat(max_batch_size, 1)
+
+        # Initialize SCV/NWOR optimizations
+        self.opt_config = SpecDecodeOptConfig.from_cli_args(vllm_config)
+
+        # Initialize NWOR components if enabled
+        self.shadow_kv = None
+        self.kv_router = None
+        if self.opt_config.use_shadow_kv:
+            # Get model dimensions for ShadowKV
+            model_config = vllm_config.model_config
+            n_layers = model_config.num_hidden_layers
+            n_heads = model_config.num_key_value_heads or model_config.num_attention_heads
+            head_dim = model_config.hidden_size // model_config.num_attention_heads
+
+            # Create ShadowKV staging buffer
+            self.shadow_kv = ShadowKV(
+                n_layers=n_layers,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                max_chunk=max(16, vllm_config.speculative_config.num_speculative_tokens),
+                device="cuda",
+                dtype=torch.float16,
+            )
+
+            # KV writer will be initialized when load_model is called
+            # and we have access to the target model's KV cache
+            self.kv_writer = None
+            self.kv_router = None
+
+            logger.info("NWOR/ShadowKV enabled with %d layers, %d heads, %d head_dim",
+                       n_layers, n_heads, head_dim)
+
+        # Enable NVTX ranges if requested
+        self.nvtx_enabled = self.opt_config.enable_nvtx_ranges
 
     def propose(
         self,
