@@ -195,13 +195,9 @@ class ShadowKV:
             accepted_len, rejected
         )
 
-    @property
-    def memory_saved_mb(self) -> float:
-        """Estimate memory bandwidth saved by not writing rejected tokens."""
-        # Assume 2 bytes per element (fp16), K and V
-        bytes_per_token = 2 * self.n_heads * self.head_dim * 2  # K and V
-        bytes_saved = self._total_rejected * bytes_per_token * self.n_layers
-        return bytes_saved / (1024 * 1024)
+    # REMOVED: memory_saved_mb property
+    # This was a fake metric - actual memory bandwidth must be measured
+    # with Nsight Compute using dram__bytes_write.sum in NVTX ranges
 
     @property
     def acceptance_rate(self) -> float:
@@ -218,7 +214,7 @@ class ShadowKV:
             "total_committed": self._total_committed,
             "total_rejected": self._total_rejected,
             "acceptance_rate": self.acceptance_rate,
-            "memory_saved_mb": self.memory_saved_mb,
+            # NOTE: memory_saved_mb removed - use Nsight Compute for real measurements
         }
 
     def reset_metrics(self):
