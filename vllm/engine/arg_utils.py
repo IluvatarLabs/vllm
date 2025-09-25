@@ -364,6 +364,12 @@ class EngineArgs:
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     disable_log_stats: bool = False
+    # NWOR/SCV optimization flags
+    scv_enabled: bool = False
+    verify_chunk_size: int = 4
+    use_shadow_kv: bool = False
+    enable_nvtx_ranges: bool = False
+    debug_alloc_counters: bool = False
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
     rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")
