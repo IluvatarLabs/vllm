@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from typing import Optional, Protocol
 
@@ -41,6 +41,13 @@ from vllm.v1.kv_cache.write_router import KVWriteRouter, PersistentKVWriter
 logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
+
+
+@dataclass
+class DraftProposals:
+    """Container for draft token proposals with their log-probabilities."""
+    token_ids: torch.Tensor   # [batch_size, T] draft token IDs
+    logprobs: torch.Tensor    # [batch_size, T] log p_draft for chosen tokens
 
 
 class EagleAttentionMetadata(Protocol):
@@ -361,14 +368,17 @@ class EagleProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
-            return draft_token_ids.view(-1, 1)
+            return DraftProposals(
+                token_ids=draft_token_ids.view(-1, 1),
+                logprobs=draft_logp.view(-1, 1)
+            )
 
         positions = target_positions[last_token_indices]
         hidden_states = hidden_states[last_token_indices]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
             # Draft using tree attention.
-            draft_token_ids_list = self.propose_tree(
+            draft_token_ids_list, draft_logp_list = self.propose_tree(
                 batch_size=batch_size,
                 logits=logits,
                 positions=positions,
@@ -376,10 +386,14 @@ class EagleProposer:
                 common_attn_metadata=common_attn_metadata,
             )
             # [batch_size, num_tree_tokens]
-            return torch.cat(draft_token_ids_list, dim=1)
+            return DraftProposals(
+                token_ids=torch.cat(draft_token_ids_list, dim=1),
+                logprobs=torch.cat(draft_logp_list, dim=1)
+            )
 
         draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
-        # TODO: Store draft_logp for acceptance ratio calculation in verification
+        draft_token_ids_list = [draft_token_ids]
+        draft_logp_list = [draft_logp]
 
         if not isinstance(attn_metadata, self.allowed_attn_types):
             raise ValueError(
@@ -389,7 +403,7 @@ class EagleProposer:
                 f"{self.allowed_attn_types}")
 
         # Generate the remaining draft tokens.
-        draft_token_ids_list = [draft_token_ids]
+        # (draft_token_ids_list and draft_logp_list already initialized above)
 
         if self.use_cuda_graph and \
                 batch_size <= self.cudagraph_batch_sizes[-1]:
@@ -486,11 +500,12 @@ class EagleProposer:
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
             draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
             draft_token_ids_list.append(draft_token_ids)
-            # TODO: Store draft_logp for acceptance ratio calculation
+            draft_logp_list.append(draft_logp)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        return draft_token_ids
+        draft_logprobs = torch.stack(draft_logp_list, dim=1)
+        return DraftProposals(token_ids=draft_token_ids, logprobs=draft_logprobs)
 
     def prepare_next_token_ids_cpu(
             self, sampled_token_ids: list[list[int]],
@@ -654,7 +669,7 @@ class EagleProposer:
         # [num_tokens, hidden_size]
         hidden_states: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         tree_attn_metadata_builder = \
             self.runner.attn_groups[0][0].get_metadata_builder()
         assert isinstance(tree_attn_metadata_builder,
@@ -667,11 +682,14 @@ class EagleProposer:
         if num_children == 1:
             draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
             draft_token_ids = draft_token_ids.view(batch_size, -1)
-            # TODO: Store draft_logp for acceptance ratio
+            draft_logp = draft_logp.view(batch_size, -1)
+            draft_token_ids_list = [draft_token_ids]
+            draft_logp_list = [draft_logp]
         else:
             draft_token_ids = torch.topk(logits, num_children,
                                          dim=-1).indices.view(batch_size, -1)
-        draft_token_ids_list = [draft_token_ids]
+            draft_token_ids_list = [draft_token_ids]
+            draft_logp_list = None  # No valid draft probs for deterministic top-k
         draft_hidden_states = hidden_states.view(batch_size, 1, -1)
 
         # Initialize empty tensors for concatenation with the level outputs.
@@ -802,18 +820,28 @@ class EagleProposer:
             if num_children == 1:
                 draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
                 draft_token_ids = draft_token_ids.view(batch_size, -1)
-                # TODO: Store draft_logp for acceptance ratio
+                draft_logp = draft_logp.view(batch_size, -1)
+                draft_token_ids_list.append(draft_token_ids)
+                draft_logp_list.append(draft_logp)
             else:
                 draft_token_ids = torch.topk(logits, num_children,
                                              dim=-1).indices.view(
                                                  batch_size, -1)
-            draft_token_ids_list.append(draft_token_ids)
+                draft_token_ids_list.append(draft_token_ids)
+                if draft_logp_list is not None:
+                    draft_logp_list = None  # Mixed modes -> no valid logprobs
 
             # Update the # drafts counters for the next tree level.
             level_num_drafts = self.cu_drafts_per_level[level +
                                                         1] - total_num_drafts
             total_num_drafts = self.cu_drafts_per_level[level + 1]
-        return draft_token_ids_list
+
+        # Return both token IDs and logprobs
+        # If draft_logp_list is None (top-k was used), return zeros
+        if draft_logp_list is None:
+            draft_logp_list = [torch.zeros_like(draft_token_ids_list[0], dtype=torch.float32)]
+
+        return draft_token_ids_list, draft_logp_list
 
     def prepare_inputs(
         self,

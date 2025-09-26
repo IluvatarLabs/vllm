@@ -85,7 +85,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.eagle import DraftProposals, EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -284,6 +284,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
             self.rejection_sampler = RejectionSampler()
+            # Initialize draft_probs storage for EAGLE
+            self._draft_probs: Optional[torch.Tensor] = None
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1998,9 +2000,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
             target_logits = logits[spec_decode_metadata.target_logits_indices]
+
+            # Convert sparse draft logprobs to full format for rejection sampler
+            draft_probs = self._prepare_draft_probs(
+                spec_decode_metadata,
+                target_logits.shape[-1]  # vocab_size
+            ) if hasattr(self, '_draft_probs') and self._draft_probs is not None else None
+
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
-                None,  # draft_probs
+                draft_probs,  # Now passing actual draft probs!
                 target_logits,
                 bonus_token_ids,
                 sampling_metadata,
@@ -2358,7 +2367,50 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
+        self._draft_probs = None  # Clear draft probs as well
         return DraftTokenIds(req_ids, draft_token_ids)
+
+    def _prepare_draft_probs(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        vocab_size: int,
+    ) -> torch.Tensor:
+        """
+        Convert sparse draft logprobs to full format for rejection sampler.
+
+        Args:
+            spec_decode_metadata: Contains draft_token_ids for indexing
+            vocab_size: Vocabulary size
+
+        Returns:
+            draft_probs: [num_tokens, vocab_size] with probs only at chosen tokens
+        """
+        if not hasattr(self, '_draft_probs') or self._draft_probs is None:
+            return None
+
+        # Get draft token IDs - shape [num_tokens]
+        draft_token_ids = spec_decode_metadata.draft_token_ids
+
+        # Our draft_probs is [batch_size, num_spec_tokens] with log-probs
+        # Need to flatten it to [num_tokens] and convert to probs
+        draft_logprobs_flat = self._draft_probs.flatten()[:draft_token_ids.shape[0]]
+
+        # Convert log-probs to probs
+        draft_probs_sparse = torch.exp(draft_logprobs_flat)
+
+        # Create full [num_tokens, vocab_size] tensor with zeros
+        num_tokens = draft_token_ids.shape[0]
+        draft_probs_full = torch.zeros(
+            (num_tokens, vocab_size),
+            device=draft_token_ids.device,
+            dtype=torch.float32
+        )
+
+        # Fill in probabilities only for the chosen tokens
+        token_indices = torch.arange(num_tokens, device=draft_token_ids.device)
+        draft_probs_full[token_indices, draft_token_ids] = draft_probs_sparse
+
+        return draft_probs_full
 
     def propose_draft_token_ids(
         self,
@@ -2474,7 +2526,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_embeds = self._gather_mm_embeddings(scheduler_output,
                                                        shift_computed_tokens=1)
 
-            draft_token_ids = self.drafter.propose(
+            proposals = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -2484,6 +2536,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 common_attn_metadata=common_attn_metadata,
                 mm_embeds=mm_embeds,
             )
+            # Store draft_probs for use in rejection sampler
+            self._draft_probs = proposals.logprobs
+            draft_token_ids = proposals.token_ids
         return draft_token_ids
 
     def propose_ngram_draft_token_ids(
