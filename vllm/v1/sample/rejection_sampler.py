@@ -124,6 +124,26 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
+        # Sanity checks: Inspect raw values BEFORE any processing
+        if draft_probs is not None:
+            draft_p_nonzero = draft_probs[draft_probs > 0]
+            if draft_p_nonzero.numel() > 0:
+                print(f"[SANITY] draft_p (nonzero) min/med/max: "
+                      f"{draft_p_nonzero.min():.3e}/"
+                      f"{draft_p_nonzero.median():.3e}/"
+                      f"{draft_p_nonzero.max():.3e}",
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"[SANITY] draft_p: ALL ZEROS!", file=sys.stderr, flush=True)
+
+        # Check target probabilities for the chosen draft tokens
+        target_p_check = target_probs.gather(-1, metadata.draft_token_ids.unsqueeze(-1)).squeeze(-1)
+        print(f"[SANITY] p_target min/med/max: "
+              f"{target_p_check.min():.3e}/"
+              f"{target_p_check.median():.3e}/"
+              f"{target_p_check.max():.3e}",
+              file=sys.stderr, flush=True)
+
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,

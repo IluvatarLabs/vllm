@@ -695,10 +695,13 @@ class EagleProposer:
             draft_token_ids_list = [draft_token_ids]
             draft_logp_list = [draft_logp]
         else:
+            # Top-k branching: compute actual log-probs for chosen tokens
             draft_token_ids = torch.topk(logits, num_children,
                                          dim=-1).indices.view(batch_size, -1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            draft_logp = log_probs.gather(-1, draft_token_ids).view(batch_size, -1)
             draft_token_ids_list = [draft_token_ids]
-            draft_logp_list = None  # No valid draft probs for deterministic top-k
+            draft_logp_list = [draft_logp]
         draft_hidden_states = hidden_states.view(batch_size, 1, -1)
 
         # Initialize empty tensors for concatenation with the level outputs.
@@ -833,12 +836,14 @@ class EagleProposer:
                 draft_token_ids_list.append(draft_token_ids)
                 draft_logp_list.append(draft_logp)
             else:
+                # Top-k branching: compute actual log-probs for chosen tokens
                 draft_token_ids = torch.topk(logits, num_children,
                                              dim=-1).indices.view(
                                                  batch_size, -1)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                draft_logp = log_probs.gather(-1, draft_token_ids).view(batch_size, -1)
                 draft_token_ids_list.append(draft_token_ids)
-                if draft_logp_list is not None:
-                    draft_logp_list = None  # Mixed modes -> no valid logprobs
+                draft_logp_list.append(draft_logp)
 
             # Update the # drafts counters for the next tree level.
             level_num_drafts = self.cu_drafts_per_level[level +
@@ -846,10 +851,7 @@ class EagleProposer:
             total_num_drafts = self.cu_drafts_per_level[level + 1]
 
         # Return both token IDs and logprobs
-        # If draft_logp_list is None (top-k was used), return zeros
-        if draft_logp_list is None:
-            draft_logp_list = [torch.zeros_like(draft_token_ids_list[0], dtype=torch.float32)]
-
+        # All branches now compute real logprobs, no need for fallback
         return draft_token_ids_list, draft_logp_list
 
     def prepare_inputs(
