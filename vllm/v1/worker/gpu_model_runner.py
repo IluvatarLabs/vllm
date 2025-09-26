@@ -207,6 +207,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model_config.is_multimodal_raw_input_only_model)
 
         self.max_model_len = model_config.max_model_len
+
+        self._router_token = None
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
@@ -2016,16 +2018,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
 
-            # NWOR: Commit accepted tokens to persistent cache after rejection sampling
-            if _router_token is not None:
-                # Extract accepted lengths from output_token_ids
-                # The rejection sampler returns [batch_size, max_spec_len+1] with PLACEHOLDER_TOKEN_ID for rejected
-                valid_mask = (output_token_ids != -1) & (output_token_ids < sampling_metadata.vocab_size)
-                accepted_lens = valid_mask.sum(dim=1).to(dtype=torch.int32)
-                self.drafter.kv_router.commit(accepted_lens)
-                reset_router(_router_token)
-                self.drafter.kv_router.immediate()
-
             sampler_output.sampled_token_ids = output_token_ids
             self._update_states_after_model_execute(output_token_ids)
 
@@ -2223,12 +2215,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_input_tokens = ubatch_slices[0].num_tokens
 
         # NWOR: Arm router before target verify pass if spec decode + shadow_kv enabled
-        _router_token = None
         if (spec_decode_metadata is not None and
             hasattr(self, 'drafter') and hasattr(self.drafter, 'kv_router') and
             self.drafter.kv_router is not None):
             self.drafter.kv_router.defer()
-            _router_token = set_router(self.drafter.kv_router)
+            self._router_token = set_router(self.drafter.kv_router)
+        else:
+            self._router_token = None
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -2356,6 +2349,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
+
+        # NWOR: Commit accepted tokens and disarm router
+        if self._router_token is not None:
+            if isinstance(valid_sampled_token_ids, list):
+                accepted_lens = torch.tensor([len(seq) for seq in valid_sampled_token_ids],
+                                            dtype=torch.int32, device=self.device)
+            else:
+                accepted_lens = torch.tensor([1] * len(valid_sampled_token_ids),
+                                            dtype=torch.int32, device=self.device)
+
+            self.drafter.kv_router.commit(accepted_lens)
+            reset_router(self._router_token)
+            self._router_token = None
+            self.drafter.kv_router.immediate()
 
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
