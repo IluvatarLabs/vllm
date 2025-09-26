@@ -221,6 +221,21 @@ class EagleProposer:
             draft_token_ids: [batch_size] sampled token IDs
             draft_logp: [batch_size] log probability of sampled tokens
         """
+        # DIAGNOSTIC: Check raw logits before any processing
+        import sys
+        print(f"[RAW_LOGITS] shape={logits.shape} dtype={logits.dtype} "
+              f"min={logits.min().item():.3f} max={logits.max().item():.3f} "
+              f"mean={logits.mean().item():.3f} std={logits.std().item():.3f} "
+              f"range={logits.max().item() - logits.min().item():.3f}",
+              file=sys.stderr, flush=True)
+
+        # Show top-5 logits for first sample
+        if logits.shape[0] > 0:
+            sample0_logits = logits[0]
+            top5_vals, top5_ids = torch.topk(sample0_logits, k=5)
+            print(f"[RAW_LOGITS] sample0 top-5: vals={top5_vals.tolist()} ids={top5_ids.tolist()}",
+                  file=sys.stderr, flush=True)
+
         # Fallback to greedy argmax if configured
         if self.opt_config.draft_sampling_mode == "argmax":
             draft_token_ids = logits.argmax(dim=-1)
