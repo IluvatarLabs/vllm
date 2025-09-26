@@ -4121,6 +4121,35 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return kv_cache_spec
 
+    def get_internal_metrics(self) -> dict:
+        """
+        Get internal metrics from NWOR/SCV optimizations.
+
+        Returns:
+            Dictionary containing:
+            - drafter: Metrics from Eagle proposer (acceptance rate, etc.)
+            - shadow_kv: Metrics from ShadowKV (staged/committed/rejected tokens)
+        """
+        metrics = {"drafter": {}, "shadow_kv": {}}
+
+        # Get metrics from Eagle drafter/proposer
+        try:
+            if hasattr(self, "drafter") and hasattr(self.drafter, "get_metrics"):
+                metrics["drafter"] = self.drafter.get_metrics()
+        except Exception:
+            pass
+
+        # Get metrics from ShadowKV (via KV router if present)
+        try:
+            if hasattr(self, "drafter") and hasattr(self.drafter, "shadow_kv"):
+                shadow = self.drafter.shadow_kv
+                if shadow is not None and hasattr(shadow, "get_metrics"):
+                    metrics["shadow_kv"] = shadow.get_metrics()
+        except Exception:
+            pass
+
+        return metrics
+
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         # This is a short term mitigation for issue mentioned in
         # https://github.com/vllm-project/vllm/issues/22754.

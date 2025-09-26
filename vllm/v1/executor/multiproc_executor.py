@@ -300,6 +300,16 @@ class MultiprocExecutor(Executor):
             for p in active_procs:
                 p.kill()
 
+    def get_internal_metrics(self) -> dict:
+        """
+        Get internal metrics from workers via collective RPC.
+        Returns metrics from driver worker only.
+        """
+        # Use collective_rpc to get metrics from driver worker
+        results = self.collective_rpc("get_internal_metrics",
+                                      unique_reply_rank=0)
+        return results[0] if results else {"drafter": {}, "shadow_kv": {}}
+
     def shutdown(self):
         """Properly shut down the executor and its workers"""
         if not getattr(self, 'shutting_down', False):

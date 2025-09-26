@@ -1466,6 +1466,16 @@ class LLM:
         """
         return self.llm_engine.get_metrics()
 
+    def get_internal_metrics(self) -> dict:
+        """Return internal metrics from workers (NWOR/SCV optimizations).
+
+        Returns:
+            Dictionary containing:
+            - drafter: Metrics from Eagle proposer (acceptance_rate, etc.)
+            - shadow_kv: Metrics from ShadowKV (total_staged, total_committed, etc.)
+        """
+        return self.llm_engine.get_internal_metrics()
+
     def _validate_and_add_requests(
         self,
         prompts: Union[PromptType, Sequence[PromptType], DataPrompt],

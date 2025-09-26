@@ -684,6 +684,10 @@ class Worker(WorkerBase):
         self.model_runner.save_tensorized_model(
             tensorizer_config=tensorizer_config, )
 
+    def get_internal_metrics(self) -> dict:
+        """Forward metrics request to model runner."""
+        return self.model_runner.get_internal_metrics()
+
     def shutdown(self) -> None:
         if runner := getattr(self, "model_runner", None):
             runner.ensure_kv_transfer_shutdown()

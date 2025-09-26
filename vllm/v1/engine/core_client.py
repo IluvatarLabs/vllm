@@ -159,6 +159,9 @@ class EngineCoreClient(ABC):
                            max_size: Optional[int] = None) -> None:
         raise NotImplementedError
 
+    def get_internal_metrics(self) -> dict:
+        raise NotImplementedError
+
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
                        timeout: Optional[float] = None,
@@ -300,6 +303,9 @@ class InprocClient(EngineCoreClient):
                            pattern: Optional[str] = None,
                            max_size: Optional[int] = None) -> None:
         self.engine_core.save_sharded_state(path, pattern, max_size)
+
+    def get_internal_metrics(self) -> dict:
+        return self.engine_core.get_internal_metrics()
 
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
@@ -716,6 +722,9 @@ class SyncMPClient(MPClient):
 
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
+
+    def get_internal_metrics(self) -> dict:
+        return self.call_utility("get_internal_metrics")
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)

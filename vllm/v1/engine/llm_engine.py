@@ -308,6 +308,10 @@ class LLMEngine:
         assert self.log_stats, "Stat logging disabled"
         return get_metrics_snapshot()
 
+    def get_internal_metrics(self) -> dict:
+        """Get internal metrics from workers (NWOR/SCV optimizations)."""
+        return self.engine_core.get_internal_metrics()
+
     def get_tokenizer(self) -> AnyTokenizer:
         if self.tokenizer is None:
             raise ValueError("Unable to get tokenizer because "

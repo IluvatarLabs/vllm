@@ -374,6 +374,10 @@ class EngineCore:
     def reset_prefix_cache(self):
         self.scheduler.reset_prefix_cache()
 
+    def get_internal_metrics(self) -> dict:
+        """Get internal metrics from model executor (workers)."""
+        return self.model_executor.get_internal_metrics()
+
     def sleep(self, level: int = 1):
         self.model_executor.sleep(level)
 
