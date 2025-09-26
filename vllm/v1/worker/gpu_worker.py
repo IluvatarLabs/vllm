@@ -4,6 +4,7 @@
 import copy
 import gc
 import os
+import sys
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -474,7 +475,8 @@ class Worker(WorkerBase):
         return output
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
-        return self.model_runner.take_draft_token_ids()
+        result = self.model_runner.take_draft_token_ids()
+        return result
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:

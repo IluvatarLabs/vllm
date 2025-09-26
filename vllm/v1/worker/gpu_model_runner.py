@@ -2050,6 +2050,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
 
+            # Clear draft_probs AFTER verification completes (it's no longer needed)
+            self._draft_probs = None
+
             sampler_output.sampled_token_ids = output_token_ids
             self._update_states_after_model_execute(output_token_ids)
 
@@ -2390,33 +2393,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             propose_draft_token_ids(sampler_output.sampled_token_ids)
             print("[HANG_DEBUG] After propose_draft_token_ids nested function", file=sys.stderr, flush=True)
 
-            # CRITICAL: Build verification matrix [B, 1+T] for rejection sampler
-            # Without this, bookkeeping sees [B, 1] and takes wrong branch
-            if self._draft_token_ids is not None:
-                target_token = sampler_output.sampled_token_ids  # [B, 1]
-                draft_tokens = self._draft_token_ids  # [B, T] or list[list[int]]
-
-                if isinstance(draft_tokens, torch.Tensor):
-                    # Padded batch: concatenate tensors
-                    combined_tokens = torch.cat([target_token, draft_tokens], dim=1)  # [B, 1+T]
-                    sampler_output.sampled_token_ids = combined_tokens
-                    print(f"[SPEC_DEBUG] Built verification matrix: {combined_tokens.shape}", file=sys.stderr, flush=True)
-                else:
-                    # List format: convert to padded tensor
-                    batch_size = target_token.shape[0]
-                    max_draft_len = max(len(d) for d in draft_tokens)
-                    # Build [B, 1+T] with padding
-                    combined = torch.full((batch_size, 1 + max_draft_len), -1,
-                                         dtype=torch.int32, device=self.device)
-                    combined[:, 0] = target_token.squeeze(1)
-                    for i, draft_seq in enumerate(draft_tokens):
-                        if len(draft_seq) > 0:
-                            combined[i, 1:1+len(draft_seq)] = torch.tensor(draft_seq,
-                                                                           dtype=torch.int32,
-                                                                           device=self.device)
-                    sampler_output.sampled_token_ids = combined
-                    print(f"[SPEC_DEBUG] Built verification matrix from list: {combined.shape}", file=sys.stderr, flush=True)
-
         print("[HANG_DEBUG] Before bookkeeping", file=sys.stderr, flush=True)
         with record_function_or_nullcontext("Bookkeep"):
             (
@@ -2490,7 +2466,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
-        self._draft_probs = None  # Clear draft probs - both consumed together
+        # NOTE: Do NOT clear _draft_probs here - it's needed in next iteration's verification
         try:
             with open('/tmp/vllm_take_draft.log', 'a') as f:
                 f.write(f"[TAKE_DRAFT] END: Returning {len(draft_token_ids)} sequences, cleared _draft_probs\n")

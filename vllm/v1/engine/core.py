@@ -4,6 +4,7 @@ import gc
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -708,10 +709,31 @@ class EngineCoreProc(EngineCore):
             logger.debug("EngineCore exiting.")
             raise
         except Exception as e:
+            # CRITICAL: Log exception with ALL output methods
+            import traceback
+            exc_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+
+            # Log to logger
             if engine_core is None:
                 logger.exception("EngineCore failed to start.")
             else:
                 logger.exception("EngineCore encountered a fatal error.")
+
+            # Print to stderr
+            print(f"\n{'='*80}\n[ENGINE_CORE FATAL ERROR]\n{'='*80}", file=sys.stderr, flush=True)
+            print(exc_str, file=sys.stderr, flush=True)
+            print(f"{'='*80}\n", file=sys.stderr, flush=True)
+
+            # Write to file
+            try:
+                with open('/tmp/vllm_engine_crash.log', 'w') as f:
+                    f.write(f"ENGINE_CORE CRASH AT {__import__('datetime').datetime.now()}\n")
+                    f.write(exc_str)
+                    f.flush()
+            except:
+                pass
+
+            if engine_core is not None:
                 engine_core._send_engine_dead()
             raise e
         finally:

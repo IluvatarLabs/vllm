@@ -100,6 +100,10 @@ class UniProcExecutor(ExecutorBase):
         # it's running.
         return
 
+    def get_internal_metrics(self) -> dict:
+        """Route to driver worker for TP=1 case."""
+        return self.driver_worker.get_internal_metrics()
+
     def reinitialize_distributed(
             self, reconfig_request: ReconfigureDistributedRequest) -> None:
         self.driver_worker.reinitialize_distributed(reconfig_request)

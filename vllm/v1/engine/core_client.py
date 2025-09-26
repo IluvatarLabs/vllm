@@ -526,8 +526,22 @@ class MPClient(EngineCoreClient):
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
-        return EngineDeadError(
-            suppress_context=True) if self.resources.engine_dead else e
+        if self.resources.engine_dead:
+            # CRITICAL: Log and print the ACTUAL exception before replacing it
+            import traceback
+            logger.error(f"{'='*80}")
+            logger.error("[ACTUAL EXCEPTION FROM ENGINE_CORE]")
+            logger.error(f"Exception type: {type(e).__name__}")
+            logger.error(f"Exception message: {str(e)}")
+            logger.error(f"{'='*80}")
+            # Also print to stderr for immediate visibility
+            print(f"\n{'='*80}\n[ACTUAL EXCEPTION FROM ENGINE_CORE]\n{'='*80}", file=sys.stderr, flush=True)
+            print(f"Exception type: {type(e).__name__}", file=sys.stderr, flush=True)
+            print(f"Exception message: {str(e)}", file=sys.stderr, flush=True)
+            traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
+            print(f"{'='*80}\n", file=sys.stderr, flush=True)
+            return EngineDeadError(suppress_context=True)
+        return e
 
     def ensure_alive(self):
         if self.resources.engine_dead:
