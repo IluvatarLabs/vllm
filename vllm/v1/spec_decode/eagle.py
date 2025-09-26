@@ -221,6 +221,8 @@ class EagleProposer:
             draft_token_ids: [batch_size] sampled token IDs
             draft_logp: [batch_size] log probability of sampled tokens
         """
+        import torch.nn.functional as F
+
         # DIAGNOSTIC: Check raw logits before any processing
         import sys
         print(f"[RAW_LOGITS] shape={logits.shape} dtype={logits.dtype} "
@@ -239,7 +241,7 @@ class EagleProposer:
         # Fallback to greedy argmax if configured
         if self.opt_config.draft_sampling_mode == "argmax":
             draft_token_ids = logits.argmax(dim=-1)
-            draft_logp = torch.log_softmax(logits.float(), dim=-1).gather(
+            draft_logp = F.log_softmax(logits.to(torch.float32), dim=-1).gather(
                 -1, draft_token_ids.unsqueeze(-1)
             ).squeeze(-1)
             return draft_token_ids, draft_logp
@@ -248,7 +250,7 @@ class EagleProposer:
         # Without this, PyTorch autocast downcasts softmax to fp16 even if tensor is fp32
         with torch.autocast(device_type="cuda", enabled=False):
             # Convert to fp32 and apply temperature in LOGITS space
-            logits_f32 = (logits / max(self.opt_config.draft_temperature, 1e-6)).float()
+            logits_f32 = (logits / max(self.opt_config.draft_temperature, 1e-6)).to(torch.float32)
 
             # Apply top-k filtering: mask in LOGITS space with -inf (not probability space!)
             if self.opt_config.draft_top_k > 0:
@@ -261,7 +263,7 @@ class EagleProposer:
                 sorted_logits, sorted_indices = torch.sort(logits_f32, dim=-1, descending=True)
 
                 # Compute cumulative probabilities in fp32 (stable)
-                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
 
                 # Mark tokens to DROP (cumsum > threshold)
@@ -282,7 +284,7 @@ class EagleProposer:
 
             # Compute normalized log-probabilities directly (no separate renormalization!)
             # log_softmax handles -inf correctly: masked tokens get -inf logprob
-            logp_full = torch.log_softmax(logits_f32, dim=-1)  # [B, V], fp32
+            logp_full = F.log_softmax(logits_f32, dim=-1)  # [B, V], fp32
             probs_full = logp_full.exp()  # [B, V], fp32
 
             # Sample from the distribution
