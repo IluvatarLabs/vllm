@@ -130,13 +130,11 @@ class RejectionSampler(nn.Module):
                 f"draft_probs (after exp) must be in [0,1], got range [{nonzero_probs.min():.3e}, {nonzero_probs.max():.3e}]"
 
         # [num_tokens, vocab_size]
-        # NOTE(woosuk): `target_logits` can be updated in place inside the
-        # `compute_probs` function.
-        target_probs = compute_probs(
-            target_logits,
-            metadata.cu_num_draft_tokens,
-            sampling_metadata,
-        )
+        # CRITICAL: Do NOT apply top-k/top-p to target logits for ratio test!
+        # The rejection sampler needs the RAW target distribution.
+        # Filtering causes p_target→1.0 for single survivors, breaking acceptance.
+        with torch.autocast(device_type="cuda", enabled=False):
+            target_probs = torch.softmax(target_logits.to(torch.float32), dim=-1)
 
         # Sanity checks: Inspect raw values BEFORE any processing
         if draft_probs is not None:

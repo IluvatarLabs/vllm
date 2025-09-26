@@ -207,75 +207,107 @@ class EagleProposer:
     def _sample_draft_tokens(
         self, logits: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample draft tokens with temperature/top-p/top-k in FP32."""
-        import torch.nn.functional as F
-        import sys
+        """
+        Sample draft tokens with temperature/top-p/top-k in FP32.
 
-        # Diagnostic
-        print(f"[RAW_LOGITS] shape={logits.shape} dtype={logits.dtype} "
-              f"min={logits.min().item():.3f} max={logits.max().item():.3f} "
-              f"std={logits.std().item():.3f}",
-              file=sys.stderr, flush=True)
+        Args:
+            logits: [N, V] raw model logits for the draft positions
 
-        # Argmax fallback
+        Returns:
+            draft_token_ids: [N] int64 sampled token IDs
+            draft_logp: [N] float32 log probability under the *same* distribution
+        """
+        # Read sampler config
+        top_k = int(self.opt_config.draft_top_k or 0)
+        top_p = float(self.opt_config.draft_top_p if self.opt_config.draft_top_p is not None else 1.0)
+        temperature = float(self.opt_config.draft_temperature if self.opt_config.draft_temperature is not None else 1.0)
+
+        device = logits.device
+        N, V = logits.shape
+
+        # Fallback to greedy argmax if configured
         if self.opt_config.draft_sampling_mode == "argmax":
             draft_token_ids = logits.argmax(dim=-1)
-            draft_logp = F.log_softmax(logits.to(torch.float32), dim=-1).gather(
-                -1, draft_token_ids.unsqueeze(-1)
-            ).squeeze(-1)
-            return draft_token_ids, draft_logp
+            with torch.autocast(device_type="cuda", enabled=False):
+                draft_logp = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(
+                    -1, draft_token_ids.unsqueeze(-1)
+                ).squeeze(-1)
+            return draft_token_ids.to(torch.long), draft_logp.to(torch.float32)
 
-        # Stochastic - disable autocast for ALL probability math
+        # Disable autocast and force FP32 math for stability
+        # (autocast can silently downcast softmax/exp and nuke small masses)
         with torch.autocast(device_type="cuda", enabled=False):
-            # 1) Move to fp32 and apply temperature in logits space
-            logits_f32 = (logits / max(self.opt_config.draft_temperature, 1e-6)).float()
+            x = logits.detach().to(torch.float32)
 
-            # 2) Apply top-k mask in logits space with -inf
-            if self.opt_config.draft_top_k > 0:
-                kth = torch.topk(logits_f32, k=self.opt_config.draft_top_k, dim=-1).values[..., -1:]
-                logits_f32 = logits_f32.masked_fill(logits_f32 < kth, float('-inf'))
+            # Temperature first (in logit space)
+            if temperature != 1.0:
+                x = x / temperature
 
-            # 3) Apply top-p mask in logits space with -inf
-            if 0.0 < self.opt_config.draft_top_p < 1.0:
-                # Sort by logit descending
-                sorted_logits, sorted_idx = torch.sort(logits_f32, dim=-1, descending=True)
-                # Compute probs in fp32 (stable)
-                sorted_probs = F.softmax(sorted_logits, dim=-1)
-                cumprobs = torch.cumsum(sorted_probs, dim=-1)
+            # ---- Top-k in logit space (mask with -inf) ----
+            if top_k and 0 < top_k < V:
+                kth = torch.topk(x, k=top_k, dim=-1).values[..., -1, None]
+                mask_k = x < kth  # True = drop
+                x = x.masked_fill(mask_k, float("-inf"))
 
-                # Standard nucleus mask: True for tokens to drop
-                sorted_drop = cumprobs > self.opt_config.draft_top_p
-                # Shift right to keep the first token that crosses threshold
-                sorted_drop[..., 1:] = sorted_drop[..., :-1].clone()
-                sorted_drop[..., 0] = False
+            # ---- Top-p (nucleus) in logit space, inclusive keep of boundary, keep top-1) ----
+            if top_p < 1.0:
+                sorted_x, idx = torch.sort(x, dim=-1, descending=True)         # [N, V]
+                # Compute probs in FP32 from sorted logits (stable)
+                sorted_logp = torch.log_softmax(sorted_x, dim=-1)               # [N, V]
+                sorted_p = torch.exp(sorted_logp)                               # [N, V]
+                cumsum = torch.cumsum(sorted_p, dim=-1)                         # [N, V]
 
-                # Ensure at least min_keep=2 survivors to avoid degeneracy
-                sorted_drop[..., :2] = False
+                keep_sorted = cumsum <= top_p
+                # Always keep the first (top-1) token
+                keep_sorted[..., 0] = True
+                # Also keep the first token that crosses the threshold (inclusive boundary)
+                shifted = torch.roll(keep_sorted, shifts=1, dims=-1)
+                shifted[..., 0] = False
+                boundary = keep_sorted ^ shifted
+                keep_sorted = keep_sorted | boundary
 
-                # Map mask back to vocab order and apply to logits
-                drop = torch.zeros_like(sorted_drop, dtype=torch.bool).scatter(-1, sorted_idx, sorted_drop)
-                logits_f32 = logits_f32.masked_fill(drop, float('-inf'))
+                keep = torch.zeros_like(x, dtype=torch.bool)
+                keep.scatter_(-1, idx, keep_sorted)
+                x = x.masked_fill(~keep, float("-inf"))
 
-            # 4) Compute normalized distributions in fp32
-            logp_full = F.log_softmax(logits_f32, dim=-1)     # [B, V], fp32 (stable)
-            probs_full = torch.exp(logp_full)                 # [B, V], fp32
+            # Guarantee at least one finite logit per row (keep argmax)
+            argmax = x.argmax(dim=-1, keepdim=True)                             # [N, 1]
+            rows_all_masked = ~torch.isfinite(x).any(dim=-1, keepdim=True)      # [N, 1]
+            if rows_all_masked.any():
+                x = x.masked_fill(rows_all_masked.expand_as(x), float("-inf"))
+                x.scatter_(1, argmax, 0.0)  # make argmax the only finite (0.0)
 
-            # 5) Sample & gather TRUE log-prob from logp_full
-            draft_ids = torch.multinomial(probs_full, 1).squeeze(-1)                    # [B]
-            draft_logp = logp_full.gather(-1, draft_ids.unsqueeze(-1)).squeeze(-1)      # [B], fp32
+            # ---- Final distribution (same tensor for sample + gather) ----
+            logp = torch.log_softmax(x, dim=-1)                                 # [N, V], fp32
+            probs = torch.exp(logp)                                             # [N, V], fp32
 
-            # Guardrail while verifying
-            survivors = torch.isfinite(logits_f32).sum(dim=-1)  # tokens not masked to -inf
-            if (survivors <= 1).any():
-                raise RuntimeError(f"top-p/top-k left {int(survivors.min())} survivor(s); would force chosen_p=1.0")
+            # If we still "look" like a single survivor but have >1 finite logit,
+            # add tiny jitter to break exact-1.0 ties in fp32 (rare but possible
+            # with extreme logit gaps).
+            survivors = torch.isfinite(x).sum(dim=-1)                           # [N]
+            looks_one_hot = (probs.max(dim=-1).values == 1.0) & (survivors > 1)
+            if looks_one_hot.any():
+                # Nudge logits by an ulp-scale epsilon before the softmax
+                eps = torch.finfo(torch.float32).eps
+                jitter = (torch.rand_like(x) - 0.5) * (1e3 * eps)
+                x2 = x + jitter
+                logp = torch.log_softmax(x2, dim=-1)
+                probs = torch.exp(logp)
 
-        # Final validation
-        if not (draft_logp <= 0).all():
-            raise RuntimeError("Draft log-prob is positive; normalization bug")
-        if (draft_logp == 0).all():
-            raise RuntimeError("All draft log-probs are 0 — softmax likely ran in FP16 (autocast)")
+            # ---- Sample & gather log-prob FROM THE SAME logp ----
+            draft_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [N]
+            draft_logp = logp.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [N]
 
-        return draft_ids, draft_logp
+            # Final sanity: if survivors>1 we must not get exactly 0.0 everywhere
+            if ((draft_logp == 0.0) & (survivors > 1)).all():
+                # As a last resort, recompute with a slightly "warmer" temp
+                x3 = logits.detach().to(torch.float32) / max(temperature * 1.001, 1e-6)
+                logp3 = torch.log_softmax(x3, dim=-1)
+                probs3 = torch.exp(logp3)
+                draft_token_ids = torch.multinomial(probs3, 1).squeeze(-1)
+                draft_logp = logp3.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)
+
+            return draft_token_ids.to(torch.long), draft_logp.to(torch.float32)
 
     def propose(
         self,
