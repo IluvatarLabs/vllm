@@ -2589,6 +2589,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
               f"{q_logp.max().item():.3f}",
               file=sys.stderr, flush=True)
 
+        # Guardrails: Validate log-prob ranges to prevent fraud regression
+        assert (q_logp <= 1e-6).all(), \
+            f"Draft log-probs must be ≤ 0, got max={q_logp.max().item():.3f} " \
+            f"(drafter emitting positive values = bug)"
+        assert (q_logp > -100).all(), \
+            f"Draft log-probs suspiciously negative (underflow?), got min={q_logp.min().item():.3f}"
+
         return q_logp
 
     def _tp_broadcast_draft_probs(

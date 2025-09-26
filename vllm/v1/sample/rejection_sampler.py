@@ -119,6 +119,12 @@ class RejectionSampler(nn.Module):
         token_indices = torch.arange(num_tokens, device=metadata.draft_token_ids.device)
         draft_probs[token_indices, metadata.draft_token_ids] = torch.exp(draft_logprobs)
 
+        # Guardrail: Validate draft_probs after exp() are valid probabilities
+        nonzero_probs = draft_probs[draft_probs > 0]
+        if nonzero_probs.numel() > 0:
+            assert (nonzero_probs >= 0).all() and (nonzero_probs <= 1.0).all(), \
+                f"draft_probs (after exp) must be in [0,1], got range [{nonzero_probs.min():.3e}, {nonzero_probs.max():.3e}]"
+
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `compute_probs` function.
