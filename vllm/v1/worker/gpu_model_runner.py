@@ -2068,15 +2068,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                       f"{pt_raw.max().item():.3e}",
                       file=sys.stderr, flush=True)
 
-                # Guard rails
-                assert draft_logprobs.ndim == 1, f"draft_logprobs wrong ndim: {draft_logprobs.ndim}"
-                if not (draft_logprobs <= 1e-6).all():
-                    print(f"[WARNING] draft_logprobs has values > 0! Max={draft_logprobs.max().item()}",
-                          file=sys.stderr, flush=True)
-                if not (draft_logprobs > -100).all():
-                    print(f"[WARNING] draft_logprobs too negative! Min={draft_logprobs.min().item()}",
-                          file=sys.stderr, flush=True)
-                assert target_logits.ndim == 2, f"target_logits wrong ndim: {target_logits.ndim}"
+                # Validation: Ensure logprobs are well-formed
+                assert draft_logprobs.ndim == 1, f"draft_logprobs must be 1-D, got shape {draft_logprobs.shape}"
+                assert torch.isfinite(draft_logprobs).all(), \
+                    f"draft_logprobs contains NaN/inf: min={draft_logprobs.min()}, max={draft_logprobs.max()}"
+                assert (draft_logprobs <= 0).all(), \
+                    f"draft_logprobs must be log-space (≤0), got max={draft_logprobs.max().item():.6f}. " \
+                    f"Ensure _sample_draft_tokens returns log(prob), not prob."
+                assert target_logits.ndim == 2, f"target_logits must be 2-D [num_tokens, vocab_size], got shape {target_logits.shape}"
+                assert draft_logprobs.shape[0] == spec_decode_metadata.draft_token_ids.shape[0], \
+                    f"Length mismatch: draft_logprobs {draft_logprobs.shape[0]} != draft_token_ids {spec_decode_metadata.draft_token_ids.shape[0]}"
 
             # Smoke test: Diagnose alignment and estimate acceptance rate
             if draft_logprobs is not None:
@@ -2565,17 +2566,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # self._draft_probs: [batch_size, max_spec_len] with padding
         # spec_decode_metadata.num_draft_tokens: list[int] - valid counts per request
         counts = spec_decode_metadata.num_draft_tokens
-        rows = []
-        for i, n in enumerate(counts):
-            if int(n) > 0:
-                # Take only valid (non-padded) logprobs for this request
-                rows.append(self._draft_probs[i, :int(n)])
+        B, T_max = self._draft_probs.shape
 
-        if not rows:
+        # Use masking for efficient extraction (no loops)
+        counts_tensor = torch.tensor(counts, dtype=torch.int32, device=self._draft_probs.device)
+        mask = torch.arange(T_max, device=self._draft_probs.device).unsqueeze(0) < counts_tensor.unsqueeze(1)  # [B, T_max]
+        q_logp = self._draft_probs.masked_select(mask).to(torch.float32).contiguous()  # [T_total]
+
+        if q_logp.numel() == 0:
             return None
-
-        # Concatenate valid logprobs from all requests
-        q_logp = torch.cat(rows, dim=0).to(torch.float32).contiguous()  # [T_total]
 
         # Validate alignment
         draft_token_ids = spec_decode_metadata.draft_token_ids
@@ -3453,33 +3452,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "initializing the engine.") from e
             else:
                 raise e
-        if self.speculative_config:
-            draft_token_ids = [[0] for _ in range(num_reqs)]
-            dummy_spec_decode_metadata = SpecDecodeMetadata.make_dummy(
-                draft_token_ids, self.device)
-
-            num_tokens = sum(len(ids) for ids in draft_token_ids)
-            # draft_probs = torch.randn(
-            #     num_tokens, logits.shape[-1], device=self.device,
-            #     dtype=logits.dtype)
-            draft_probs = None
-            target_logits = torch.randn(num_tokens,
-                                        logits.shape[-1],
-                                        device=self.device,
-                                        dtype=logits.dtype)
-            # NOTE(woosuk): Here, we should use int32 because the sampler uses
-            # int32 for bonus_token_ids. If the dtype mismatches, re-compilation
-            # will occur at runtime.
-            bonus_token_ids = torch.zeros(num_reqs,
-                                          device=self.device,
-                                          dtype=torch.int32)
-            self.rejection_sampler(
-                dummy_spec_decode_metadata,
-                draft_probs,
-                target_logits,
-                bonus_token_ids,
-                dummy_metadata,
-            )
+        # Skip rejection sampler during profiling - it requires real draft proposals
+        # Profiling only needs to measure target model memory, not spec decode path
         return sampler_output
 
     def _dummy_pooler_run_task(

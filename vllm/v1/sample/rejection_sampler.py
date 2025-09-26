@@ -102,6 +102,10 @@ class RejectionSampler(nn.Module):
         assert draft_logprobs.shape[0] == metadata.draft_token_ids.shape[0], \
             f"draft_logprobs length {draft_logprobs.shape[0]} != " \
             f"draft_token_ids length {metadata.draft_token_ids.shape[0]}"
+        assert torch.isfinite(draft_logprobs).all(), \
+            f"draft_logprobs contains NaN/inf"
+        assert (draft_logprobs <= 0).all(), \
+            f"draft_logprobs must be in log-space (≤0), got max={draft_logprobs.max().item():.6f}"
 
         # Convert 1-D draft_logprobs to dense format for Triton kernels
         # This creates the sparse [num_tokens, vocab_size] representation
