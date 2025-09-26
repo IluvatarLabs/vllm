@@ -360,7 +360,7 @@ class EagleProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
             return draft_token_ids.view(-1, 1)
 
         positions = target_positions[last_token_indices]
@@ -378,7 +378,8 @@ class EagleProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = logits.argmax(dim=-1)
+        draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
+        # TODO: Store draft_logp for acceptance ratio calculation in verification
 
         if not isinstance(attn_metadata, self.allowed_attn_types):
             raise ValueError(
@@ -483,8 +484,9 @@ class EagleProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
             draft_token_ids_list.append(draft_token_ids)
+            # TODO: Store draft_logp for acceptance ratio calculation
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
@@ -663,7 +665,9 @@ class EagleProposer:
         # Sample a draft token for each child at the tree root level.
         num_children = self.child_drafts_per_level[0]
         if num_children == 1:
-            draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
+            draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
+            draft_token_ids = draft_token_ids.view(batch_size, -1)
+            # TODO: Store draft_logp for acceptance ratio
         else:
             draft_token_ids = torch.topk(logits, num_children,
                                          dim=-1).indices.view(batch_size, -1)
@@ -796,7 +800,9 @@ class EagleProposer:
             # Sample a draft token for each child at the next tree level.
             num_children = self.child_drafts_per_level[level + 1]
             if num_children == 1:
-                draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
+                draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
+                draft_token_ids = draft_token_ids.view(batch_size, -1)
+                # TODO: Store draft_logp for acceptance ratio
             else:
                 draft_token_ids = torch.topk(logits, num_children,
                                              dim=-1).indices.view(
