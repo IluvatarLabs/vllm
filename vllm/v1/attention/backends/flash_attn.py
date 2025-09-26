@@ -19,9 +19,17 @@ from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
                                            is_flash_attn_varlen_func_available)
 
 # NWOR imports
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from vllm.v1.kv_cache.write_router import KVWriteRouter
+from vllm.kvcache.route_ctx import get_router
+try:
+    from torch.cuda import nvtx
+except Exception:
+    class _NV:
+        def range(self, *a, **k):
+            from contextlib import contextmanager
+            @contextmanager
+            def _cm(): yield
+            return _cm()
+    nvtx = _NV()
 
 if is_flash_attn_varlen_func_available():
     from vllm.attention.utils.fa_utils import (flash_attn_varlen_func,
@@ -502,30 +510,34 @@ class FlashAttentionImpl(AttentionImpl):
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
 
-            # NWOR: Route KV writes through router if provided
-            if kv_router is not None and layer_idx is not None:
-                # Route through KV router (may stage in ShadowKV)
-                num_tokens = attn_metadata.slot_mapping.shape[0]
-                slot_mapping = attn_metadata.slot_mapping
-                for t in range(num_tokens):
-                    # Extract single token KV slice and its slot mapping
-                    k_slice = key[t:t+1]
-                    v_slice = value[t:t+1]
-                    slot_mapping_1t = slot_mapping[t] if slot_mapping.ndim > 1 else slot_mapping[t:t+1]
-                    # Route write (immediate or deferred based on router mode)
-                    kv_router.write(layer_idx, t, k_slice, v_slice, slot_mapping_1t)
-            else:
-                # Original direct write path
+            # NWOR: Route KV writes through router if deferred
+            router = get_router()
+            slot_map = attn_metadata.slot_mapping
+            if router is None or not router.is_deferred() or slot_map is None:
+                # Original direct write path (baseline)
                 reshape_and_cache_flash(
                     key,
                     value,
                     key_cache,
                     value_cache,
-                    attn_metadata.slot_mapping,
+                    slot_map,
                     self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            else:
+                # DEFERRED (NWOR): stage per-timestep instead of persisting now
+                qsl = getattr(attn_metadata, "query_start_loc", None)
+                if qsl is None:
+                    raise RuntimeError("verify path: missing query_start_loc for segmenting batch")
+                seg_lens = (qsl[1:] - qsl[:-1]).to(device="cpu", dtype=torch.int32)
+                T_total = key.size(0)
+                router.begin(T_total, slot_map.contiguous(), seg_lens)
+                with nvtx.range("cache_stage_verify"):
+                    key_c = key.contiguous()
+                    value_c = value.contiguous()
+                    for t in range(T_total):
+                        router.stage(layer_idx, t, key_c[t:t+1], value_c[t:t+1])
 
         if self.kv_cache_dtype.startswith("fp8"):
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(

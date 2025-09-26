@@ -89,6 +89,7 @@ from vllm.v1.spec_decode.eagle import DraftProposals, EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.kvcache.route_ctx import set_router, reset_router
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -2014,6 +2015,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 bonus_token_ids,
                 sampling_metadata,
             )
+
+            # NWOR: Commit accepted tokens to persistent cache after rejection sampling
+            if _router_token is not None:
+                # Extract accepted lengths from output_token_ids
+                # The rejection sampler returns [batch_size, max_spec_len+1] with PLACEHOLDER_TOKEN_ID for rejected
+                valid_mask = (output_token_ids != -1) & (output_token_ids < sampling_metadata.vocab_size)
+                accepted_lens = valid_mask.sum(dim=1).to(dtype=torch.int32)
+                self.drafter.kv_router.commit(accepted_lens)
+                reset_router(_router_token)
+                self.drafter.kv_router.immediate()
+
             sampler_output.sampled_token_ids = output_token_ids
             self._update_states_after_model_execute(output_token_ids)
 
@@ -2209,6 +2221,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # where it wants `num_tokens_across_dp` to align with `num_tokens`
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
+
+        # NWOR: Arm router before target verify pass if spec decode + shadow_kv enabled
+        _router_token = None
+        if (spec_decode_metadata is not None and
+            hasattr(self, 'drafter') and hasattr(self.drafter, 'kv_router') and
+            self.drafter.kv_router is not None):
+            self.drafter.kv_router.defer()
+            _router_token = set_router(self.drafter.kv_router)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

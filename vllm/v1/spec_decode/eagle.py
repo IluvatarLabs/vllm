@@ -1021,6 +1021,26 @@ class EagleProposer:
                     "The EAGLE head's lm_head will be loaded separately"
                     " from the target model.")
 
+        # Initialize KV router if NWOR is enabled
+        if self.opt_config.use_shadow_kv and self.shadow_kv is not None:
+            from vllm.kvcache.write_router import KVWriteRouter, PersistentKVWriter
+
+            # Get KV cache manager from runner
+            if hasattr(self.runner, 'input_batch') and hasattr(self.runner.input_batch, 'kv_cache'):
+                kv_cache_manager = self.runner.input_batch.kv_cache
+            else:
+                # Fallback: try to get from model
+                kv_cache_manager = None
+                logger.warning("Could not find KV cache manager for NWOR router initialization")
+
+            if kv_cache_manager is not None:
+                kv_dtype = getattr(self.runner, 'kv_cache_dtype', torch.float16)
+                self.kv_writer = PersistentKVWriter(kv_cache_manager, kv_dtype)
+                self.kv_router = KVWriteRouter(self.kv_writer, self.shadow_kv)
+                logger.info("KV router initialized for NWOR")
+            else:
+                logger.warning("KV cache manager not available, NWOR will not function")
+
     @torch.inference_mode()
     def dummy_run(
         self,
