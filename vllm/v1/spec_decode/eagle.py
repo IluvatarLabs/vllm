@@ -244,60 +244,62 @@ class EagleProposer:
             ).squeeze(-1)
             return draft_token_ids, draft_logp
 
-        # Stochastic sampling: ALL operations in fp32 logits space to prevent underflow
-        # Convert to fp32 and apply temperature in LOGITS space
-        logits_f32 = (logits / max(self.opt_config.draft_temperature, 1e-6)).float()
+        # Stochastic sampling: CRITICAL - disable autocast to keep ALL ops in fp32
+        # Without this, PyTorch autocast downcasts softmax to fp16 even if tensor is fp32
+        with torch.autocast(device_type="cuda", enabled=False):
+            # Convert to fp32 and apply temperature in LOGITS space
+            logits_f32 = (logits / max(self.opt_config.draft_temperature, 1e-6)).float()
 
-        # Apply top-k filtering: mask in LOGITS space with -inf (not probability space!)
-        if self.opt_config.draft_top_k > 0:
-            kth_val = torch.topk(logits_f32, k=self.opt_config.draft_top_k, dim=-1).values[..., -1:]
-            logits_f32 = logits_f32.masked_fill(logits_f32 < kth_val, float('-inf'))
+            # Apply top-k filtering: mask in LOGITS space with -inf (not probability space!)
+            if self.opt_config.draft_top_k > 0:
+                kth_val = torch.topk(logits_f32, k=self.opt_config.draft_top_k, dim=-1).values[..., -1:]
+                logits_f32 = logits_f32.masked_fill(logits_f32 < kth_val, float('-inf'))
 
-        # Apply top-p (nucleus): mask in LOGITS space with -inf
-        if 0.0 < self.opt_config.draft_top_p < 1.0:
-            # Sort by logit value descending
-            sorted_logits, sorted_indices = torch.sort(logits_f32, dim=-1, descending=True)
+            # Apply top-p (nucleus): mask in LOGITS space with -inf
+            if 0.0 < self.opt_config.draft_top_p < 1.0:
+                # Sort by logit value descending
+                sorted_logits, sorted_indices = torch.sort(logits_f32, dim=-1, descending=True)
 
-            # Compute cumulative probabilities in fp32 (stable)
-            sorted_probs = torch.softmax(sorted_logits, dim=-1)
-            cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+                # Compute cumulative probabilities in fp32 (stable)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
 
-            # Mark tokens to DROP (cumsum > threshold)
-            sorted_drop = cumsum_probs > self.opt_config.draft_top_p
+                # Mark tokens to DROP (cumsum > threshold)
+                sorted_drop = cumsum_probs > self.opt_config.draft_top_p
 
-            # Shift right: keep the token that crosses threshold
-            sorted_drop[..., 1:] = sorted_drop[..., :-1].clone()
-            sorted_drop[..., 0] = False
+                # Shift right: keep the token that crosses threshold
+                sorted_drop[..., 1:] = sorted_drop[..., :-1].clone()
+                sorted_drop[..., 0] = False
 
-            # CRITICAL: Always keep at least 2 tokens to prevent single-survivor collapse
-            sorted_drop[..., :2] = False
+                # CRITICAL: Always keep at least 2 tokens to prevent single-survivor collapse
+                sorted_drop[..., :2] = False
 
-            # Map drop mask back to original vocab order
-            drop_mask = torch.zeros_like(sorted_drop, dtype=torch.bool).scatter(
-                -1, sorted_indices, sorted_drop
-            )
-            logits_f32 = logits_f32.masked_fill(drop_mask, float('-inf'))
+                # Map drop mask back to original vocab order
+                drop_mask = torch.zeros_like(sorted_drop, dtype=torch.bool).scatter(
+                    -1, sorted_indices, sorted_drop
+                )
+                logits_f32 = logits_f32.masked_fill(drop_mask, float('-inf'))
 
-        # Compute normalized log-probabilities directly (no separate renormalization!)
-        # log_softmax handles -inf correctly: masked tokens get -inf logprob
-        logp_full = torch.log_softmax(logits_f32, dim=-1)  # [B, V], fp32
-        probs_full = logp_full.exp()  # [B, V], fp32
+            # Compute normalized log-probabilities directly (no separate renormalization!)
+            # log_softmax handles -inf correctly: masked tokens get -inf logprob
+            logp_full = torch.log_softmax(logits_f32, dim=-1)  # [B, V], fp32
+            probs_full = logp_full.exp()  # [B, V], fp32
 
-        # Sample from the distribution
-        draft_token_ids = torch.multinomial(probs_full, num_samples=1).squeeze(-1)  # [B]
+            # Sample from the distribution
+            draft_token_ids = torch.multinomial(probs_full, num_samples=1).squeeze(-1)  # [B]
 
-        # Gather TRUE log-probability from log_softmax output (no log after gather!)
-        draft_logp = logp_full.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B], fp32
+            # Gather TRUE log-probability from log_softmax output (no log after gather!)
+            draft_logp = logp_full.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B], fp32
 
-        # Guardrail: detect if bug still exists
-        if (draft_logp == 0).all():
-            import sys
-            survivors = torch.isfinite(logits_f32).sum(dim=-1)
-            print(f"[FATAL] All draft_logp = 0! survivors={survivors.tolist()}, "
-                  f"temp={self.opt_config.draft_temperature}, "
-                  f"top_k={self.opt_config.draft_top_k}, top_p={self.opt_config.draft_top_p}",
-                  file=sys.stderr, flush=True)
-            raise RuntimeError("Draft sampling collapsed to prob=1.0: fp16 underflow or single-survivor bug")
+            # Guardrail: detect if autocast bug still exists
+            if (draft_logp == 0).all():
+                import sys
+                survivors = torch.isfinite(logits_f32).sum(dim=-1)
+                print(f"[FATAL] All draft_logp = 0! survivors={survivors.tolist()}, "
+                      f"temp={self.opt_config.draft_temperature}, "
+                      f"top_k={self.opt_config.draft_top_k}, top_p={self.opt_config.draft_top_p}",
+                      file=sys.stderr, flush=True)
+                raise RuntimeError("Draft sampling collapsed to prob=1.0: autocast still downcasting to FP16")
 
         return draft_token_ids, draft_logp
 
