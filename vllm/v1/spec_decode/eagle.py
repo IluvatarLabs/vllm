@@ -272,9 +272,18 @@ class EagleProposer:
         draft_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
         # Get log probability of sampled tokens (needed for acceptance ratio)
-        draft_logp = torch.log(
-            probs.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).clamp(min=1e-12)
-        )
+        chosen_p = probs.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).clamp(min=1e-12)
+        draft_logp = torch.log(chosen_p)
+
+        # Debug: Check for zero logprobs (indicates prob=1.0 collapse)
+        import sys
+        if (draft_logp == 0).all():
+            print(f"[ZERO_LOGP_DEBUG] All zeros! probs stats: min={probs.min():.6f} max={probs.max():.6f}, "
+                  f"chosen_p min={chosen_p.min():.6f} max={chosen_p.max():.6f}, "
+                  f"sampling_mode={self.opt_config.draft_sampling_mode}, "
+                  f"temperature={self.opt_config.draft_temperature}, "
+                  f"top_k={self.opt_config.draft_top_k}, top_p={self.opt_config.draft_top_p}",
+                  file=sys.stderr, flush=True)
 
         return draft_token_ids, draft_logp
 

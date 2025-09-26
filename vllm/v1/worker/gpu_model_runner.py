@@ -2538,6 +2538,49 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pass
         return DraftTokenIds(req_ids, draft_token_ids)
 
+    def _reconcile_counts(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        B_expected: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Reconcile num_draft_tokens to match expected batch size.
+
+        When batch size changes between steps, counts may have different length
+        than _draft_probs batch dimension. Pad with zeros or trim to match.
+
+        Args:
+            spec_decode_metadata: Contains num_draft_tokens or cu_num_draft_tokens
+            B_expected: Expected batch size (should match _draft_probs.shape[0])
+            device: Device to place counts tensor on
+
+        Returns:
+            counts: [B_expected] tensor of per-request draft token counts
+        """
+        # Get counts from metadata
+        counts = getattr(spec_decode_metadata, "num_draft_tokens", None)
+        if counts is None:
+            # Derive from cumulative counts
+            cu = spec_decode_metadata.cu_num_draft_tokens
+            counts = torch.cat([cu[0:1], cu[1:] - cu[:-1]])
+
+        # Convert to tensor if needed
+        if not isinstance(counts, torch.Tensor):
+            counts = torch.tensor(counts, device=device, dtype=torch.int32)
+        else:
+            counts = counts.to(device=device, dtype=torch.int32)
+
+        # Pad or trim to match expected batch size
+        if counts.numel() < B_expected:
+            # Batch grew - pad with zeros
+            counts = torch.nn.functional.pad(counts, (0, B_expected - counts.numel()))
+        elif counts.numel() > B_expected:
+            # Batch shrunk - trim
+            counts = counts[:B_expected]
+
+        return counts
+
     def _prepare_draft_probs(
         self,
         spec_decode_metadata: SpecDecodeMetadata,
@@ -2564,13 +2607,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Build q_logp respecting per-request counts (no padding)
         # self._draft_probs: [batch_size, max_spec_len] with padding
-        # spec_decode_metadata.num_draft_tokens: list[int] - valid counts per request
-        counts = spec_decode_metadata.num_draft_tokens
+        # CRITICAL: Reconcile counts to match _draft_probs batch size
         B, T_max = self._draft_probs.shape
+        counts = self._reconcile_counts(spec_decode_metadata, B, self._draft_probs.device)  # [B]
 
         # Use masking for efficient extraction (no loops)
-        counts_tensor = torch.tensor(counts, dtype=torch.int32, device=self._draft_probs.device)
-        mask = torch.arange(T_max, device=self._draft_probs.device).unsqueeze(0) < counts_tensor.unsqueeze(1)  # [B, T_max]
+        mask = torch.arange(T_max, device=self._draft_probs.device).unsqueeze(0) < counts.unsqueeze(1)  # [B, T_max]
         q_logp = self._draft_probs.masked_select(mask).to(torch.float32).contiguous()  # [T_total]
 
         if q_logp.numel() == 0:
@@ -2784,6 +2826,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # CRITICAL: Synchronize CUDA streams after TP broadcast to prevent rank divergence
             torch.cuda.synchronize()
+
+            # Batch size consistency check: ensure proposals match current batch
+            current_batch_size = sampled_token_ids.shape[0]
+            assert self._draft_probs.shape[0] == current_batch_size, \
+                f"Draft probs batch {self._draft_probs.shape[0]} != current batch {current_batch_size}. " \
+                f"This indicates EAGLE proposer was called with wrong batch size."
 
             # Debug: Check what runner stored after TP broadcast
             print(f"[RUNNER_STORE] _draft_probs shape={self._draft_probs.shape}, "
