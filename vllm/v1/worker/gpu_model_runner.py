@@ -2353,10 +2353,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # NWOR: Commit accepted tokens and disarm router
         if self._router_token is not None:
             if isinstance(valid_sampled_token_ids, list):
-                accepted_lens = torch.tensor([len(seq) for seq in valid_sampled_token_ids],
+                # Compute actual draft tokens accepted (exclude bonus token)
+                # valid_sampled_token_ids includes: [accepted_draft_tokens..., bonus_token]
+                # So len(seq) - 1 gives the number of accepted draft tokens
+                accepted_lens = torch.tensor([max(0, len(seq) - 1) for seq in valid_sampled_token_ids],
                                             dtype=torch.int32, device=self.device)
             else:
-                accepted_lens = torch.tensor([1] * len(valid_sampled_token_ids),
+                # Non-list case: assume no draft tokens accepted (only bonus)
+                accepted_lens = torch.tensor([0] * len(valid_sampled_token_ids),
                                             dtype=torch.int32, device=self.device)
 
             self.drafter.kv_router.commit(accepted_lens)

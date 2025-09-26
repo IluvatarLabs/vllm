@@ -100,6 +100,7 @@ class KVWriteRouter:
         self._persistent = persistent_writer
         self._shadow = None
         self._mode = "immediate"  # or "defer"
+        self._slot_mapping = None  # Stored during begin() for use in stage()
 
     def immediate(self):
         """Switch to immediate write mode (normal operation)."""
@@ -115,6 +116,53 @@ class KVWriteRouter:
         """
         self._mode = "defer"
         self._shadow = shadow
+
+    @torch.no_grad()
+    def begin(self, length_hint: int, slot_mapping: torch.Tensor, seg_lens: Optional[torch.Tensor] = None):
+        """
+        Begin staging for a verification window.
+        Called by flash_attn backend before staging tokens.
+
+        Args:
+            length_hint: Expected number of tokens to stage
+            slot_mapping: Slot mapping tensor for all tokens in this window
+            seg_lens: Segment lengths (optional, for context)
+        """
+        if self._mode == "defer" and self._shadow is not None:
+            # Store slot_mapping for use in stage() calls
+            self._slot_mapping = slot_mapping
+            # Initialize shadow buffer for this verification window
+            self._shadow.begin(length_hint)
+
+    @torch.no_grad()
+    def stage(self, layer_idx: int, t: int, k_slice: torch.Tensor, v_slice: torch.Tensor):
+        """
+        Stage a single timestep's KV during verification.
+        Called by flash_attn backend for each token being verified.
+
+        Args:
+            layer_idx: Transformer layer index
+            t: Position in the staging buffer (0-indexed)
+            k_slice: Key tensor [1, H, D]
+            v_slice: Value tensor [1, H, D]
+        """
+        if self._mode == "defer" and self._shadow is not None:
+            # Extract slot mapping for this specific timestep
+            if self._slot_mapping is not None:
+                slot_t = self._slot_mapping[t:t+1]
+            else:
+                # Fallback: create a dummy slot mapping
+                slot_t = torch.tensor([t], dtype=torch.int64, device=k_slice.device)
+
+            # Stage in shadow buffer
+            self._shadow.stage(layer_idx, t, k_slice, v_slice, slot_t)
+        elif self._mode == "immediate":
+            # In immediate mode, write directly to persistent cache
+            if self._slot_mapping is not None:
+                slot_t = self._slot_mapping[t:t+1]
+            else:
+                slot_t = torch.tensor([t], dtype=torch.int64, device=k_slice.device)
+            self._persistent.append_slice(layer_idx, k_slice, v_slice, slot_t)
 
     @torch.no_grad()
     def write(self,
