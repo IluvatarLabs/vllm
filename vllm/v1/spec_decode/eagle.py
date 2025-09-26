@@ -197,6 +197,80 @@ class EagleProposer:
         # Enable NVTX ranges if requested
         self.nvtx_enabled = self.opt_config.enable_nvtx_ranges
 
+    def _sample_draft_tokens(
+        self, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample draft tokens with temperature/top-p/top-k.
+
+        This replaces the hardcoded argmax to enable realistic acceptance rates.
+        With argmax, draft and target models pick identical tokens → 100% acceptance.
+        With stochastic sampling, we get realistic 30-70% acceptance rates.
+
+        Args:
+            logits: [batch_size, vocab_size] unnormalized logits from draft model
+
+        Returns:
+            draft_token_ids: [batch_size] sampled token IDs
+            draft_logp: [batch_size] log probability of sampled tokens
+        """
+        # Fallback to greedy argmax if configured
+        if self.opt_config.draft_sampling_mode == "argmax":
+            draft_token_ids = logits.argmax(dim=-1)
+            draft_logp = torch.log_softmax(logits, dim=-1).gather(
+                -1, draft_token_ids.unsqueeze(-1)
+            ).squeeze(-1)
+            return draft_token_ids, draft_logp
+
+        # Stochastic sampling mode
+        # Apply temperature scaling
+        if self.opt_config.draft_temperature != 1.0:
+            logits = logits / self.opt_config.draft_temperature
+
+        # Compute probabilities
+        probs = torch.softmax(logits, dim=-1)
+
+        # Apply top-k filtering if enabled
+        if self.opt_config.draft_top_k > 0:
+            top_k_probs, top_k_indices = torch.topk(
+                probs, self.opt_config.draft_top_k, dim=-1
+            )
+            # Zero out non-top-k probabilities
+            mask = torch.zeros_like(probs).scatter(-1, top_k_indices, 1.0)
+            probs = probs * mask
+
+        # Apply top-p (nucleus sampling) if enabled
+        if self.opt_config.draft_top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(
+                probs, descending=True, dim=-1
+            )
+            cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            # Remove tokens with cumulative probability above threshold
+            sorted_mask = cumsum_probs <= self.opt_config.draft_top_p
+            # Always keep at least the top token
+            sorted_mask[..., 0] = True
+
+            # Scatter mask back to original order
+            mask = torch.zeros_like(probs, dtype=torch.bool).scatter(
+                -1, sorted_indices, sorted_mask
+            )
+            probs = torch.where(mask, probs, torch.zeros_like(probs))
+
+        # Renormalize probabilities
+        probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        probs = probs / probs_sum
+
+        # Sample from the distribution
+        draft_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        # Get log probability of sampled tokens (needed for acceptance ratio)
+        draft_logp = torch.log(
+            probs.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).clamp(min=1e-12)
+        )
+
+        return draft_token_ids, draft_logp
+
     def propose(
         self,
         # [num_tokens]

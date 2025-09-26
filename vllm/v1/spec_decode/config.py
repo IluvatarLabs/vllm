@@ -21,6 +21,12 @@ class SpecDecodeOptConfig:
     # NWOR (No-Write-On-Reject) settings
     use_shadow_kv: bool = False
 
+    # Draft sampling settings (fix for 100% acceptance issue)
+    draft_sampling_mode: str = "stochastic"  # "stochastic" or "argmax"
+    draft_temperature: float = 0.9
+    draft_top_p: float = 0.95
+    draft_top_k: int = 0  # 0 = disabled
+
     # Debug and profiling settings
     enable_nvtx_ranges: bool = False
     debug_alloc_counters: bool = False
@@ -57,6 +63,27 @@ class SpecDecodeOptConfig:
         else:
             config.use_shadow_kv = os.environ.get('VLLM_USE_SHADOW_KV', '0') == '1'
 
+        # Draft sampling settings
+        if hasattr(vllm_config, 'draft_sampling_mode'):
+            config.draft_sampling_mode = vllm_config.draft_sampling_mode
+        else:
+            config.draft_sampling_mode = os.environ.get('VLLM_DRAFT_SAMPLING_MODE', 'stochastic')
+
+        if hasattr(vllm_config, 'draft_temperature'):
+            config.draft_temperature = vllm_config.draft_temperature
+        else:
+            config.draft_temperature = float(os.environ.get('VLLM_DRAFT_TEMPERATURE', '0.9'))
+
+        if hasattr(vllm_config, 'draft_top_p'):
+            config.draft_top_p = vllm_config.draft_top_p
+        else:
+            config.draft_top_p = float(os.environ.get('VLLM_DRAFT_TOP_P', '0.95'))
+
+        if hasattr(vllm_config, 'draft_top_k'):
+            config.draft_top_k = vllm_config.draft_top_k
+        else:
+            config.draft_top_k = int(os.environ.get('VLLM_DRAFT_TOP_K', '0'))
+
         # Debug settings
         if hasattr(vllm_config, 'enable_nvtx_ranges'):
             config.enable_nvtx_ranges = vllm_config.enable_nvtx_ranges
@@ -71,11 +98,16 @@ class SpecDecodeOptConfig:
         # Log configuration
         if config.scv_enabled or config.use_shadow_kv:
             logger.info(
-                "SpecDecode optimizations: SCV=%s (chunk_size=%d), NWOR=%s, NVTX=%s",
+                "SpecDecode optimizations: SCV=%s (chunk_size=%d), NWOR=%s, NVTX=%s, "
+                "Draft sampling=%s (temp=%.2f, top_p=%.2f, top_k=%d)",
                 config.scv_enabled,
                 config.verify_chunk_size,
                 config.use_shadow_kv,
-                config.enable_nvtx_ranges
+                config.enable_nvtx_ranges,
+                config.draft_sampling_mode,
+                config.draft_temperature,
+                config.draft_top_p,
+                config.draft_top_k
             )
 
         return config
@@ -96,6 +128,31 @@ class SpecDecodeOptConfig:
             logger.warning(
                 "SCV enabled with chunk_size=1, no chunking benefit. "
                 "Consider increasing verify_chunk_size or disabling SCV."
+            )
+
+        # Validate draft sampling settings
+        if self.draft_sampling_mode not in ["stochastic", "argmax"]:
+            raise ValueError(
+                f"draft_sampling_mode must be 'stochastic' or 'argmax', "
+                f"got '{self.draft_sampling_mode}'"
+            )
+
+        if self.draft_temperature <= 0:
+            raise ValueError(f"draft_temperature must be > 0, got {self.draft_temperature}")
+
+        if not (0.0 < self.draft_top_p <= 1.0):
+            raise ValueError(f"draft_top_p must be in (0, 1], got {self.draft_top_p}")
+
+        if self.draft_top_k < 0:
+            raise ValueError(f"draft_top_k must be >= 0, got {self.draft_top_k}")
+
+        # Warn if using argmax (will cause 100% acceptance with similar models)
+        if self.draft_sampling_mode == "argmax":
+            logger.warning(
+                "Draft sampling mode is 'argmax' (greedy). This may cause 100%% "
+                "acceptance rate with similar draft/target models, preventing "
+                "NWOR/SCV optimizations from showing benefits. "
+                "Consider using 'stochastic' mode instead."
             )
 
         return True

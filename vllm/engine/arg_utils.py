@@ -370,6 +370,11 @@ class EngineArgs:
     use_shadow_kv: bool = False
     enable_nvtx_ranges: bool = False
     debug_alloc_counters: bool = False
+    # Draft sampling flags (fix for 100% acceptance issue)
+    draft_sampling_mode: str = "stochastic"
+    draft_temperature: float = 0.9
+    draft_top_p: float = 0.95
+    draft_top_k: int = 0
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
     rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")
@@ -965,6 +970,33 @@ class EngineArgs:
             '--debug-alloc-counters',
             action='store_true',
             help='Enable debug allocator counters for memory analysis'
+        )
+
+        # Draft sampling flags (fix for 100% acceptance issue)
+        vllm_group.add_argument(
+            '--draft-sampling-mode',
+            type=str,
+            choices=['stochastic', 'argmax'],
+            default='stochastic',
+            help='Draft token sampling mode: stochastic (realistic acceptance) or argmax (greedy, may cause 100%% acceptance)'
+        )
+        vllm_group.add_argument(
+            '--draft-temperature',
+            type=float,
+            default=0.9,
+            help='Temperature for draft model sampling (only used in stochastic mode, default: 0.9)'
+        )
+        vllm_group.add_argument(
+            '--draft-top-p',
+            type=float,
+            default=0.95,
+            help='Top-p (nucleus sampling) for draft model (default: 0.95)'
+        )
+        vllm_group.add_argument(
+            '--draft-top-k',
+            type=int,
+            default=0,
+            help='Top-k filtering for draft model (0 = disabled, default: 0)'
         )
 
         # Other arguments
