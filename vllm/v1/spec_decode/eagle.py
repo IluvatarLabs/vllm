@@ -239,66 +239,65 @@ class EagleProposer:
         # Fallback to greedy argmax if configured
         if self.opt_config.draft_sampling_mode == "argmax":
             draft_token_ids = logits.argmax(dim=-1)
-            draft_logp = torch.log_softmax(logits, dim=-1).gather(
+            draft_logp = torch.log_softmax(logits.float(), dim=-1).gather(
                 -1, draft_token_ids.unsqueeze(-1)
             ).squeeze(-1)
             return draft_token_ids, draft_logp
 
-        # Stochastic sampling mode
-        # Apply temperature scaling
-        if self.opt_config.draft_temperature != 1.0:
-            logits = logits / self.opt_config.draft_temperature
+        # Stochastic sampling: ALL operations in fp32 logits space to prevent underflow
+        # Convert to fp32 and apply temperature in LOGITS space
+        logits_f32 = (logits / max(self.opt_config.draft_temperature, 1e-6)).float()
 
-        # Compute probabilities
-        probs = torch.softmax(logits, dim=-1)
-
-        # Apply top-k filtering if enabled
+        # Apply top-k filtering: mask in LOGITS space with -inf (not probability space!)
         if self.opt_config.draft_top_k > 0:
-            top_k_probs, top_k_indices = torch.topk(
-                probs, self.opt_config.draft_top_k, dim=-1
-            )
-            # Zero out non-top-k probabilities
-            mask = torch.zeros_like(probs).scatter(-1, top_k_indices, 1.0)
-            probs = probs * mask
+            kth_val = torch.topk(logits_f32, k=self.opt_config.draft_top_k, dim=-1).values[..., -1:]
+            logits_f32 = logits_f32.masked_fill(logits_f32 < kth_val, float('-inf'))
 
-        # Apply top-p (nucleus sampling) if enabled
-        if self.opt_config.draft_top_p < 1.0:
-            sorted_probs, sorted_indices = torch.sort(
-                probs, descending=True, dim=-1
-            )
+        # Apply top-p (nucleus): mask in LOGITS space with -inf
+        if 0.0 < self.opt_config.draft_top_p < 1.0:
+            # Sort by logit value descending
+            sorted_logits, sorted_indices = torch.sort(logits_f32, dim=-1, descending=True)
+
+            # Compute cumulative probabilities in fp32 (stable)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
             cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
 
-            # Remove tokens with cumulative probability above threshold
-            sorted_mask = cumsum_probs <= self.opt_config.draft_top_p
-            # Always keep at least the top token
-            sorted_mask[..., 0] = True
+            # Mark tokens to DROP (cumsum > threshold)
+            sorted_drop = cumsum_probs > self.opt_config.draft_top_p
 
-            # Scatter mask back to original order
-            mask = torch.zeros_like(probs, dtype=torch.bool).scatter(
-                -1, sorted_indices, sorted_mask
+            # Shift right: keep the token that crosses threshold
+            sorted_drop[..., 1:] = sorted_drop[..., :-1].clone()
+            sorted_drop[..., 0] = False
+
+            # CRITICAL: Always keep at least 2 tokens to prevent single-survivor collapse
+            sorted_drop[..., :2] = False
+
+            # Map drop mask back to original vocab order
+            drop_mask = torch.zeros_like(sorted_drop, dtype=torch.bool).scatter(
+                -1, sorted_indices, sorted_drop
             )
-            probs = torch.where(mask, probs, torch.zeros_like(probs))
+            logits_f32 = logits_f32.masked_fill(drop_mask, float('-inf'))
 
-        # Renormalize probabilities
-        probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-        probs = probs / probs_sum
+        # Compute normalized log-probabilities directly (no separate renormalization!)
+        # log_softmax handles -inf correctly: masked tokens get -inf logprob
+        logp_full = torch.log_softmax(logits_f32, dim=-1)  # [B, V], fp32
+        probs_full = logp_full.exp()  # [B, V], fp32
 
         # Sample from the distribution
-        draft_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        draft_token_ids = torch.multinomial(probs_full, num_samples=1).squeeze(-1)  # [B]
 
-        # Get log probability of sampled tokens (needed for acceptance ratio)
-        chosen_p = probs.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).clamp(min=1e-12)
-        draft_logp = torch.log(chosen_p)
+        # Gather TRUE log-probability from log_softmax output (no log after gather!)
+        draft_logp = logp_full.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B], fp32
 
-        # Debug: Check for zero logprobs (indicates prob=1.0 collapse)
-        import sys
+        # Guardrail: detect if bug still exists
         if (draft_logp == 0).all():
-            print(f"[ZERO_LOGP_DEBUG] All zeros! probs stats: min={probs.min():.6f} max={probs.max():.6f}, "
-                  f"chosen_p min={chosen_p.min():.6f} max={chosen_p.max():.6f}, "
-                  f"sampling_mode={self.opt_config.draft_sampling_mode}, "
-                  f"temperature={self.opt_config.draft_temperature}, "
+            import sys
+            survivors = torch.isfinite(logits_f32).sum(dim=-1)
+            print(f"[FATAL] All draft_logp = 0! survivors={survivors.tolist()}, "
+                  f"temp={self.opt_config.draft_temperature}, "
                   f"top_k={self.opt_config.draft_top_k}, top_p={self.opt_config.draft_top_p}",
                   file=sys.stderr, flush=True)
+            raise RuntimeError("Draft sampling collapsed to prob=1.0: fp16 underflow or single-survivor bug")
 
         return draft_token_ids, draft_logp
 
