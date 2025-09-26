@@ -87,33 +87,37 @@ class RejectionSampler(nn.Module):
         '''
         assert metadata.max_spec_len <= MAX_SPEC_LEN
 
-        # Validate draft_logprobs if provided
-        if draft_logprobs is not None:
-            assert draft_logprobs.ndim == 1, \
-                f"draft_logprobs should be 1-D, got shape {draft_logprobs.shape}"
-            assert draft_logprobs.shape[0] == metadata.draft_token_ids.shape[0], \
-                f"draft_logprobs length {draft_logprobs.shape[0]} != " \
-                f"draft_token_ids length {metadata.draft_token_ids.shape[0]}"
+        # CRITICAL: draft_logprobs is REQUIRED for spec decode
+        # If missing, drafter is broken - FAIL LOUDLY
+        if draft_logprobs is None:
+            raise RuntimeError(
+                "Spec decode requires draft_logprobs for acceptance ratio test. "
+                "EAGLE proposer must emit logprobs for ALL draft tokens. "
+                "If you see this error, the drafter failed to populate proposals.logprobs."
+            )
+
+        # Validate draft_logprobs
+        assert draft_logprobs.ndim == 1, \
+            f"draft_logprobs should be 1-D, got shape {draft_logprobs.shape}"
+        assert draft_logprobs.shape[0] == metadata.draft_token_ids.shape[0], \
+            f"draft_logprobs length {draft_logprobs.shape[0]} != " \
+            f"draft_token_ids length {metadata.draft_token_ids.shape[0]}"
 
         # Convert 1-D draft_logprobs to dense format for Triton kernels
         # This creates the sparse [num_tokens, vocab_size] representation
-        # that the kernels expect, but only when draft_logprobs is provided
-        if draft_logprobs is not None:
-            num_tokens = metadata.draft_token_ids.shape[0]
-            vocab_size = target_logits.shape[-1]
+        num_tokens = metadata.draft_token_ids.shape[0]
+        vocab_size = target_logits.shape[-1]
 
-            # Create sparse representation
-            draft_probs = torch.zeros(
-                (num_tokens, vocab_size),
-                dtype=torch.float32,
-                device=metadata.draft_token_ids.device
-            )
+        # Create sparse representation
+        draft_probs = torch.zeros(
+            (num_tokens, vocab_size),
+            dtype=torch.float32,
+            device=metadata.draft_token_ids.device
+        )
 
-            # Fill chosen token probabilities (convert from log-space)
-            token_indices = torch.arange(num_tokens, device=metadata.draft_token_ids.device)
-            draft_probs[token_indices, metadata.draft_token_ids] = torch.exp(draft_logprobs)
-        else:
-            draft_probs = None
+        # Fill chosen token probabilities (convert from log-space)
+        token_indices = torch.arange(num_tokens, device=metadata.draft_token_ids.device)
+        draft_probs[token_indices, metadata.draft_token_ids] = torch.exp(draft_logprobs)
 
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
@@ -192,8 +196,8 @@ def rejection_sample(
     max_spec_len: int,
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
-    # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    # [num_tokens, vocab_size] - REQUIRED, not Optional
+    draft_probs: torch.Tensor,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     # [batch_size, 1]
@@ -201,7 +205,7 @@ def rejection_sample(
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
-    assert draft_probs is None or draft_probs.ndim == 2
+    assert draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
     assert target_probs.ndim == 2
 
@@ -210,7 +214,7 @@ def rejection_sample(
     vocab_size = target_probs.shape[-1]
     device = target_probs.device
     assert draft_token_ids.is_contiguous()
-    assert draft_probs is None or draft_probs.is_contiguous()
+    assert draft_probs.is_contiguous()
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
@@ -278,7 +282,6 @@ def rejection_sample(
         is_greedy,
         max_spec_len,
         vocab_size,
-        NO_DRAFT_PROBS=draft_probs is None,
         num_warps=1,
     )
     return output_token_ids
@@ -448,8 +451,8 @@ def sample_recovered_tokens(
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens]
     draft_token_ids: torch.Tensor,
-    # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    # [num_tokens, vocab_size] - REQUIRED, not Optional
+    draft_probs: torch.Tensor,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -480,7 +483,6 @@ def sample_recovered_tokens(
         q,
         vocab_size,
         triton.next_power_of_2(vocab_size),
-        NO_DRAFT_PROBS=draft_probs is None,
     )
     return recovered_token_ids
 
@@ -539,7 +541,7 @@ def rejection_random_sample_kernel(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
-    draft_probs_ptr,  # [num_tokens, vocab_size] or None
+    draft_probs_ptr,  # [num_tokens, vocab_size] - REQUIRED
     target_probs_ptr,  # [num_tokens, vocab_size]
     bonus_token_ids_ptr,  # [batch_size]
     recovered_token_ids_ptr,  # [num_tokens]
@@ -547,7 +549,6 @@ def rejection_random_sample_kernel(
     is_greedy_ptr,  # [batch_size]
     max_spec_len,
     vocab_size,
-    NO_DRAFT_PROBS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     is_greedy = tl.load(is_greedy_ptr + req_idx)
@@ -566,12 +567,9 @@ def rejection_random_sample_kernel(
     for pos in range(num_draft_tokens):
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-            if NO_DRAFT_PROBS:
-                draft_prob = 1
-            else:
-                draft_prob = tl.load(draft_probs_ptr +
-                                     (start_idx + pos) * vocab_size +
-                                     draft_token_id)
+            draft_prob = tl.load(draft_probs_ptr +
+                                 (start_idx + pos) * vocab_size +
+                                 draft_token_id)
             target_prob = tl.load(target_probs_ptr +
                                   (start_idx + pos) * vocab_size +
                                   draft_token_id)
@@ -627,12 +625,11 @@ def sample_recovered_tokens_kernel(
     output_token_ids_ptr,  # [num_tokens]
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
-    draft_probs_ptr,  # [num_tokens, vocab_size] or None
+    draft_probs_ptr,  # [num_tokens, vocab_size] - REQUIRED
     target_probs_ptr,  # [num_tokens, vocab_size]
     q_ptr,  # [batch_size, vocab_size]
     vocab_size,
     PADDED_VOCAB_SIZE: tl.constexpr,
-    NO_DRAFT_PROBS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     if req_idx == 0:
@@ -648,25 +645,17 @@ def sample_recovered_tokens_kernel(
         return
 
     vocab_offset = tl.arange(0, PADDED_VOCAB_SIZE)
-    if NO_DRAFT_PROBS:
-        draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-        prob = tl.load(target_probs_ptr + (start_idx + pos) * vocab_size +
-                       vocab_offset,
-                       mask=((vocab_offset < vocab_size) &
-                             (vocab_offset != draft_token_id)),
-                       other=0)
-    else:
-        draft_prob = tl.load(draft_probs_ptr + (start_idx + pos) * vocab_size +
-                             vocab_offset,
-                             mask=vocab_offset < vocab_size,
-                             other=0)
-        target_prob = tl.load(target_probs_ptr +
-                              (start_idx + pos) * vocab_size + vocab_offset,
-                              mask=vocab_offset < vocab_size,
-                              other=0)
-        prob = tl.maximum(target_prob - draft_prob, 0)
-        # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here because
-        # `tl.argmax` will select the maximum value.
+    draft_prob = tl.load(draft_probs_ptr + (start_idx + pos) * vocab_size +
+                         vocab_offset,
+                         mask=vocab_offset < vocab_size,
+                         other=0)
+    target_prob = tl.load(target_probs_ptr +
+                          (start_idx + pos) * vocab_size + vocab_offset,
+                          mask=vocab_offset < vocab_size,
+                          other=0)
+    prob = tl.maximum(target_prob - draft_prob, 0)
+    # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here because
+    # `tl.argmax` will select the maximum value.
 
     q = tl.load(q_ptr + req_idx * vocab_size + vocab_offset,
                 mask=vocab_offset < vocab_size,
