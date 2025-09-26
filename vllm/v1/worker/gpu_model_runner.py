@@ -2249,9 +2249,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # NWOR: Arm router before target verify pass if spec decode + shadow_kv enabled
         if (spec_decode_metadata is not None and
             hasattr(self, 'drafter') and hasattr(self.drafter, 'kv_router') and
-            self.drafter.kv_router is not None):
-            self.drafter.kv_router.defer()
+            self.drafter.kv_router is not None and
+            hasattr(self.drafter, 'shadow_kv') and self.drafter.shadow_kv is not None):
+            self.drafter.kv_router.defer(self.drafter.shadow_kv)
             self._router_token = set_router(self.drafter.kv_router)
+            # Sanity check: router should be deferred after arming
+            assert self.drafter.kv_router.is_deferred(), \
+                "Router token set but router not in deferred mode"
         else:
             self._router_token = None
 

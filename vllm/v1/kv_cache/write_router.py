@@ -113,9 +113,23 @@ class KVWriteRouter:
 
         Args:
             shadow: ShadowKV instance to stage writes
+
+        Raises:
+            RuntimeError: If shadow is None
         """
+        if shadow is None:
+            raise RuntimeError("KVWriteRouter.defer() requires a ShadowKV instance")
         self._mode = "defer"
         self._shadow = shadow
+
+    def is_deferred(self) -> bool:
+        """
+        Check if router is in deferred mode with valid shadow buffer.
+
+        Returns:
+            True if router is armed for NWOR staging
+        """
+        return self._mode == "defer" and self._shadow is not None
 
     @torch.no_grad()
     def begin(self, length_hint: int, slot_mapping: torch.Tensor, seg_lens: Optional[torch.Tensor] = None):

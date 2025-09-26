@@ -64,6 +64,7 @@ class ShadowKV:
         self._total_staged = 0
         self._total_committed = 0
         self._total_rejected = 0
+        self._debug_stage_calls = 0  # Track if staging is actually happening
 
         logger.info(
             "Initialized ShadowKV: %d layers, %d heads, %d head_dim, max_chunk=%d",
@@ -130,6 +131,9 @@ class ShadowKV:
         if t + 1 > self._len:
             self._len = t + 1
             self._total_staged += 1
+            self._debug_stage_calls += 1
+            if self._debug_stage_calls == 1:
+                logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
 
     @torch.no_grad()
     def commit_to(self, persistent_writer, accepted_len: int):
