@@ -170,11 +170,11 @@ class EagleProposer:
         self.shadow_kv = None
         self.kv_router = None
         if self.opt_config.use_shadow_kv:
-            # Get model dimensions for ShadowKV
-            model_config = vllm_config.model_config
-            n_layers = model_config.num_hidden_layers
-            n_heads = model_config.num_key_value_heads or model_config.num_attention_heads
-            head_dim = model_config.hidden_size // model_config.num_attention_heads
+            # Get model dimensions for ShadowKV from HF config
+            hf_config = vllm_config.model_config.hf_config
+            n_layers = hf_config.num_hidden_layers
+            n_heads = getattr(hf_config, 'num_key_value_heads', None) or hf_config.num_attention_heads
+            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
             # Create ShadowKV staging buffer
             self.shadow_kv = ShadowKV(
