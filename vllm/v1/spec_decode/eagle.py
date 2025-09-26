@@ -978,6 +978,27 @@ class EagleProposer:
             ])
         ) == 1, "All eagle layers should belong to the same kv cache group"
 
+    def get_metrics(self) -> dict:
+        """
+        Get NWOR/SCV metrics for benchmarking.
+
+        Returns:
+            Dictionary containing:
+            - total_staged: Total tokens staged in ShadowKV
+            - total_committed: Total tokens committed (accepted)
+            - total_rejected: Total tokens rejected
+            - acceptance_rate: Fraction of staged tokens that were accepted
+        """
+        if self.shadow_kv is not None:
+            return self.shadow_kv.get_metrics()
+        else:
+            return {
+                "total_staged": 0,
+                "total_committed": 0,
+                "total_rejected": 0,
+                "acceptance_rate": 0.0,
+            }
+
 
 # NOTE(woosuk): Currently, the below code is not used and we always use argmax
 # to sample the draft tokens. We will use this after we find a way to manage
