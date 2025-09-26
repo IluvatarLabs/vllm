@@ -2042,6 +2042,41 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     file=sys.stderr, flush=True
                 )
 
+            # Diagnostic: Check tensor shapes and alignment
+            print("[ACCEPT_DIAG] shapes "
+                  f"tokens={spec_decode_metadata.draft_token_ids.shape}, "
+                  f"logp={draft_logprobs.shape if draft_logprobs is not None else None}, "
+                  f"tgt={target_logits.shape}, "
+                  f"counts={spec_decode_metadata.num_draft_tokens}, "
+                  f"tokens_head={spec_decode_metadata.draft_token_ids[:8].tolist()}",
+                  file=sys.stderr, flush=True)
+
+            # Smoke test: Diagnose alignment and estimate acceptance rate
+            if draft_logprobs is not None:
+                with torch.no_grad():
+                    p_draft  = draft_logprobs.exp()  # [T_total]
+                    p_target = torch.softmax(target_logits, dim=-1).gather(
+                        -1, spec_decode_metadata.draft_token_ids.view(-1, 1)
+                    ).squeeze(-1)  # [T_total]
+                    ratio    = (p_target / (p_draft.clamp_min(1e-12))).clamp_max(10.0)
+                    u        = torch.rand_like(ratio)
+                    est_rate = (u < torch.minimum(torch.ones_like(ratio), ratio)).float().mean().item()
+
+                    nz_tgt   = (p_target > 0).float().mean().item()
+                    print(f"[ACCEPT_SMOKE:pre-sampler] T={spec_decode_metadata.draft_token_ids.numel()} "
+                          f"p_tgt>0={nz_tgt:.2%} "
+                          f"est_rate={est_rate:.2%} "
+                          f"p_draft_med={p_draft.median().item():.3e} "
+                          f"p_tgt_med={p_target.median().item():.3e}",
+                          file=sys.stderr, flush=True)
+
+            # Alignment check: Verify token IDs are in valid range
+            bad = (spec_decode_metadata.draft_token_ids < 0) | \
+                  (spec_decode_metadata.draft_token_ids >= target_logits.size(-1))
+            if bad.any():
+                bad_ids = spec_decode_metadata.draft_token_ids[bad].tolist()
+                raise RuntimeError(f"Out-of-range token ids in draft_token_ids: {bad_ids}, vocab_size={target_logits.size(-1)}")
+
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
                 draft_logprobs,  # 1-D [num_tokens] log-probs for chosen tokens
