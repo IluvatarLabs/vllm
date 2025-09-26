@@ -184,12 +184,16 @@ class LlamaModel(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    continue  # Skip missing weights
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    continue  # Skip missing weights
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)

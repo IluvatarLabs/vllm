@@ -251,7 +251,9 @@ class EagleMiniCPMModel(nn.Module):
                     continue
                 if is_pp_missing_parameter(name, self):
                     continue
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    continue  # Skip missing weights
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -262,7 +264,9 @@ class EagleMiniCPMModel(nn.Module):
                     name = name.replace(weight_name, param_name)
                     if is_pp_missing_parameter(name, self):
                         continue
-                    param = params_dict[name]
+                    param = params_dict.get(name)
+                    if param is None:
+                        continue  # Skip missing weights
                     weight_loader = param.weight_loader
                     weight_loader(param,
                                   loaded_weight,
@@ -275,7 +279,9 @@ class EagleMiniCPMModel(nn.Module):
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
-                    param = params_dict[name]
+                    param = params_dict.get(name)
+                    if param is None:
+                        continue  # Skip missing weights
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
 

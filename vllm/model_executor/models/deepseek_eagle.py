@@ -139,7 +139,9 @@ class DeepseekV2Model(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    continue  # Skip missing weights
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -150,7 +152,9 @@ class DeepseekV2Model(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
-                    param = params_dict[name]
+                    param = params_dict.get(name)
+                    if param is None:
+                        continue  # Skip missing weights
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -175,7 +179,9 @@ class DeepseekV2Model(nn.Module):
                     if name is None:
                         continue
 
-                    param = params_dict[name]
+                    param = params_dict.get(name)
+                    if param is None:
+                        continue  # Skip missing weights
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
