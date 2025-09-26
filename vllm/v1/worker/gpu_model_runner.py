@@ -2099,19 +2099,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
+        print(f"[BOOKKEEP_DEBUG] sampled_token_ids shape: {sampled_token_ids.shape}", file=sys.stderr, flush=True)
         invalid_req_indices = []
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
+            print(f"[BOOKKEEP_DEBUG] max_gen_len={max_gen_len}, use_async_scheduling={self.use_async_scheduling}", file=sys.stderr, flush=True)
             if max_gen_len == 1:
                 # No spec decode tokens.
+                print(f"[BOOKKEEP_DEBUG] Branch: No spec decode (max_gen_len=1)", file=sys.stderr, flush=True)
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
             else:
                 # Includes spec decode tokens.
+                print(f"[BOOKKEEP_DEBUG] Branch: Spec decode (max_gen_len={max_gen_len}), calling parse_output", file=sys.stderr, flush=True)
                 valid_sampled_token_ids = self.rejection_sampler.parse_output(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
                 )
+                print(f"[BOOKKEEP_DEBUG] parse_output returned", file=sys.stderr, flush=True)
             # Mask out the sampled tokens that should not be sampled.
             for i in discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[int(i)].clear()
@@ -2197,6 +2202,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        # DEBUG: Write to file to avoid logger issues in multiprocessing
+        try:
+            with open('/tmp/vllm_execute_model.log', 'a') as f:
+                has_spec = hasattr(scheduler_output, 'spec_decode_metadata') and scheduler_output.spec_decode_metadata is not None
+                f.write(f"[EXECUTE_MODEL] START: has_spec={has_spec}, _draft_probs={'None' if not hasattr(self, '_draft_probs') or self._draft_probs is None else self._draft_probs.shape}\n")
+                f.flush()
+        except:
+            pass
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -2343,6 +2356,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # NWOR: Reset router context BEFORE draft proposal (CRITICAL FOR TP)
+        # Target forward complete. Must reset context NOW to prevent EAGLE draft
+        # model from seeing armed router, which causes TP desync/hangs.
+        # We'll commit accepted tokens after bookkeeping.
+        router_for_commit = None
+        if self._router_token is not None:
+            from vllm.kvcache.route_ctx import reset_router
+            reset_router(self._router_token)
+            self._router_token = None
+            router_for_commit = self.drafter.kv_router
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("Draft"):
@@ -2364,7 +2388,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # EAGLE speculative decoding can use the GPU sampled tokens
             # as inputs, and does not need to wait for bookkeeping to finish.
             propose_draft_token_ids(sampler_output.sampled_token_ids)
+            print("[HANG_DEBUG] After propose_draft_token_ids nested function", file=sys.stderr, flush=True)
 
+        print("[HANG_DEBUG] Before bookkeeping", file=sys.stderr, flush=True)
         with record_function_or_nullcontext("Bookkeep"):
             (
                 num_nans_in_logits,
@@ -2377,33 +2403,29 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ) = self._bookkeeping_sync(scheduler_output, sampler_output,
                                        logits, hidden_states,
                                        num_scheduled_tokens)
+        print("[HANG_DEBUG] After bookkeeping", file=sys.stderr, flush=True)
 
         if self.speculative_config and not use_padded_batch_for_eagle:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        print("[HANG_DEBUG] Before EPLB", file=sys.stderr, flush=True)
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
+        print("[HANG_DEBUG] After EPLB", file=sys.stderr, flush=True)
 
-        # NWOR: Commit accepted tokens and disarm router
-        if self._router_token is not None:
+        # NWOR: Commit accepted tokens from shadow_kv to persistent cache
+        if router_for_commit is not None:
             if isinstance(valid_sampled_token_ids, list):
-                # Compute actual draft tokens accepted (exclude bonus token)
-                # valid_sampled_token_ids includes: [accepted_draft_tokens..., bonus_token]
-                # So len(seq) - 1 gives the number of accepted draft tokens
-                accepted_lens = torch.tensor([max(0, len(seq) - 1) for seq in valid_sampled_token_ids],
-                                            dtype=torch.int32, device=self.device)
+                num_accepted_list = [max(0, len(seq) - 1) for seq in valid_sampled_token_ids]
             else:
-                # Non-list case: assume no draft tokens accepted (only bonus)
-                accepted_lens = torch.tensor([0] * len(valid_sampled_token_ids),
-                                            dtype=torch.int32, device=self.device)
+                num_accepted_list = [(row >= 0).sum().item() - 1 for row in valid_sampled_token_ids]
 
-            self.drafter.kv_router.commit(accepted_lens)
-            reset_router(self._router_token)
-            self._router_token = None
-            self.drafter.kv_router.immediate()
+            router_for_commit.commit(num_accepted_list)
+            router_for_commit.immediate()
 
+        print("[HANG_DEBUG] Creating output", file=sys.stderr, flush=True)
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2414,6 +2436,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
         )
+        print("[HANG_DEBUG] About to return from execute_model", file=sys.stderr, flush=True)
 
         if not self.use_async_scheduling:
             return output
@@ -2426,6 +2449,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+        try:
+            with open('/tmp/vllm_take_draft.log', 'a') as f:
+                f.write(f"[TAKE_DRAFT] START: _draft_token_ids={type(self._draft_token_ids)}, _draft_probs={'None' if not hasattr(self, '_draft_probs') or self._draft_probs is None else self._draft_probs.shape}\n")
+                f.flush()
+        except:
+            pass
         if self._draft_token_ids is None:
             return None
         req_ids = self.input_batch.req_ids
@@ -2434,7 +2463,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
-        self._draft_probs = None  # Clear draft probs as well
+        self._draft_probs = None  # Clear draft probs - both consumed together
+        try:
+            with open('/tmp/vllm_take_draft.log', 'a') as f:
+                f.write(f"[TAKE_DRAFT] END: Returning {len(draft_token_ids)} sequences, cleared _draft_probs\n")
+                f.flush()
+        except:
+            pass
         return DraftTokenIds(req_ids, draft_token_ids)
 
     def _prepare_draft_probs(
@@ -2668,6 +2703,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Broadcast to all TP ranks (critical for TP > 1)
             self._draft_probs = self._tp_broadcast_draft_probs(local_draft_probs)
+
+            # CRITICAL: Synchronize CUDA streams after TP broadcast to prevent rank divergence
+            torch.cuda.synchronize()
+
             print(f"[SPEC_DEBUG] EAGLE propose complete (after TP broadcast): draft_probs shape={self._draft_probs.shape}, draft_token_ids shape={proposals.token_ids.shape}", file=sys.stderr, flush=True)
             draft_token_ids = proposals.token_ids
         return draft_token_ids
