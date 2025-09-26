@@ -2004,15 +2004,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # it is safe to update `target_logits` in place.
             target_logits = logits[spec_decode_metadata.target_logits_indices]
 
-            # Convert sparse draft logprobs to full format for rejection sampler
-            draft_probs = self._prepare_draft_probs(
+            # Extract 1-D draft logprobs (per-request, no padding)
+            draft_logprobs = self._prepare_draft_probs(
                 spec_decode_metadata,
-                target_logits.shape[-1]  # vocab_size
+                target_logits.shape[-1]  # vocab_size (kept for API compat)
             ) if hasattr(self, '_draft_probs') and self._draft_probs is not None else None
+
+            # DEBUG: Verify draft_logprobs alignment
+            if draft_logprobs is not None:
+                logger.info(
+                    f"[SPEC_DEBUG] draft_logprobs shape: {draft_logprobs.shape}, "
+                    f"draft_token_ids shape: {spec_decode_metadata.draft_token_ids.shape}, "
+                    f"num_draft_tokens: {spec_decode_metadata.num_draft_tokens}"
+                )
+            else:
+                logger.warning("[SPEC_DEBUG] draft_logprobs is None!")
 
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
-                draft_probs,  # Now passing actual draft probs!
+                draft_logprobs,  # 1-D [num_tokens] log-probs for chosen tokens
                 target_logits,
                 bonus_token_ids,
                 sampling_metadata,
@@ -2405,43 +2415,45 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         spec_decode_metadata: SpecDecodeMetadata,
         vocab_size: int,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """
-        Convert sparse draft logprobs to full format for rejection sampler.
+        Extract valid draft logprobs respecting per-request counts.
+
+        FIXED: No longer uses flatten() which misaligns padded rows.
+        Instead, extracts valid logprobs per-request respecting num_draft_tokens.
 
         Args:
-            spec_decode_metadata: Contains draft_token_ids for indexing
-            vocab_size: Vocabulary size
+            spec_decode_metadata: Contains draft_token_ids and num_draft_tokens
+            vocab_size: Vocabulary size (kept for API compatibility)
 
         Returns:
-            draft_probs: [num_tokens, vocab_size] with probs only at chosen tokens
+            draft_logprobs: [num_tokens] 1-D log-probs for chosen tokens (NO PADDING)
         """
         if not hasattr(self, '_draft_probs') or self._draft_probs is None:
             return None
 
-        # Get draft token IDs - shape [num_tokens]
+        # Build q_logp respecting per-request counts (no padding)
+        # self._draft_probs: [batch_size, max_spec_len] with padding
+        # spec_decode_metadata.num_draft_tokens: list[int] - valid counts per request
+        counts = spec_decode_metadata.num_draft_tokens
+        rows = []
+        for i, n in enumerate(counts):
+            if int(n) > 0:
+                # Take only valid (non-padded) logprobs for this request
+                rows.append(self._draft_probs[i, :int(n)])
+
+        if not rows:
+            return None
+
+        # Concatenate valid logprobs from all requests
+        q_logp = torch.cat(rows, dim=0).to(torch.float32).contiguous()  # [T_total]
+
+        # Validate alignment
         draft_token_ids = spec_decode_metadata.draft_token_ids
+        assert q_logp.shape[0] == draft_token_ids.shape[0], \
+            f"Draft logprobs length {q_logp.shape[0]} != draft_token_ids length {draft_token_ids.shape[0]}"
 
-        # Our draft_probs is [batch_size, num_spec_tokens] with log-probs
-        # Need to flatten it to [num_tokens] and convert to probs
-        draft_logprobs_flat = self._draft_probs.flatten()[:draft_token_ids.shape[0]]
-
-        # Convert log-probs to probs
-        draft_probs_sparse = torch.exp(draft_logprobs_flat)
-
-        # Create full [num_tokens, vocab_size] tensor with zeros
-        num_tokens = draft_token_ids.shape[0]
-        draft_probs_full = torch.zeros(
-            (num_tokens, vocab_size),
-            device=draft_token_ids.device,
-            dtype=torch.float32
-        )
-
-        # Fill in probabilities only for the chosen tokens
-        token_indices = torch.arange(num_tokens, device=draft_token_ids.device)
-        draft_probs_full[token_indices, draft_token_ids] = draft_probs_sparse
-
-        return draft_probs_full
+        return q_logp
 
     def propose_draft_token_ids(
         self,

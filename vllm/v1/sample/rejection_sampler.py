@@ -46,8 +46,8 @@ class RejectionSampler(nn.Module):
     def forward(
         self,
         metadata: SpecDecodeMetadata,
-        # [num_tokens, vocab_size]
-        draft_probs: Optional[torch.Tensor],
+        # [num_tokens] - CHANGED: now 1-D log-probs
+        draft_logprobs: Optional[torch.Tensor],
         # [num_tokens, vocab_size]
         target_logits: torch.Tensor,
         # [batch_size, 1]
@@ -58,9 +58,9 @@ class RejectionSampler(nn.Module):
         Args:
             metadata:
                 Metadata for spec decoding.
-            draft_probs (Optional[torch.Tensor]):
-                Probability distribution for the draft tokens. Shape is
-                [num_tokens, vocab_size]. Can be None if probabilities are
+            draft_logprobs (Optional[torch.Tensor]):
+                CHANGED: 1-D log-probabilities for the chosen draft tokens.
+                Shape is [num_tokens]. Can be None if probabilities are
                 not provided, which is the case for ngram spec decode.
             target_logits (torch.Tensor):
                 Target model's logits probability distribution.
@@ -83,6 +83,35 @@ class RejectionSampler(nn.Module):
                 A tensor containing the final output token IDs.
         '''
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+
+        # Validate draft_logprobs if provided
+        if draft_logprobs is not None:
+            assert draft_logprobs.ndim == 1, \
+                f"draft_logprobs should be 1-D, got shape {draft_logprobs.shape}"
+            assert draft_logprobs.shape[0] == metadata.draft_token_ids.shape[0], \
+                f"draft_logprobs length {draft_logprobs.shape[0]} != " \
+                f"draft_token_ids length {metadata.draft_token_ids.shape[0]}"
+
+        # Convert 1-D draft_logprobs to dense format for Triton kernels
+        # This creates the sparse [num_tokens, vocab_size] representation
+        # that the kernels expect, but only when draft_logprobs is provided
+        if draft_logprobs is not None:
+            num_tokens = metadata.draft_token_ids.shape[0]
+            vocab_size = target_logits.shape[-1]
+
+            # Create sparse representation
+            draft_probs = torch.zeros(
+                (num_tokens, vocab_size),
+                dtype=torch.float32,
+                device=metadata.draft_token_ids.device
+            )
+
+            # Fill chosen token probabilities (convert from log-space)
+            token_indices = torch.arange(num_tokens, device=metadata.draft_token_ids.device)
+            draft_probs[token_indices, metadata.draft_token_ids] = torch.exp(draft_logprobs)
+        else:
+            draft_probs = None
+
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `compute_probs` function.
