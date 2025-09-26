@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Optional
+import sys
 
 import torch
 import torch.nn as nn
@@ -54,6 +55,8 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
+        # DEBUG: Confirm rejection sampler is called
+        print(f"[REJECTION_SAMPLER] Called with draft_logprobs={'None' if draft_logprobs is None else draft_logprobs.shape}", file=sys.stderr, flush=True)
         '''
         Args:
             metadata:

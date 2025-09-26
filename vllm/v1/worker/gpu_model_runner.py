@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -31,7 +32,8 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
-    get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
+    get_pp_group, get_tp_group, get_tensor_model_parallel_rank,
+    graph_capture, is_global_first_rank,
     prepare_communication_buffer_for_model)
 from vllm.forward_context import (BatchDescriptor, DPMetadata,
                                   set_forward_context)
@@ -183,6 +185,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        # DEBUG: Check if speculative decoding is enabled
+        if self.speculative_config:
+            print(f"[INIT] Speculative decoding ENABLED: method={self.speculative_config.method}", file=sys.stderr, flush=True)
+        else:
+            print("[INIT] Speculative decoding DISABLED", file=sys.stderr, flush=True)
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -2005,20 +2013,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             target_logits = logits[spec_decode_metadata.target_logits_indices]
 
             # Extract 1-D draft logprobs (per-request, no padding)
+            # DEBUG: Check _draft_probs before prepare
+            has_attr = hasattr(self, '_draft_probs')
+            is_none = self._draft_probs is None if has_attr else True
+            print(f"[SPEC_DEBUG] Before prepare: hasattr={has_attr}, _draft_probs is None={is_none}", file=sys.stderr, flush=True)
+            if has_attr and not is_none:
+                print(f"[SPEC_DEBUG] _draft_probs shape: {self._draft_probs.shape}", file=sys.stderr, flush=True)
+
             draft_logprobs = self._prepare_draft_probs(
                 spec_decode_metadata,
                 target_logits.shape[-1]  # vocab_size (kept for API compat)
-            ) if hasattr(self, '_draft_probs') and self._draft_probs is not None else None
+            ) if has_attr and not is_none else None
 
             # DEBUG: Verify draft_logprobs alignment
             if draft_logprobs is not None:
-                logger.info(
-                    f"[SPEC_DEBUG] draft_logprobs shape: {draft_logprobs.shape}, "
+                print(
+                    f"[SPEC_DEBUG] ✓ draft_logprobs shape: {draft_logprobs.shape}, "
                     f"draft_token_ids shape: {spec_decode_metadata.draft_token_ids.shape}, "
-                    f"num_draft_tokens: {spec_decode_metadata.num_draft_tokens}"
+                    f"num_draft_tokens: {spec_decode_metadata.num_draft_tokens}",
+                    file=sys.stderr, flush=True
                 )
             else:
-                logger.warning("[SPEC_DEBUG] draft_logprobs is None!")
+                print(
+                    f"[SPEC_DEBUG] ✗ draft_logprobs is None! "
+                    f"hasattr(_draft_probs)={has_attr}, "
+                    f"_draft_probs is None={is_none}, "
+                    f"speculative_config.method={self.speculative_config.method if self.speculative_config else 'N/A'}",
+                    file=sys.stderr, flush=True
+                )
 
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
@@ -2429,8 +2451,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Returns:
             draft_logprobs: [num_tokens] 1-D log-probs for chosen tokens (NO PADDING)
         """
-        if not hasattr(self, '_draft_probs') or self._draft_probs is None:
-            return None
+        if not hasattr(self, '_draft_probs'):
+            raise RuntimeError("SpecDecode: _draft_probs attribute missing")
+        if self._draft_probs is None:
+            tp_rank = get_tensor_model_parallel_rank()
+            raise RuntimeError(f"SpecDecode: _draft_probs is None on TP rank {tp_rank}")
 
         # Build q_logp respecting per-request counts (no padding)
         # self._draft_probs: [batch_size, max_spec_len] with padding
@@ -2454,6 +2479,59 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             f"Draft logprobs length {q_logp.shape[0]} != draft_token_ids length {draft_token_ids.shape[0]}"
 
         return q_logp
+
+    def _tp_broadcast_draft_probs(
+        self,
+        tensor_src: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Broadcast [B, T_max] fp32 draft logprobs from TP rank 0 to all TP ranks.
+
+        Args:
+            tensor_src: Source tensor on rank 0, None on other ranks
+
+        Returns:
+            Broadcasted tensor on all ranks
+        """
+        tp_group = get_tp_group()
+        if tp_group is None or tp_group.world_size == 1:
+            # Single TP rank - no broadcast needed
+            if tensor_src is None:
+                raise RuntimeError("TP=1 but draft_probs is None")
+            return tensor_src
+
+        tp_rank = get_tensor_model_parallel_rank()
+        src_rank = 0
+
+        # Broadcast shape [rows, cols] first
+        if tp_rank == src_rank:
+            if tensor_src is None:
+                raise RuntimeError(f"TP rank {tp_rank} (source) has None draft_probs")
+            rows, cols = tensor_src.shape
+            shape_buf = torch.tensor([rows, cols],
+                                    device=tensor_src.device,
+                                    dtype=torch.int64)
+        else:
+            # Non-source ranks: allocate shape buffer
+            dev = torch.device("cuda", torch.cuda.current_device())
+            shape_buf = torch.empty(2, device=dev, dtype=torch.int64)
+
+        torch.distributed.broadcast(shape_buf, src=src_rank,
+                                   group=tp_group.device_group)
+        rows, cols = int(shape_buf[0].item()), int(shape_buf[1].item())
+
+        # Broadcast tensor payload
+        if tp_rank == src_rank:
+            buf = tensor_src.contiguous()
+        else:
+            # Non-source ranks: allocate buffer with correct shape
+            buf = torch.empty((rows, cols), device=shape_buf.device,
+                             dtype=torch.float32)
+
+        torch.distributed.broadcast(buf, src=src_rank,
+                                   group=tp_group.device_group)
+
+        return buf
 
     def propose_draft_token_ids(
         self,
@@ -2580,7 +2658,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_embeds=mm_embeds,
             )
             # Store draft_probs for use in rejection sampler
-            self._draft_probs = proposals.logprobs
+            local_draft_probs = getattr(proposals, "logprobs", None)
+            if local_draft_probs is None:
+                raise RuntimeError("EAGLE proposer did not populate proposals.logprobs")
+
+            # Broadcast to all TP ranks (critical for TP > 1)
+            self._draft_probs = self._tp_broadcast_draft_probs(local_draft_probs)
+            print(f"[SPEC_DEBUG] EAGLE propose complete (after TP broadcast): draft_probs shape={self._draft_probs.shape}, draft_token_ids shape={proposals.token_ids.shape}", file=sys.stderr, flush=True)
             draft_token_ids = proposals.token_ids
         return draft_token_ids
 
