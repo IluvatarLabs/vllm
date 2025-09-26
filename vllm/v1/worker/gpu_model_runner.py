@@ -2051,6 +2051,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                   f"tokens_head={spec_decode_metadata.draft_token_ids[:8].tolist()}",
                   file=sys.stderr, flush=True)
 
+            # Sanity check: Inspect raw values BEFORE any processing
+            if draft_logprobs is not None:
+                print(f"[SANITY] draft_logp min/med/max: "
+                      f"{draft_logprobs.min().item():.3f}/"
+                      f"{draft_logprobs.median().item():.3f}/"
+                      f"{draft_logprobs.max().item():.3f}",
+                      file=sys.stderr, flush=True)
+
+                pt_raw = torch.softmax(target_logits, dim=-1).gather(
+                    -1, spec_decode_metadata.draft_token_ids.view(-1, 1)
+                ).squeeze(-1)
+                print(f"[SANITY] p_target min/med/max: "
+                      f"{pt_raw.min().item():.3e}/"
+                      f"{pt_raw.median().item():.3e}/"
+                      f"{pt_raw.max().item():.3e}",
+                      file=sys.stderr, flush=True)
+
+                # Guard rails
+                assert draft_logprobs.ndim == 1, f"draft_logprobs wrong ndim: {draft_logprobs.ndim}"
+                if not (draft_logprobs <= 1e-6).all():
+                    print(f"[WARNING] draft_logprobs has values > 0! Max={draft_logprobs.max().item()}",
+                          file=sys.stderr, flush=True)
+                if not (draft_logprobs > -100).all():
+                    print(f"[WARNING] draft_logprobs too negative! Min={draft_logprobs.min().item()}",
+                          file=sys.stderr, flush=True)
+                assert target_logits.ndim == 2, f"target_logits wrong ndim: {target_logits.ndim}"
+
             # Smoke test: Diagnose alignment and estimate acceptance rate
             if draft_logprobs is not None:
                 with torch.no_grad():
@@ -2555,6 +2582,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert q_logp.shape[0] == draft_token_ids.shape[0], \
             f"Draft logprobs length {q_logp.shape[0]} != draft_token_ids length {draft_token_ids.shape[0]}"
 
+        # Debug: Check what _prepare_draft_probs is returning
+        print(f"[PREPARE_DRAFT] q_logp shape={q_logp.shape}, "
+              f"min/med/max={q_logp.min().item():.3f}/"
+              f"{q_logp.median().item():.3f}/"
+              f"{q_logp.max().item():.3f}",
+              file=sys.stderr, flush=True)
+
         return q_logp
 
     def _tp_broadcast_draft_probs(
@@ -2744,6 +2778,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # CRITICAL: Synchronize CUDA streams after TP broadcast to prevent rank divergence
             torch.cuda.synchronize()
+
+            # Debug: Check what runner stored after TP broadcast
+            print(f"[RUNNER_STORE] _draft_probs shape={self._draft_probs.shape}, "
+                  f"min/med/max={self._draft_probs.min().item():.3f}/"
+                  f"{self._draft_probs.median().item():.3f}/"
+                  f"{self._draft_probs.max().item():.3f}",
+                  file=sys.stderr, flush=True)
 
             print(f"[SPEC_DEBUG] EAGLE propose complete (after TP broadcast): draft_probs shape={self._draft_probs.shape}, draft_token_ids shape={proposals.token_ids.shape}", file=sys.stderr, flush=True)
             draft_token_ids = proposals.token_ids

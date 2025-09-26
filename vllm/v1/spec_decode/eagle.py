@@ -505,6 +505,15 @@ class EagleProposer:
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         draft_logprobs = torch.stack(draft_logp_list, dim=1)
+
+        # Debug: Check what EAGLE is actually returning
+        import sys
+        print(f"[EAGLE_PROPOSE] logprobs shape={draft_logprobs.shape}, "
+              f"min/med/max={draft_logprobs.min().item():.3f}/"
+              f"{draft_logprobs.median().item():.3f}/"
+              f"{draft_logprobs.max().item():.3f}",
+              file=sys.stderr, flush=True)
+
         return DraftProposals(token_ids=draft_token_ids, logprobs=draft_logprobs)
 
     def prepare_next_token_ids_cpu(
