@@ -321,31 +321,24 @@ def rejection_sample(
     )
 
     # Sample recovered tokens for each position.
-    # OPTION B': Compute residual in filtered space.
-    # Apply same (temp, top_k, top_p) to target that drafter used.
-    # This ensures all tokens (accepted/recovered/bonus) come from same filtered distribution.
+    # Use RAW distributions (consistent with acceptance calculation)
+    # This avoids complications from drafter and target having different filtering params
 
     with torch.autocast(device_type="cuda", enabled=False):
-        # Apply temperature and top-k/top-p filtering to target logits
-        # This produces the filtered target distribution p_target
-        target_probs_filtered = compute_probs(
-            target_logits.float(),  # Now correctly using target_logits
-            cu_num_draft_tokens,
-            sampling_metadata,
-        )
+        # Compute raw target probabilities (no filtering)
+        target_probs_raw = torch.softmax(target_logits.float(), dim=-1)
 
-        # Draft probs are already in filtered space (drafter used same params)
-        # Compute residual: (p_target_filtered - q_draft)_+
-        adjusted_probs = torch.clamp(target_probs_filtered - draft_probs, min=0.0)
+        # Compute residual: (p_target_raw - q_draft)_+
+        # Draft probs are also raw (from drafter's internal distribution)
+        adjusted_probs = torch.clamp(target_probs_raw - draft_probs, min=0.0)
 
         # Handle zero-sum rows (edge case: all target mass was on draft token)
         row_sums = adjusted_probs.sum(dim=-1, keepdim=True)
         zero_rows = (row_sums.squeeze(-1) == 0.0)
 
         if zero_rows.any():
-            # Fallback: For empty rows, use filtered target distribution directly
-            # (sample from target argmax in filtered space)
-            target_argmax = target_probs_filtered.argmax(dim=-1)
+            # Fallback: For empty rows, use raw target distribution
+            target_argmax = target_probs_raw.argmax(dim=-1)
             adjusted_probs[zero_rows] = 0.0
             adjusted_probs[zero_rows, target_argmax[zero_rows]] = 1.0
         else:
@@ -370,13 +363,13 @@ def rejection_sample(
     )
 
     # Rejection sampling for random sampling requests.
-    # Use filtered target probs (Option B': all distributions in filtered space)
+    # Use raw target probs (consistent with acceptance calculation)
     rejection_random_sample_kernel[(batch_size, )](
         output_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
-        target_probs_filtered,  # Use filtered probs for consistency
+        target_probs_raw,  # Use raw probs for consistency
         bonus_token_ids,
         recovered_token_ids,
         uniform_probs,
