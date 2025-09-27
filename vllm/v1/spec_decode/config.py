@@ -28,10 +28,9 @@ class SpecDecodeOptConfig:
     draft_top_k: int = 0  # 0 = disabled
 
     # Mixture proposal settings (prevents delta collapse at low temps)
-    draft_q_temp_offset: float = 0.25  # Offset added to draft_temp for main branch
-    draft_q_soft_temp: float = 2.0  # Soft branch temperature (high entropy)
-    draft_mix_lambda_max: float = 0.12  # Maximum mixture weight for soft branch
-    draft_mix_target_c: float = 2.2  # Entropy schedule constant
+    draft_mix_temp: float = 1.0  # Soft branch temperature
+    draft_mix_lambda: float = 0.10  # Base lambda (before scaling)
+    draft_mix_cap: float = 0.50  # Maximum lambda at low temps
 
     # Debug and profiling settings
     enable_nvtx_ranges: bool = False
@@ -93,25 +92,20 @@ class SpecDecodeOptConfig:
             config.draft_top_k = int(os.environ.get('VLLM_DRAFT_TOP_K', '0'))
 
         # Mixture proposal settings
-        if hasattr(vllm_config, 'draft_q_temp_offset'):
-            config.draft_q_temp_offset = vllm_config.draft_q_temp_offset
+        if hasattr(vllm_config, 'draft_mix_temp'):
+            config.draft_mix_temp = vllm_config.draft_mix_temp
         else:
-            config.draft_q_temp_offset = float(os.environ.get('VLLM_DRAFT_Q_TEMP_OFFSET', '0.25'))
+            config.draft_mix_temp = float(os.environ.get('VLLM_DRAFT_MIX_TEMP', '1.0'))
 
-        if hasattr(vllm_config, 'draft_q_soft_temp'):
-            config.draft_q_soft_temp = vllm_config.draft_q_soft_temp
+        if hasattr(vllm_config, 'draft_mix_lambda'):
+            config.draft_mix_lambda = vllm_config.draft_mix_lambda
         else:
-            config.draft_q_soft_temp = float(os.environ.get('VLLM_DRAFT_Q_SOFT_TEMP', '2.0'))
+            config.draft_mix_lambda = float(os.environ.get('VLLM_DRAFT_MIX_LAMBDA', '0.10'))
 
-        if hasattr(vllm_config, 'draft_mix_lambda_max'):
-            config.draft_mix_lambda_max = vllm_config.draft_mix_lambda_max
+        if hasattr(vllm_config, 'draft_mix_cap'):
+            config.draft_mix_cap = vllm_config.draft_mix_cap
         else:
-            config.draft_mix_lambda_max = float(os.environ.get('VLLM_DRAFT_MIX_LAMBDA_MAX', '0.12'))
-
-        if hasattr(vllm_config, 'draft_mix_target_c'):
-            config.draft_mix_target_c = vllm_config.draft_mix_target_c
-        else:
-            config.draft_mix_target_c = float(os.environ.get('VLLM_DRAFT_MIX_TARGET_C', '2.2'))
+            config.draft_mix_cap = float(os.environ.get('VLLM_DRAFT_MIX_CAP', '0.50'))
 
         # Debug settings
         if hasattr(vllm_config, 'enable_nvtx_ranges'):

@@ -246,105 +246,72 @@ class EagleProposer:
             # MIXTURE PROPOSAL: Prevents delta collapse at low temps
             # Get config parameters
             tau_d = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
-            tau_offset = float(getattr(self.opt_config, "draft_q_temp_offset", 0.25))
-            tau_s = float(getattr(self.opt_config, "draft_q_soft_temp", 2.0))
-            lambda_max = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.12))
-            target_c = float(getattr(self.opt_config, "draft_mix_target_c", 2.2))
+            tau_s = float(getattr(self.opt_config, "draft_mix_temp", 1.0) or 1.0)
+            lam0 = float(getattr(self.opt_config, "draft_mix_lambda", 0.10))
+            lam_max = float(getattr(self.opt_config, "draft_mix_cap", 0.50))
 
-            # Compute main branch (offset prevents underflow)
-            tau_q = tau_d + tau_offset
-            x_main = x / max(tau_q, 1e-8)
-            logp_main = torch.log_softmax(x_main, dim=-1)  # [B, V], FP32
+            # Adaptive lambda: stronger at low temps
+            lam = min(lam_max, lam0 / max(tau_d, 1e-3))
 
-            # Compute soft branch (high entropy)
-            x_soft = x / max(tau_s, 1e-8)
+            # Helper function to apply top-k/top-p masking
+            def apply_topkp(y, top_k, top_p):
+                # Apply top-k if set
+                if top_k and 0 < top_k < y.size(-1):
+                    tk_vals, tk_idx = torch.topk(y, top_k, dim=-1)
+                    mask = torch.full_like(y, float('-inf'))
+                    y = mask.scatter(-1, tk_idx, tk_vals)
+                # Apply nucleus if set
+                if top_p and 0.0 < top_p < 1.0:
+                    p = torch.softmax(y, dim=-1)
+                    sp, si = torch.sort(p, dim=-1, descending=True)
+                    csum = sp.cumsum(dim=-1)
+                    # Keep tokens where cumsum - prob <= top_p (exclusive)
+                    keep_sorted = (csum - sp) <= top_p
+                    keep_sorted[..., 0] = True  # Always keep top-1
+                    keep = torch.zeros_like(p, dtype=torch.bool).scatter(-1, si, keep_sorted)
+                    y = torch.where(keep, y, torch.full_like(y, float('-inf')))
+                return y
+
+            top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
+            top_p = float(getattr(self.opt_config, "draft_top_p", 0.0) or 0.0)
+
+            # Two branches: share same masking logic at their own temperatures
+            x_hard = apply_topkp(x / max(tau_d, 1e-8), top_k, top_p)
+            x_soft = apply_topkp(x / max(tau_s, 1e-8), top_k, top_p)
+
+            logp_hard = torch.log_softmax(x_hard, dim=-1)  # [B, V], FP32
             logp_soft = torch.log_softmax(x_soft, dim=-1)  # [B, V], FP32
 
-            # Compute entropies for adaptive lambda
-            p_main = torch.exp(logp_main)
-            p_soft = torch.exp(logp_soft)
-            H_main = -(p_main * logp_main).sum(dim=-1)  # [B]
-            H_soft = -(p_soft * logp_soft).sum(dim=-1)  # [B]
+            # Sample from mixture with coin flip (correct distribution for q_mix)
+            B = x.size(0)
+            coin = (torch.rand(B, device=x.device) < lam)
 
-            # Adaptive lambda based on entropy schedule
-            S_tgt = torch.clamp(1.0 + target_c / (tau_d + 1e-6), min=2.0)
-            H_tgt = torch.log(S_tgt)
-            lambda_eff = torch.clamp((H_tgt - H_main) / (H_soft - H_main + 1e-8), 0.0, lambda_max)  # [B]
+            tok_hard = torch.distributions.Categorical(logits=logp_hard).sample()  # [B]
+            tok_soft = torch.distributions.Categorical(logits=logp_soft).sample()  # [B]
+            draft_token_ids = torch.where(coin, tok_soft, tok_hard)
 
-            # Mix in log-space (CRITICAL for numerical stability)
-            log_lambda = torch.log(lambda_eff + 1e-10).unsqueeze(-1)  # [B, 1]
-            log_one_minus_lambda = torch.log(1.0 - lambda_eff + 1e-10).unsqueeze(-1)  # [B, 1]
+            # Compute q_mix at the *chosen* token
+            hard_ptok = logp_hard.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).exp()
+            soft_ptok = logp_soft.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).exp()
+            qtok = (1.0 - lam) * hard_ptok + lam * soft_ptok
 
-            # Stack: [B, V, 2] with dim=-1 being [main, soft]
-            stack = torch.stack([
-                logp_main + log_one_minus_lambda,
-                logp_soft + log_lambda
-            ], dim=-1)
-            log_q_mix = torch.logsumexp(stack, dim=-1)  # [B, V]
+            draft_logp = torch.log(qtok.clamp_min(1e-12))  # FP32, finite
 
             std_before = x.std().item()
-            std_after = x_main.std().item()
-            lambda_mean = lambda_eff.mean().item()
+            std_after = x_hard.std().item()
 
-            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} q_temp={tau_q:.3f} "
-                  f"soft_temp={tau_s:.3f} lambda_mean={lambda_mean:.3f} "
+            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} soft_temp={tau_s:.3f} lambda={lam:.3f} "
                   f"raw_max={raw_max:.3f} std: {std_before:.4f}->{std_after:.4f}",
                   file=sys.stderr, flush=True)
 
-            # Apply top-k masking to MIXED distribution (not individual branches)
-            top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
-            if top_k > 0 and top_k < log_q_mix.shape[-1]:
-                kth = torch.topk(log_q_mix, k=top_k, dim=-1).values[..., -1, None]
-                log_q_mix = log_q_mix.masked_fill(log_q_mix < kth, float('-inf'))
-
-            # Apply top-p (nucleus) masking to MIXED distribution
-            top_p = float(getattr(self.opt_config, "draft_top_p", 1.0) or 1.0)
-            if top_p < 1.0:
-                # Convert to probs for cumsum
-                p_mix = torch.exp(log_q_mix)
-                sorted_probs, sorted_idx = torch.sort(p_mix, dim=-1, descending=True)
-                cumsum = torch.cumsum(sorted_probs, dim=-1)
-
-                # FIXED: Keep tokens where (cumsum - prob) <= top_p (exclusive)
-                keep_sorted = (cumsum - sorted_probs) <= top_p
-                keep_sorted[..., 0] = True  # Always keep top-1
-
-                # Map keep mask back to original vocab order
-                keep = torch.zeros_like(p_mix, dtype=torch.bool)
-                keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
-
-                log_q_mix = log_q_mix.masked_fill(~keep, float('-inf'))
-
-            # Renormalize after masking (CRITICAL)
-            log_q_mix = torch.log_softmax(log_q_mix, dim=-1)  # [B, V], FP32
-
-            # Check for single-survivor rows
-            survivors = torch.isfinite(log_q_mix).sum(dim=-1)  # [B]
-
-            # Sample from the MIXED, MASKED distribution
-            dist = torch.distributions.Categorical(logits=log_q_mix)
-            draft_token_ids = dist.sample()  # [B]
-
-            # Gather log-prob from the SAME mixed distribution we sampled from
-            draft_logp = log_q_mix.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
-
-            # Clamp to finite FP32 range
-            draft_logp = torch.nan_to_num(draft_logp, neginf=-80.0)
-
             # Debug: log mixture statistics
-            if survivors.numel() > 0:
-                print(f"[MIX_DEBUG] survivors: min={survivors.min().item()}, "
-                      f"max={survivors.max().item()}, mean={survivors.float().mean().item():.1f}, "
-                      f"lambda_eff: min={lambda_eff.min().item():.3f}, "
-                      f"max={lambda_eff.max().item():.3f}, mean={lambda_mean:.3f}",
-                      file=sys.stderr, flush=True)
-
             q_chosen = torch.exp(draft_logp)
             if q_chosen.numel() > 0:
                 print(f"[Q_DEBUG] chosen q min/med/max: "
                       f"{q_chosen.min().item():.3e}/"
                       f"{q_chosen.median().item():.3e}/"
-                      f"{q_chosen.max().item():.3e}",
+                      f"{q_chosen.max().item():.3e}, "
+                      f"lambda={lam:.3f}",
                       file=sys.stderr, flush=True)
 
             return draft_token_ids.contiguous(), draft_logp.contiguous()
