@@ -243,92 +243,100 @@ class EagleProposer:
             # Stabilizer: subtract max to prevent overflow/underflow
             x = x - x.amax(dim=-1, keepdim=True)
 
-            # Apply temperature in logits space
-            # Sampling temp: can be very low (0.1) for sharp sampling
+            # MIXTURE PROPOSAL: Prevents delta collapse at low temps
+            # Get config parameters
             tau_d = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
+            tau_offset = float(getattr(self.opt_config, "draft_q_temp_offset", 0.25))
+            tau_s = float(getattr(self.opt_config, "draft_q_soft_temp", 2.0))
+            lambda_max = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.12))
+            target_c = float(getattr(self.opt_config, "draft_mix_target_c", 2.2))
 
-            # Acceptance-q temp: floored to prevent delta collapse in FP32
-            # At tau=0.1, top token can get 99.99% mass → log(p)≈0 → q≈1.0
-            # Floor ensures q has dynamic range for calibration
-            tau_floor = float(getattr(self.opt_config, "draft_q_temp_floor", 0.7))
-            tau_q = max(tau_d, tau_floor)
+            # Compute main branch (offset prevents underflow)
+            tau_q = tau_d + tau_offset
+            x_main = x / max(tau_q, 1e-8)
+            logp_main = torch.log_softmax(x_main, dim=-1)  # [B, V], FP32
+
+            # Compute soft branch (high entropy)
+            x_soft = x / max(tau_s, 1e-8)
+            logp_soft = torch.log_softmax(x_soft, dim=-1)  # [B, V], FP32
+
+            # Compute entropies for adaptive lambda
+            p_main = torch.exp(logp_main)
+            p_soft = torch.exp(logp_soft)
+            H_main = -(p_main * logp_main).sum(dim=-1)  # [B]
+            H_soft = -(p_soft * logp_soft).sum(dim=-1)  # [B]
+
+            # Adaptive lambda based on entropy schedule
+            S_tgt = torch.clamp(1.0 + target_c / (tau_d + 1e-6), min=2.0)
+            H_tgt = torch.log(S_tgt)
+            lambda_eff = torch.clamp((H_tgt - H_main) / (H_soft - H_main + 1e-8), 0.0, lambda_max)  # [B]
+
+            # Mix in log-space (CRITICAL for numerical stability)
+            log_lambda = torch.log(lambda_eff + 1e-10).unsqueeze(-1)  # [B, 1]
+            log_one_minus_lambda = torch.log(1.0 - lambda_eff + 1e-10).unsqueeze(-1)  # [B, 1]
+
+            # Stack: [B, V, 2] with dim=-1 being [main, soft]
+            stack = torch.stack([
+                logp_main + log_one_minus_lambda,
+                logp_soft + log_lambda
+            ], dim=-1)
+            log_q_mix = torch.logsumexp(stack, dim=-1)  # [B, V]
 
             std_before = x.std().item()
-            x_samp = x / tau_d if tau_d != 1.0 else x.clone()
-            std_after = x_samp.std().item()
+            std_after = x_main.std().item()
+            lambda_mean = lambda_eff.mean().item()
 
-            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} q_temp={tau_q:.3f} raw_max={raw_max:.3f} "
-                  f"std: {std_before:.4f}->{std_after:.4f}", file=sys.stderr, flush=True)
+            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} q_temp={tau_q:.3f} "
+                  f"soft_temp={tau_s:.3f} lambda_mean={lambda_mean:.3f} "
+                  f"raw_max={raw_max:.3f} std: {std_before:.4f}->{std_after:.4f}",
+                  file=sys.stderr, flush=True)
 
-            # CRITICAL: Compute acceptance-q logprobs from SOFTER distribution
-            # This prevents q from collapsing to 1.0 due to low temperature
-            logp_q = torch.log_softmax(x / tau_q, dim=-1)  # [B, V], FP32, before any masking
-
-            # Apply top-k (mask to -inf in logits space)
-            # Mask the SAMPLING distribution, not the acceptance-q distribution
+            # Apply top-k masking to MIXED distribution (not individual branches)
             top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
-            if top_k > 0 and top_k < x_samp.shape[-1]:
-                kth = torch.topk(x_samp, k=top_k, dim=-1).values[..., -1, None]
-                x_samp = x_samp.masked_fill(x_samp < kth, float('-inf'))
+            if top_k > 0 and top_k < log_q_mix.shape[-1]:
+                kth = torch.topk(log_q_mix, k=top_k, dim=-1).values[..., -1, None]
+                log_q_mix = log_q_mix.masked_fill(log_q_mix < kth, float('-inf'))
 
-            # Apply top-p (nucleus sampling in logits space)
-            # Mask the SAMPLING distribution, not the acceptance-q distribution
+            # Apply top-p (nucleus) masking to MIXED distribution
             top_p = float(getattr(self.opt_config, "draft_top_p", 1.0) or 1.0)
             if top_p < 1.0:
-                # Sort by logit descending
-                sorted_logits, sorted_idx = torch.sort(x_samp, dim=-1, descending=True)
-                # Compute probs from sorted logits in fp32
-                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                # Convert to probs for cumsum
+                p_mix = torch.exp(log_q_mix)
+                sorted_probs, sorted_idx = torch.sort(p_mix, dim=-1, descending=True)
                 cumsum = torch.cumsum(sorted_probs, dim=-1)
 
-                # FIXED: Use exclusive threshold to prevent single-survivor collapse
-                # Keep tokens while cumsum[i-1] < top_p (exclusive test)
-                keep_sorted = torch.zeros_like(sorted_probs, dtype=torch.bool)
+                # FIXED: Keep tokens where (cumsum - prob) <= top_p (exclusive)
+                keep_sorted = (cumsum - sorted_probs) <= top_p
                 keep_sorted[..., 0] = True  # Always keep top-1
-                if sorted_probs.shape[-1] > 1:
-                    keep_sorted[..., 1:] = cumsum[..., :-1] < top_p  # Exclusive
 
                 # Map keep mask back to original vocab order
-                keep = torch.zeros_like(x_samp, dtype=torch.bool)
+                keep = torch.zeros_like(p_mix, dtype=torch.bool)
                 keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
 
-                # Optional: enforce minimum survivors to prevent full collapse
-                min_keep = int(getattr(self.opt_config, "draft_min_keep", 0) or 0)
-                if min_keep > 0:
-                    survivor_counts = keep.sum(dim=-1, keepdim=True)  # [B, 1]
-                    need_more = (survivor_counts < min_keep)
-                    if need_more.any():
-                        # Add next-best tokens in sorted space until floor is met
-                        floor_sorted = torch.zeros_like(keep_sorted, dtype=torch.bool)
-                        floor_sorted[..., :min_keep] = True
-                        keep_sorted = keep_sorted | floor_sorted
-                        keep = torch.zeros_like(x_samp, dtype=torch.bool)
-                        keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
+                log_q_mix = log_q_mix.masked_fill(~keep, float('-inf'))
 
-                x_samp = x_samp.masked_fill(~keep, float('-inf'))
+            # Renormalize after masking (CRITICAL)
+            log_q_mix = torch.log_softmax(log_q_mix, dim=-1)  # [B, V], FP32
 
-            # CRITICAL: Recompute log-probs after ALL masking to ensure alignment
-            # This guarantees sampling from the correct masked distribution
-            logp_samp = torch.log_softmax(x_samp, dim=-1)  # [B, V], FP32
+            # Check for single-survivor rows
+            survivors = torch.isfinite(log_q_mix).sum(dim=-1)  # [B]
 
-            # Check for single-survivor rows (where only 1 token has non-inf logit)
-            survivors = torch.isfinite(logp_samp).sum(dim=-1)  # [B]
-
-            # Sample from the masked distribution
-            dist = torch.distributions.Categorical(logits=x_samp)
+            # Sample from the MIXED, MASKED distribution
+            dist = torch.distributions.Categorical(logits=log_q_mix)
             draft_token_ids = dist.sample()  # [B]
 
-            # Gather log-prob from ACCEPTANCE-Q distribution (softer, floored temp)
-            # This prevents q from becoming 1.0 due to intrinsic temperature collapse
-            draft_logp = logp_q.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
+            # Gather log-prob from the SAME mixed distribution we sampled from
+            draft_logp = log_q_mix.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
 
             # Clamp to finite FP32 range
             draft_logp = torch.nan_to_num(draft_logp, neginf=-80.0)
 
-            # Debug: log survivors and q statistics
+            # Debug: log mixture statistics
             if survivors.numel() > 0:
-                print(f"[NUC_DEBUG] survivors per row: min={survivors.min().item()}, "
-                      f"max={survivors.max().item()}, mean={survivors.float().mean().item():.1f}",
+                print(f"[MIX_DEBUG] survivors: min={survivors.min().item()}, "
+                      f"max={survivors.max().item()}, mean={survivors.float().mean().item():.1f}, "
+                      f"lambda_eff: min={lambda_eff.min().item():.3f}, "
+                      f"max={lambda_eff.max().item():.3f}, mean={lambda_mean:.3f}",
                       file=sys.stderr, flush=True)
 
             q_chosen = torch.exp(draft_logp)

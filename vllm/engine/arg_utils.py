@@ -375,7 +375,11 @@ class EngineArgs:
     draft_temperature: float = 0.9
     draft_top_p: float = 1.0
     draft_top_k: int = 0
-    draft_q_temp_floor: float = 0.7
+    # Mixture proposal settings
+    draft_q_temp_offset: float = 0.25
+    draft_q_soft_temp: float = 2.0
+    draft_mix_lambda_max: float = 0.12
+    draft_mix_target_c: float = 2.2
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
     rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")

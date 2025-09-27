@@ -26,7 +26,12 @@ class SpecDecodeOptConfig:
     draft_temperature: float = 0.9
     draft_top_p: float = 1.0  # 1.0 = disabled (required for temp-based calibration)
     draft_top_k: int = 0  # 0 = disabled
-    draft_q_temp_floor: float = 0.7  # Floor for acceptance-q temp (prevents delta collapse)
+
+    # Mixture proposal settings (prevents delta collapse at low temps)
+    draft_q_temp_offset: float = 0.25  # Offset added to draft_temp for main branch
+    draft_q_soft_temp: float = 2.0  # Soft branch temperature (high entropy)
+    draft_mix_lambda_max: float = 0.12  # Maximum mixture weight for soft branch
+    draft_mix_target_c: float = 2.2  # Entropy schedule constant
 
     # Debug and profiling settings
     enable_nvtx_ranges: bool = False
@@ -87,10 +92,26 @@ class SpecDecodeOptConfig:
         else:
             config.draft_top_k = int(os.environ.get('VLLM_DRAFT_TOP_K', '0'))
 
-        if hasattr(vllm_config, 'draft_q_temp_floor'):
-            config.draft_q_temp_floor = vllm_config.draft_q_temp_floor
+        # Mixture proposal settings
+        if hasattr(vllm_config, 'draft_q_temp_offset'):
+            config.draft_q_temp_offset = vllm_config.draft_q_temp_offset
         else:
-            config.draft_q_temp_floor = float(os.environ.get('VLLM_DRAFT_Q_TEMP_FLOOR', '0.7'))
+            config.draft_q_temp_offset = float(os.environ.get('VLLM_DRAFT_Q_TEMP_OFFSET', '0.25'))
+
+        if hasattr(vllm_config, 'draft_q_soft_temp'):
+            config.draft_q_soft_temp = vllm_config.draft_q_soft_temp
+        else:
+            config.draft_q_soft_temp = float(os.environ.get('VLLM_DRAFT_Q_SOFT_TEMP', '2.0'))
+
+        if hasattr(vllm_config, 'draft_mix_lambda_max'):
+            config.draft_mix_lambda_max = vllm_config.draft_mix_lambda_max
+        else:
+            config.draft_mix_lambda_max = float(os.environ.get('VLLM_DRAFT_MIX_LAMBDA_MAX', '0.12'))
+
+        if hasattr(vllm_config, 'draft_mix_target_c'):
+            config.draft_mix_target_c = vllm_config.draft_mix_target_c
+        else:
+            config.draft_mix_target_c = float(os.environ.get('VLLM_DRAFT_MIX_TARGET_C', '2.2'))
 
         # Debug settings
         if hasattr(vllm_config, 'enable_nvtx_ranges'):
