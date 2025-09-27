@@ -44,6 +44,13 @@ class RejectionSampler(nn.Module):
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
 
+    def __init__(self):
+        super().__init__()
+        # Metrics accumulators for tracking acceptance across steps
+        self._acc_accepted = 0
+        self._acc_proposed = 0
+        self._acc_verifier_tokens = 0
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
@@ -173,7 +180,13 @@ class RejectionSampler(nn.Module):
             # Count accepted vs proposed for metrics
             num_accepted_global = int(accept_mask.sum().item())
             num_proposed_global = int(accept_mask.numel())
+            num_verifier_tokens = int(target_logits.size(0))
             accept_rate_global = num_accepted_global / num_proposed_global if num_proposed_global > 0 else 0.0
+
+            # CRITICAL: Accumulate into instance metrics (wired to get_internal_metrics)
+            self._acc_accepted += num_accepted_global
+            self._acc_proposed += num_proposed_global
+            self._acc_verifier_tokens += num_verifier_tokens
 
             print(f"[ACCEPT_METRICS] Accepted {num_accepted_global}/{num_proposed_global} = {accept_rate_global:.1%}",
                   file=sys.stderr, flush=True)
@@ -189,6 +202,27 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
         return output_token_ids
+
+    def pop_metrics(self) -> dict:
+        """
+        Pop accumulated metrics and reset counters.
+
+        Returns:
+            Dictionary with:
+            - accepted: Total accepted tokens since last pop
+            - proposed: Total proposed tokens since last pop
+            - verifier_tokens: Total tokens processed by verifier since last pop
+        """
+        metrics = {
+            "accepted": self._acc_accepted,
+            "proposed": self._acc_proposed,
+            "verifier_tokens": self._acc_verifier_tokens,
+        }
+        # Reset counters
+        self._acc_accepted = 0
+        self._acc_proposed = 0
+        self._acc_verifier_tokens = 0
+        return metrics
 
     @staticmethod
     def parse_output(

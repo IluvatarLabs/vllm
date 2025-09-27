@@ -264,17 +264,33 @@ class EagleProposer:
                 keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
                 x = x.masked_fill(~keep, float('-inf'))
 
-            # Sample using Categorical distribution (handles log-space normalization)
-            # This is numerically stable and guarantees log_prob matches sample distribution
+            # CRITICAL: Recompute log-probs after ALL masking to ensure alignment
+            # This guarantees draft_logp exactly matches the distribution we sample from
+            logp = torch.log_softmax(x, dim=-1)  # [B, V], FP32
+
+            # Check for single-survivor rows (where only 1 token has non-inf logit)
+            survivors = torch.isfinite(logp).sum(dim=-1)  # [B]
+
+            # Sample from the masked distribution
             dist = torch.distributions.Categorical(logits=x)
-            draft_token_ids = dist.sample()                    # [B]
-            draft_logp = dist.log_prob(draft_token_ids)        # [B], strictly <= 0
+            draft_token_ids = dist.sample()  # [B]
 
-            # Only check for NaN/Inf, not for logp≈0 (dominant tokens can legitimately have logp≈0)
-            if not torch.all(torch.isfinite(draft_logp)):
-                raise RuntimeError("Non-finite draft log-prob encountered")
+            # Gather log-prob from the recomputed logp (NOT from dist.log_prob)
+            draft_logp = logp.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
 
-            return draft_token_ids, draft_logp
+            # Clamp to finite FP32 range
+            draft_logp = torch.nan_to_num(draft_logp, neginf=-80.0)
+
+            # Validate: single-survivor rows can have logp==0, multi-survivor must have logp<0
+            multi = (survivors > 1)
+            if torch.any(multi) and torch.any(draft_logp[multi] >= 1e-6):
+                bad_logp = draft_logp[multi][draft_logp[multi] >= 1e-6]
+                raise RuntimeError(
+                    f"Draft sampling produced non-negative logp with >1 survivors. "
+                    f"bad_logp={bad_logp.tolist()}, survivors={survivors.tolist()}"
+                )
+
+            return draft_token_ids.contiguous(), draft_logp.contiguous()
 
     def propose(
         self,

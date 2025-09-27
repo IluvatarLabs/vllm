@@ -2113,6 +2113,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
 
+            # CRITICAL: Pop metrics from rejection sampler and accumulate
+            m = self.rejection_sampler.pop_metrics()
+            if not hasattr(self, '_internal_metrics'):
+                self._internal_metrics = {}
+            self._internal_metrics["accepted"] = self._internal_metrics.get("accepted", 0) + m["accepted"]
+            self._internal_metrics["proposed"] = self._internal_metrics.get("proposed", 0) + m["proposed"]
+            self._internal_metrics["verifier_tokens"] = self._internal_metrics.get("verifier_tokens", 0) + m["verifier_tokens"]
+
             # Clear draft_probs AFTER verification completes (it's no longer needed)
             self._draft_probs = None
 
@@ -4388,14 +4396,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def get_internal_metrics(self) -> dict:
         """
-        Get internal metrics from NWOR/SCV optimizations.
+        Get internal metrics from NWOR/SCV optimizations and acceptance.
 
         Returns:
             Dictionary containing:
-            - drafter: Metrics from Eagle proposer (acceptance rate, etc.)
+            - drafter: Metrics from Eagle proposer
             - shadow_kv: Metrics from ShadowKV (staged/committed/rejected tokens)
+            - acceptance: Actual acceptance metrics from rejection sampler
         """
-        metrics = {"drafter": {}, "shadow_kv": {}}
+        metrics = {"drafter": {}, "shadow_kv": {}, "acceptance": {}}
 
         # Get metrics from Eagle drafter/proposer
         try:
@@ -4412,6 +4421,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     metrics["shadow_kv"] = shadow.get_metrics()
         except Exception:
             pass
+
+        # CRITICAL: Get actual acceptance metrics from rejection sampler
+        if hasattr(self, '_internal_metrics'):
+            accepted = self._internal_metrics.get("accepted", 0)
+            proposed = self._internal_metrics.get("proposed", 0)
+            verifier_tokens = self._internal_metrics.get("verifier_tokens", 0)
+            accept_rate = (accepted / proposed) if proposed > 0 else 0.0
+
+            metrics["acceptance"] = {
+                "accept_rate": accept_rate,
+                "acceptance_rate": accept_rate,  # alias for compatibility
+                "accepted": accepted,
+                "proposed": proposed,
+                "verifier_tokens": verifier_tokens,
+            }
 
         return metrics
 
