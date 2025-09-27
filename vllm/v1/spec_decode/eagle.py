@@ -288,7 +288,7 @@ class EagleProposer:
                 keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
 
                 # Optional: enforce minimum survivors to prevent full collapse
-                min_survivors = int(getattr(self.opt_config, "draft_top_p_min_survivors", 0) or 0)
+                min_survivors = int(getattr(self.opt_config, "draft_top_p_min_survivors", 2) or 2)
                 if min_survivors > 1:
                     survivor_counts = keep.sum(dim=-1, keepdim=True)  # [B, 1]
                     need_more = (survivor_counts < min_survivors)

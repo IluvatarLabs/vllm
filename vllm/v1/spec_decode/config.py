@@ -79,7 +79,7 @@ class SpecDecodeOptConfig:
         if hasattr(vllm_config, 'draft_top_p'):
             config.draft_top_p = vllm_config.draft_top_p
         else:
-            config.draft_top_p = float(os.environ.get('VLLM_DRAFT_TOP_P', '0.95'))
+            config.draft_top_p = float(os.environ.get('VLLM_DRAFT_TOP_P', '1.0'))
 
         if hasattr(vllm_config, 'draft_top_k'):
             config.draft_top_k = vllm_config.draft_top_k

@@ -373,7 +373,7 @@ class EngineArgs:
     # Draft sampling flags (fix for 100% acceptance issue)
     draft_sampling_mode: str = "stochastic"
     draft_temperature: float = 0.9
-    draft_top_p: float = 0.95
+    draft_top_p: float = 1.0
     draft_top_k: int = 0
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
