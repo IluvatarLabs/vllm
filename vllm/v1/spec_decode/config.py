@@ -26,6 +26,7 @@ class SpecDecodeOptConfig:
     draft_temperature: float = 0.9
     draft_top_p: float = 1.0  # 1.0 = disabled (required for temp-based calibration)
     draft_top_k: int = 0  # 0 = disabled
+    draft_q_temp_floor: float = 0.7  # Floor for acceptance-q temp (prevents delta collapse)
 
     # Debug and profiling settings
     enable_nvtx_ranges: bool = False
@@ -85,6 +86,11 @@ class SpecDecodeOptConfig:
             config.draft_top_k = vllm_config.draft_top_k
         else:
             config.draft_top_k = int(os.environ.get('VLLM_DRAFT_TOP_K', '0'))
+
+        if hasattr(vllm_config, 'draft_q_temp_floor'):
+            config.draft_q_temp_floor = vllm_config.draft_q_temp_floor
+        else:
+            config.draft_q_temp_floor = float(os.environ.get('VLLM_DRAFT_Q_TEMP_FLOOR', '0.7'))
 
         # Debug settings
         if hasattr(vllm_config, 'enable_nvtx_ranges'):

@@ -375,6 +375,7 @@ class EngineArgs:
     draft_temperature: float = 0.9
     draft_top_p: float = 1.0
     draft_top_k: int = 0
+    draft_q_temp_floor: float = 0.7
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
     rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")

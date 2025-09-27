@@ -244,34 +244,39 @@ class EagleProposer:
             x = x - x.amax(dim=-1, keepdim=True)
 
             # Apply temperature in logits space
-            # Read from drafter's own config (independent of target)
-            temperature = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
+            # Sampling temp: can be very low (0.1) for sharp sampling
+            tau_d = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
+
+            # Acceptance-q temp: floored to prevent delta collapse in FP32
+            # At tau=0.1, top token can get 99.99% mass → log(p)≈0 → q≈1.0
+            # Floor ensures q has dynamic range for calibration
+            tau_floor = float(getattr(self.opt_config, "draft_q_temp_floor", 0.7))
+            tau_q = max(tau_d, tau_floor)
 
             std_before = x.std().item()
-            if temperature != 1.0:
-                x = x / float(temperature)
-            std_after = x.std().item()
+            x_samp = x / tau_d if tau_d != 1.0 else x.clone()
+            std_after = x_samp.std().item()
 
-            print(f"[TEMP_DEBUG] EAGLE draft_temp={temperature:.3f} raw_max={raw_max:.3f} "
+            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} q_temp={tau_q:.3f} raw_max={raw_max:.3f} "
                   f"std: {std_before:.4f}->{std_after:.4f}", file=sys.stderr, flush=True)
 
-            # CRITICAL: Compute pre-nucleus logprobs for rejection sampler
-            # This prevents q from collapsing to 1.0 when only 1 token survives masking
-            logp_full = torch.log_softmax(x, dim=-1)  # [B, V], FP32, before any masking
+            # CRITICAL: Compute acceptance-q logprobs from SOFTER distribution
+            # This prevents q from collapsing to 1.0 due to low temperature
+            logp_q = torch.log_softmax(x / tau_q, dim=-1)  # [B, V], FP32, before any masking
 
             # Apply top-k (mask to -inf in logits space)
-            # Read from drafter's own config
+            # Mask the SAMPLING distribution, not the acceptance-q distribution
             top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
-            if top_k > 0 and top_k < x.shape[-1]:
-                kth = torch.topk(x, k=top_k, dim=-1).values[..., -1, None]
-                x = x.masked_fill(x < kth, float('-inf'))
+            if top_k > 0 and top_k < x_samp.shape[-1]:
+                kth = torch.topk(x_samp, k=top_k, dim=-1).values[..., -1, None]
+                x_samp = x_samp.masked_fill(x_samp < kth, float('-inf'))
 
             # Apply top-p (nucleus sampling in logits space)
-            # Read from drafter's own config
+            # Mask the SAMPLING distribution, not the acceptance-q distribution
             top_p = float(getattr(self.opt_config, "draft_top_p", 1.0) or 1.0)
             if top_p < 1.0:
                 # Sort by logit descending
-                sorted_logits, sorted_idx = torch.sort(x, dim=-1, descending=True)
+                sorted_logits, sorted_idx = torch.sort(x_samp, dim=-1, descending=True)
                 # Compute probs from sorted logits in fp32
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumsum = torch.cumsum(sorted_probs, dim=-1)
@@ -284,7 +289,7 @@ class EagleProposer:
                     keep_sorted[..., 1:] = cumsum[..., :-1] < top_p  # Exclusive
 
                 # Map keep mask back to original vocab order
-                keep = torch.zeros_like(x, dtype=torch.bool)
+                keep = torch.zeros_like(x_samp, dtype=torch.bool)
                 keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
 
                 # Optional: enforce minimum survivors to prevent full collapse
@@ -297,25 +302,25 @@ class EagleProposer:
                         floor_sorted = torch.zeros_like(keep_sorted, dtype=torch.bool)
                         floor_sorted[..., :min_keep] = True
                         keep_sorted = keep_sorted | floor_sorted
-                        keep = torch.zeros_like(x, dtype=torch.bool)
+                        keep = torch.zeros_like(x_samp, dtype=torch.bool)
                         keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
 
-                x = x.masked_fill(~keep, float('-inf'))
+                x_samp = x_samp.masked_fill(~keep, float('-inf'))
 
             # CRITICAL: Recompute log-probs after ALL masking to ensure alignment
-            # This guarantees draft_logp exactly matches the distribution we sample from
-            logp = torch.log_softmax(x, dim=-1)  # [B, V], FP32
+            # This guarantees sampling from the correct masked distribution
+            logp_samp = torch.log_softmax(x_samp, dim=-1)  # [B, V], FP32
 
             # Check for single-survivor rows (where only 1 token has non-inf logit)
-            survivors = torch.isfinite(logp).sum(dim=-1)  # [B]
+            survivors = torch.isfinite(logp_samp).sum(dim=-1)  # [B]
 
             # Sample from the masked distribution
-            dist = torch.distributions.Categorical(logits=x)
+            dist = torch.distributions.Categorical(logits=x_samp)
             draft_token_ids = dist.sample()  # [B]
 
-            # Gather log-prob from PRE-NUCLEUS distribution for rejection sampler
-            # This prevents q from becoming 1.0 when nucleus collapses to single survivor
-            draft_logp = logp_full.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
+            # Gather log-prob from ACCEPTANCE-Q distribution (softer, floored temp)
+            # This prevents q from becoming 1.0 due to intrinsic temperature collapse
+            draft_logp = logp_q.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
 
             # Clamp to finite FP32 range
             draft_logp = torch.nan_to_num(draft_logp, neginf=-80.0)
