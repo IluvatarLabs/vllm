@@ -206,18 +206,17 @@ class EagleProposer:
         self.nvtx_enabled = self.opt_config.enable_nvtx_ranges
 
     def _sample_draft_tokens(
-        self, logits: torch.Tensor, sampling_metadata: SamplingMetadata
+        self, logits: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Sample draft tokens with temperature/top-p/top-k using Categorical distribution.
 
-        CRITICAL: Uses target's sampling parameters to ensure drafter and target
-        sample from the same filtered distribution. This makes acceptance rates
-        vary correctly with temperature changes.
+        Uses drafter's own sampling parameters (draft_temperature, draft_top_k, draft_top_p)
+        which are independent of target's parameters. This allows calibration to vary
+        acceptance rates by changing drafter params while keeping target params fixed.
 
         Args:
             logits: [B, V] raw model logits, may arrive as fp16
-            sampling_metadata: Target's sampling parameters (temp, top_k, top_p)
 
         Returns:
             draft_token_ids: [B] sampled token IDs
@@ -237,57 +236,35 @@ class EagleProposer:
         # Stochastic sampling: disable autocast and force FP32
         with torch.amp.autocast("cuda", enabled=False):
             x = logits.to(torch.float32)
+
+            # Log max BEFORE stabilization for meaningful debug
+            raw_max = x.max().item()
+
             # Stabilizer: subtract max to prevent overflow/underflow
             x = x - x.amax(dim=-1, keepdim=True)
 
             # Apply temperature in logits space
-            # CRITICAL: Use target's temperature so drafter matches target distribution
-            # This makes acceptance vary correctly when calibrating temperature
-            temperature = sampling_metadata.temperature
-            if temperature is not None:
-                # Handle batched case: temperature is per-request [B]
-                if temperature.ndim == 0:
-                    temp_scalar = temperature.item()
-                else:
-                    # For batched sampling, take first (assume homogeneous batch for now)
-                    # TODO: Handle heterogeneous batches properly
-                    temp_scalar = temperature[0].item() if temperature.numel() > 0 else 1.0
-            else:
-                temp_scalar = 1.0
+            # Read from drafter's own config (independent of target)
+            temperature = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
 
-            print(f"[TEMP_DEBUG] EAGLE sampling with temperature: {temp_scalar} (from target)", file=sys.stderr, flush=True)
-            if temp_scalar != 1.0:
-                x_before_max = x.max().item()
-                x = x / float(temp_scalar)
-                x_after_max = x.max().item()
-                print(f"[TEMP_DEBUG] Applied temp scaling: logit max before={x_before_max:.3f}, after={x_after_max:.3f}", file=sys.stderr, flush=True)
-            else:
-                print(f"[TEMP_DEBUG] Skipped temp scaling (temp==1.0)", file=sys.stderr, flush=True)
+            std_before = x.std().item()
+            if temperature != 1.0:
+                x = x / float(temperature)
+            std_after = x.std().item()
+
+            print(f"[TEMP_DEBUG] EAGLE draft_temp={temperature:.3f} raw_max={raw_max:.3f} "
+                  f"std: {std_before:.4f}->{std_after:.4f}", file=sys.stderr, flush=True)
 
             # Apply top-k (mask to -inf in logits space)
-            # Use target's top_k parameter
-            top_k_tensor = sampling_metadata.top_k
-            if top_k_tensor is not None:
-                if top_k_tensor.ndim == 0:
-                    top_k = top_k_tensor.item()
-                else:
-                    top_k = top_k_tensor[0].item() if top_k_tensor.numel() > 0 else 0
-            else:
-                top_k = 0
+            # Read from drafter's own config
+            top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
             if top_k > 0 and top_k < x.shape[-1]:
                 kth = torch.topk(x, k=top_k, dim=-1).values[..., -1, None]
                 x = x.masked_fill(x < kth, float('-inf'))
 
             # Apply top-p (nucleus sampling in logits space)
-            # Use target's top_p parameter
-            top_p_tensor = sampling_metadata.top_p
-            if top_p_tensor is not None:
-                if top_p_tensor.ndim == 0:
-                    top_p = top_p_tensor.item()
-                else:
-                    top_p = top_p_tensor[0].item() if top_p_tensor.numel() > 0 else 1.0
-            else:
-                top_p = 1.0
+            # Read from drafter's own config
+            top_p = float(getattr(self.opt_config, "draft_top_p", 1.0) or 1.0)
             if top_p < 1.0:
                 # Sort by logit descending
                 sorted_logits, sorted_idx = torch.sort(x, dim=-1, descending=True)
@@ -424,7 +401,7 @@ class EagleProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_token_ids, draft_logp = self._sample_draft_tokens(logits, sampling_metadata)
+            draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
             return DraftProposals(
                 token_ids=draft_token_ids.view(-1, 1),
                 logprobs=draft_logp.view(-1, 1)
@@ -448,7 +425,7 @@ class EagleProposer:
                 logprobs=torch.cat(draft_logp_list, dim=1)
             )
 
-        draft_token_ids, draft_logp = self._sample_draft_tokens(logits, sampling_metadata)
+        draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
         draft_token_ids_list = [draft_token_ids]
         draft_logp_list = [draft_logp]
 
@@ -555,7 +532,7 @@ class EagleProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids, draft_logp = self._sample_draft_tokens(logits, sampling_metadata)
+            draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
             draft_token_ids_list.append(draft_token_ids)
             draft_logp_list.append(draft_logp)
 
@@ -746,7 +723,7 @@ class EagleProposer:
         # Sample a draft token for each child at the tree root level.
         num_children = self.child_drafts_per_level[0]
         if num_children == 1:
-            draft_token_ids, draft_logp = self._sample_draft_tokens(logits, sampling_metadata)
+            draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
             draft_token_ids = draft_token_ids.view(batch_size, -1)
             draft_logp = draft_logp.view(batch_size, -1)
             draft_token_ids_list = [draft_token_ids]
@@ -887,7 +864,7 @@ class EagleProposer:
             # Sample a draft token for each child at the next tree level.
             num_children = self.child_drafts_per_level[level + 1]
             if num_children == 1:
-                draft_token_ids, draft_logp = self._sample_draft_tokens(logits, sampling_metadata)
+                draft_token_ids, draft_logp = self._sample_draft_tokens(logits)
                 draft_token_ids = draft_token_ids.view(batch_size, -1)
                 draft_logp = draft_logp.view(batch_size, -1)
                 draft_token_ids_list.append(draft_token_ids)
