@@ -445,6 +445,11 @@ class EngineArgs:
 
     speculative_config: Optional[Dict[str, Any]] = None
 
+    # Draft model sampling parameters for speculative decoding
+    draft_temperature: Optional[float] = None
+    draft_top_p: Optional[float] = None
+    draft_top_k: Optional[int] = None
+
     show_hidden_metrics_for_version: Optional[str] = \
         ObservabilityConfig.show_hidden_metrics_for_version
     otlp_traces_endpoint: Optional[str] = \
@@ -1502,6 +1507,10 @@ class EngineArgs:
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
+            # Pass draft sampling parameters for spec decode
+            draft_temperature=self.draft_temperature,
+            draft_top_p=self.draft_top_p,
+            draft_top_k=self.draft_top_k,
             additional_config=self.additional_config,
         )
 

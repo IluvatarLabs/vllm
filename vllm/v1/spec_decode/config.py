@@ -71,8 +71,10 @@ class SpecDecodeOptConfig:
 
         if hasattr(vllm_config, 'draft_temperature'):
             config.draft_temperature = vllm_config.draft_temperature
+            logger.info(f"[TEMP_DEBUG] Got draft_temperature from vllm_config: {config.draft_temperature}")
         else:
             config.draft_temperature = float(os.environ.get('VLLM_DRAFT_TEMPERATURE', '0.9'))
+            logger.info(f"[TEMP_DEBUG] Using default/env draft_temperature: {config.draft_temperature}")
 
         if hasattr(vllm_config, 'draft_top_p'):
             config.draft_top_p = vllm_config.draft_top_p

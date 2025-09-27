@@ -258,6 +258,10 @@ class VllmConfig:
     """LoRA configuration."""
     speculative_config: Optional[SpeculativeConfig] = None
     """Speculative decoding configuration."""
+    # Draft model sampling parameters (for spec decode)
+    draft_temperature: Optional[float] = None
+    draft_top_p: Optional[float] = None
+    draft_top_k: Optional[int] = None
     structured_outputs_config: StructuredOutputsConfig = field(
         default_factory=StructuredOutputsConfig)
     """Structured outputs configuration."""

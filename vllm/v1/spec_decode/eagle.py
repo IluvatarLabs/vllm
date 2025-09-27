@@ -236,6 +236,7 @@ class EagleProposer:
 
             # Apply temperature in logits space
             temperature = getattr(self.opt_config, "draft_temperature", 1.0) or 1.0
+            logger.info(f"[TEMP_DEBUG] EAGLE sampling with temperature: {temperature}")
             if temperature != 1.0:
                 x = x / float(temperature)
 
