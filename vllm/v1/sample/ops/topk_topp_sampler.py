@@ -150,13 +150,30 @@ def apply_top_k_top_p(
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
     if p is not None:
-        # Apply top-p.
-        probs_sort = logits_sort.softmax(dim=-1)
-        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
-        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
-        # at least one
-        top_p_mask[:, -1] = False
-        logits_sort.masked_fill_(top_p_mask, -float("inf"))
+        # Apply top-p with exclusive threshold to prevent single-survivor collapse.
+        # CRITICAL: Use exclusive cumsum test to guarantee at least 2 tokens survive.
+        # This prevents edge case where single token has p>threshold → log_p=0.0
+
+        # Work in probability space
+        probs_sort = logits_sort.softmax(dim=-1)  # Still in ascending order
+
+        # Flip to descending (best first) for cumsum
+        probs_desc = probs_sort.flip(dims=[-1])
+        csum = probs_desc.cumsum(dim=-1)
+
+        # Exclusive threshold: keep tokens while cumsum[i-1] < p
+        # Always keep at least the top-1 token
+        keep_desc = torch.zeros_like(probs_desc, dtype=torch.bool)
+        keep_desc[:, 0] = True  # Always keep best token
+        if probs_desc.shape[-1] > 1:
+            keep_desc[:, 1:] = csum[:, :-1] < p.unsqueeze(dim=1)  # Exclusive
+
+        # Flip back to ascending order to match logits_sort
+        keep_asc = keep_desc.flip(dims=[-1])
+
+        # Mask out tokens we don't want
+        logits_sort = torch.where(keep_asc, logits_sort,
+                                 torch.full_like(logits_sort, float("-inf")))
 
     # Re-sort the probabilities.
     logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
