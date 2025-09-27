@@ -197,7 +197,7 @@ class RejectionSampler(nn.Module):
             metadata.max_spec_len,
             metadata.cu_num_draft_tokens,
             draft_probs,
-            target_probs,
+            target_logits,  # Pass logits not probs for Option B'
             bonus_token_ids,
             sampling_metadata,
         )
@@ -262,8 +262,8 @@ def rejection_sample(
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size] - REQUIRED, not Optional
     draft_probs: torch.Tensor,
-    # [num_tokens, vocab_size]
-    target_probs: torch.Tensor,
+    # [num_tokens, vocab_size] - CHANGED: now logits not probs (for Option B')
+    target_logits: torch.Tensor,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -271,17 +271,17 @@ def rejection_sample(
     assert draft_token_ids.ndim == 1
     assert draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
-    assert target_probs.ndim == 2
+    assert target_logits.ndim == 2
 
     batch_size = len(num_draft_tokens)
     num_tokens = draft_token_ids.shape[0]
-    vocab_size = target_probs.shape[-1]
-    device = target_probs.device
+    vocab_size = target_logits.shape[-1]
+    device = target_logits.device
     assert draft_token_ids.is_contiguous()
     assert draft_probs.is_contiguous()
-    assert target_probs.is_contiguous()
+    assert target_logits.is_contiguous()
     assert bonus_token_ids.is_contiguous()
-    assert target_probs.shape == (num_tokens, vocab_size)
+    assert target_logits.shape == (num_tokens, vocab_size)
 
     # Create output buffer.
     output_token_ids = torch.empty(
@@ -297,7 +297,7 @@ def rejection_sample(
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
-        target_argmax = target_probs.argmax(dim=-1)
+        target_argmax = target_logits.argmax(dim=-1)
         rejection_greedy_sample_kernel[(batch_size, )](
             output_token_ids,
             cu_num_draft_tokens,
@@ -329,7 +329,7 @@ def rejection_sample(
         # Apply temperature and top-k/top-p filtering to target logits
         # This produces the filtered target distribution p_target
         target_probs_filtered = compute_probs(
-            target_logits.float(),
+            target_logits.float(),  # Now correctly using target_logits
             cu_num_draft_tokens,
             sampling_metadata,
         )
@@ -370,12 +370,13 @@ def rejection_sample(
     )
 
     # Rejection sampling for random sampling requests.
+    # Use filtered target probs (Option B': all distributions in filtered space)
     rejection_random_sample_kernel[(batch_size, )](
         output_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
-        target_probs,
+        target_probs_filtered,  # Use filtered probs for consistency
         bonus_token_ids,
         recovered_token_ids,
         uniform_probs,

@@ -295,10 +295,12 @@ class EagleProposer:
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumsum = torch.cumsum(sorted_probs, dim=-1)
 
-                # Keep tokens where cumsum <= top_p
-                keep_sorted = cumsum <= top_p
-                # Always keep at least the top-1 token
-                keep_sorted[..., 0] = True
+                # FIXED: Use exclusive threshold to prevent single-survivor collapse
+                # Keep tokens while cumsum[i-1] < top_p (exclusive test)
+                keep_sorted = torch.zeros_like(sorted_probs, dtype=torch.bool)
+                keep_sorted[..., 0] = True  # Always keep top-1
+                if sorted_probs.shape[-1] > 1:
+                    keep_sorted[..., 1:] = cumsum[..., :-1] < top_p  # Exclusive
 
                 # Map keep mask back to original vocab order
                 keep = torch.zeros_like(x, dtype=torch.bool)
