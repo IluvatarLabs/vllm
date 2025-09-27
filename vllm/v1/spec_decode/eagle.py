@@ -254,8 +254,13 @@ class EagleProposer:
 
                 # Keep tokens where cumsum <= top_p
                 keep_sorted = cumsum <= top_p
-                # Always keep at least the top-1 token
-                keep_sorted[..., 0] = True
+
+                # CRITICAL: Always keep at least 2 tokens for stochastic sampling
+                # This prevents delta distributions (prob=1.0) which cause logprob=0.0
+                if self.opt_config.draft_sampling_mode == "stochastic":
+                    keep_sorted[..., :2] = True  # Keep top-2 minimum
+                else:
+                    keep_sorted[..., 0] = True   # Greedy only needs top-1
 
                 # Map keep mask back to original vocab order
                 keep = torch.zeros_like(x, dtype=torch.bool)

@@ -2456,6 +2456,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             propose_draft_token_ids(sampler_output.sampled_token_ids)
             print("[HANG_DEBUG] After propose_draft_token_ids nested function", file=sys.stderr, flush=True)
 
+            # CRITICAL: Build verification matrix [B, 1+T] for rejection sampler
+            # Without this, bookkeeping sees [B, 1] and takes "no spec decode" branch
+            if self._draft_token_ids is not None:
+                sampler_output.sampled_token_ids = torch.cat([
+                    sampler_output.sampled_token_ids,  # [B, 1] target token
+                    self._draft_token_ids               # [B, T] draft tokens
+                ], dim=1)  # [B, 1+T]
+                print(f"[SPEC_DEBUG] Built verification matrix: {sampler_output.sampled_token_ids.shape}",
+                      file=sys.stderr, flush=True)
+
         print("[HANG_DEBUG] Before bookkeeping", file=sys.stderr, flush=True)
         with record_function_or_nullcontext("Bookkeep"):
             (
