@@ -321,25 +321,41 @@ def rejection_sample(
     )
 
     # Sample recovered tokens for each position.
-    # CRITICAL: Apply temperature and top-p to the adjusted distribution.
-    # The adjusted distribution is (p_target - p_draft)_+, which needs filtering.
-    # Compute adjusted logits: log(max(p_target - p_draft, 0) + eps)
-    adjusted_probs = torch.clamp(target_probs - draft_probs, min=0.0)
-    # Add small epsilon to avoid log(0), then take log to get logits
-    adjusted_logits = torch.log(adjusted_probs + 1e-10)
+    # OPTION B': Compute residual in filtered space.
+    # Apply same (temp, top_k, top_p) to target that drafter used.
+    # This ensures all tokens (accepted/recovered/bonus) come from same filtered distribution.
 
-    # Apply temperature and top-p filtering via compute_probs
-    adjusted_probs_filtered = compute_probs(
-        adjusted_logits,
-        cu_num_draft_tokens,
-        sampling_metadata,
-    )
+    with torch.autocast(device_type="cuda", enabled=False):
+        # Apply temperature and top-k/top-p filtering to target logits
+        # This produces the filtered target distribution p_target
+        target_probs_filtered = compute_probs(
+            target_logits.float(),
+            cu_num_draft_tokens,
+            sampling_metadata,
+        )
 
-    # CRITICAL: Pass zeros for draft_probs so kernel computes max(adjusted - 0, 0) = adjusted.
-    # Kernel does: prob = max(target_prob - draft_prob, 0)
-    # We want: prob = adjusted_probs_filtered (which is already the adjusted distribution)
-    # So we pass adjusted_probs_filtered as target and zeros as draft.
-    zero_draft_probs = torch.zeros_like(adjusted_probs_filtered)
+        # Draft probs are already in filtered space (drafter used same params)
+        # Compute residual: (p_target_filtered - q_draft)_+
+        adjusted_probs = torch.clamp(target_probs_filtered - draft_probs, min=0.0)
+
+        # Handle zero-sum rows (edge case: all target mass was on draft token)
+        row_sums = adjusted_probs.sum(dim=-1, keepdim=True)
+        zero_rows = (row_sums.squeeze(-1) == 0.0)
+
+        if zero_rows.any():
+            # Fallback: For empty rows, use filtered target distribution directly
+            # (sample from target argmax in filtered space)
+            target_argmax = target_probs_filtered.argmax(dim=-1)
+            adjusted_probs[zero_rows] = 0.0
+            adjusted_probs[zero_rows, target_argmax[zero_rows]] = 1.0
+        else:
+            # Renormalize to valid probability distribution
+            adjusted_probs = adjusted_probs / row_sums
+
+        # CRITICAL: Pass zeros for draft_probs so kernel doesn't subtract again.
+        # Kernel computes: max(target - draft, 0)
+        # We want: max(adjusted_probs - 0, 0) = adjusted_probs (already computed residual)
+        zero_draft_probs = torch.zeros_like(adjusted_probs)
 
     # [num_tokens]
     recovered_token_ids = sample_recovered_tokens(
@@ -347,8 +363,8 @@ def rejection_sample(
         num_draft_tokens,
         cu_num_draft_tokens,
         draft_token_ids,
-        zero_draft_probs,  # Pass zeros to bypass kernel's subtraction
-        adjusted_probs_filtered,  # Pre-computed adjusted distribution with temp/top-p
+        zero_draft_probs,  # Bypass kernel's subtraction
+        adjusted_probs,    # Pre-computed residual in filtered space
         sampling_metadata,
         device,
     )
@@ -378,58 +394,68 @@ def compute_probs(
 ) -> torch.Tensor:
     """Compute probability distribution from logits based on sampling metadata.
 
-    This function applies temperature scaling to the logits and converts
-    them to probabilities using softmax. For greedy decoding, it returns
-    the original logits.
+    Applies temperature, top-k, and top-p filtering in FP32 for numerical stability.
+    Returns normalized probability distribution suitable for sampling.
 
     Args:
         logits: Input logits tensor to be converted to probabilities.
         cu_num_draft_tokens: Cumulative number of draft tokens.
         sampling_metadata: Metadata containing sampling parameters such as
-            temperature and whether greedy sampling is used.
+            temperature, top_k, and top_p.
 
     Returns:
-        torch.Tensor: Probability distribution (softmax of scaled logits)
-            if non-greedy sampling is used, otherwise returns the
-            original logits.
+        torch.Tensor: Filtered probability distribution in FP32.
     """
     assert logits.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
-    if sampling_metadata.all_greedy:
-        return logits
 
-    num_tokens = logits.shape[0]
-    temperature = expand_batch_to_tokens(
-        sampling_metadata.temperature,
-        cu_num_draft_tokens,
-        num_tokens,
-        replace_from=GREEDY_TEMPERATURE,
-        replace_to=1,
-    )
-    # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
-    logits.div_(temperature.unsqueeze(-1))
+    # Force FP32 for all sampling operations (numerical stability)
+    with torch.autocast(device_type="cuda", enabled=False):
+        logits = logits.float()
 
-    # Get expanded top_k and top_p tensors.
-    top_k = None
-    if sampling_metadata.top_k is not None:
-        top_k = expand_batch_to_tokens(
-            sampling_metadata.top_k,
+        if sampling_metadata.all_greedy:
+            # Greedy case: just return probabilities from softmax
+            # (This path shouldn't be hit for recovered tokens)
+            return logits.softmax(dim=-1)
+
+        # Stabilize: subtract max before any operations
+        logits = logits - logits.amax(dim=-1, keepdim=True)
+
+        num_tokens = logits.shape[0]
+        temperature = expand_batch_to_tokens(
+            sampling_metadata.temperature,
             cu_num_draft_tokens,
             num_tokens,
-        )
-    top_p = None
-    if sampling_metadata.top_p is not None:
-        top_p = expand_batch_to_tokens(
-            sampling_metadata.top_p,
-            cu_num_draft_tokens,
-            num_tokens,
+            replace_from=GREEDY_TEMPERATURE,
+            replace_to=1,
         )
 
-    # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
-    # which is slow for large vocab sizes. This may cause performance issues.
-    logits = apply_top_k_top_p(logits, top_k, top_p)
-    output_prob = logits.softmax(dim=-1, dtype=torch.float32)
-    return output_prob
+        # Apply temperature (create new tensor, no in-place modification)
+        logits = logits / temperature.unsqueeze(-1)
+
+        # Get expanded top_k and top_p tensors
+        top_k = None
+        if sampling_metadata.top_k is not None:
+            top_k = expand_batch_to_tokens(
+                sampling_metadata.top_k,
+                cu_num_draft_tokens,
+                num_tokens,
+            )
+        top_p = None
+        if sampling_metadata.top_p is not None:
+            top_p = expand_batch_to_tokens(
+                sampling_metadata.top_p,
+                cu_num_draft_tokens,
+                num_tokens,
+            )
+
+        # Apply top_k and top_p filtering
+        logits = apply_top_k_top_p(logits, top_k, top_p)
+
+        # Return probabilities (explicit FP32)
+        output_prob = logits.softmax(dim=-1, dtype=torch.float32)
+
+        return output_prob
 
 
 def expand_batch_to_tokens(
