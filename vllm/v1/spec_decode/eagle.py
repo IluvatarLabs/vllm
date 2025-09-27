@@ -255,6 +255,10 @@ class EagleProposer:
             print(f"[TEMP_DEBUG] EAGLE draft_temp={temperature:.3f} raw_max={raw_max:.3f} "
                   f"std: {std_before:.4f}->{std_after:.4f}", file=sys.stderr, flush=True)
 
+            # CRITICAL: Compute pre-nucleus logprobs for rejection sampler
+            # This prevents q from collapsing to 1.0 when only 1 token survives masking
+            logp_full = torch.log_softmax(x, dim=-1)  # [B, V], FP32, before any masking
+
             # Apply top-k (mask to -inf in logits space)
             # Read from drafter's own config
             top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
@@ -282,6 +286,20 @@ class EagleProposer:
                 # Map keep mask back to original vocab order
                 keep = torch.zeros_like(x, dtype=torch.bool)
                 keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
+
+                # Optional: enforce minimum survivors to prevent full collapse
+                min_survivors = int(getattr(self.opt_config, "draft_top_p_min_survivors", 0) or 0)
+                if min_survivors > 1:
+                    survivor_counts = keep.sum(dim=-1, keepdim=True)  # [B, 1]
+                    need_more = (survivor_counts < min_survivors)
+                    if need_more.any():
+                        # Add next-best tokens in sorted space until floor is met
+                        floor_sorted = torch.zeros_like(keep_sorted, dtype=torch.bool)
+                        floor_sorted[..., :min_survivors] = True
+                        keep_sorted = keep_sorted | floor_sorted
+                        keep = torch.zeros_like(x, dtype=torch.bool)
+                        keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
+
                 x = x.masked_fill(~keep, float('-inf'))
 
             # CRITICAL: Recompute log-probs after ALL masking to ensure alignment
@@ -295,20 +313,26 @@ class EagleProposer:
             dist = torch.distributions.Categorical(logits=x)
             draft_token_ids = dist.sample()  # [B]
 
-            # Gather log-prob from the recomputed logp (NOT from dist.log_prob)
-            draft_logp = logp.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
+            # Gather log-prob from PRE-NUCLEUS distribution for rejection sampler
+            # This prevents q from becoming 1.0 when nucleus collapses to single survivor
+            draft_logp = logp_full.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
 
             # Clamp to finite FP32 range
             draft_logp = torch.nan_to_num(draft_logp, neginf=-80.0)
 
-            # Validate: single-survivor rows can have logp==0, multi-survivor must have logp<0
-            multi = (survivors > 1)
-            if torch.any(multi) and torch.any(draft_logp[multi] >= 1e-6):
-                bad_logp = draft_logp[multi][draft_logp[multi] >= 1e-6]
-                raise RuntimeError(
-                    f"Draft sampling produced non-negative logp with >1 survivors. "
-                    f"bad_logp={bad_logp.tolist()}, survivors={survivors.tolist()}"
-                )
+            # Debug: log survivors and q statistics
+            if survivors.numel() > 0:
+                print(f"[NUC_DEBUG] survivors per row: min={survivors.min().item()}, "
+                      f"max={survivors.max().item()}, mean={survivors.float().mean().item():.1f}",
+                      file=sys.stderr, flush=True)
+
+            q_chosen = torch.exp(draft_logp)
+            if q_chosen.numel() > 0:
+                print(f"[Q_DEBUG] chosen q min/med/max: "
+                      f"{q_chosen.min().item():.3e}/"
+                      f"{q_chosen.median().item():.3e}/"
+                      f"{q_chosen.max().item():.3e}",
+                      file=sys.stderr, flush=True)
 
             return draft_token_ids.contiguous(), draft_logp.contiguous()
 
