@@ -4429,11 +4429,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             verifier_tokens = self._internal_metrics.get("verifier_tokens", 0)
             accept_rate = (accepted / proposed) if proposed > 0 else 0.0
 
+            # Use ShadowKV-compatible naming for benchmark compatibility
             metrics["acceptance"] = {
                 "accept_rate": accept_rate,
-                "acceptance_rate": accept_rate,  # alias for compatibility
-                "accepted": accepted,
-                "proposed": proposed,
+                "acceptance_rate": accept_rate,
+                "total_committed": accepted,           # ShadowKV-style: accepted tokens
+                "total_rejected": proposed - accepted, # ShadowKV-style: rejected tokens
+                "total_staged": proposed,              # ShadowKV-style: total proposed
                 "verifier_tokens": verifier_tokens,
             }
 

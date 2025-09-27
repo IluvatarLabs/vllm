@@ -222,14 +222,14 @@ class EagleProposer:
         # Fallback to greedy argmax if configured
         if self.opt_config.draft_sampling_mode == "argmax":
             draft_token_ids = logits.argmax(dim=-1)
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 draft_logp = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(
                     -1, draft_token_ids.unsqueeze(-1)
                 ).squeeze(-1)
             return draft_token_ids, draft_logp
 
         # Stochastic sampling: disable autocast and force FP32
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             x = logits.to(torch.float32)
             # Stabilizer: subtract max to prevent overflow/underflow
             x = x - x.amax(dim=-1, keepdim=True)
