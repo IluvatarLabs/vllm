@@ -2496,9 +2496,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if isinstance(valid_sampled_token_ids, list):
                 num_accepted_list = [max(0, len(seq) - 1) for seq in valid_sampled_token_ids]
             else:
-                num_accepted_list = [(row >= 0).sum().item() - 1 for row in valid_sampled_token_ids]
+                num_accepted_list = [max(0, (row >= 0).sum().item() - 1) for row in valid_sampled_token_ids]
 
-            router_for_commit.commit(num_accepted_list)
+            # CRITICAL: commit() expects int (total tokens), not list (per-batch counts)
+            # Shadow buffer stages tokens sequentially across all batches
+            total_accepted = sum(num_accepted_list)
+            router_for_commit.commit(total_accepted)
             router_for_commit.immediate()
 
         print("[HANG_DEBUG] Creating output", file=sys.stderr, flush=True)
@@ -2691,7 +2694,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Broadcast tensor payload
         if tp_rank == src_rank:
-            buf = tensor_src.contiguous()
+            # CRITICAL: Cast to FP32 before broadcast (src rank must match dst dtype)
+            buf = tensor_src.to(torch.float32).contiguous()
         else:
             # Non-source ranks: allocate buffer with correct shape
             buf = torch.empty((rows, cols), device=shape_buf.device,

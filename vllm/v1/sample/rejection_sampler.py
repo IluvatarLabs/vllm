@@ -156,6 +156,28 @@ class RejectionSampler(nn.Module):
               f"{target_p_check.max():.3e}",
               file=sys.stderr, flush=True)
 
+        # CRITICAL: Compute actual acceptance BEFORE triton kernels for metrics
+        # This is the ONLY place where we can count acceptance for ShadowKV metrics
+        with torch.autocast(device_type="cuda", enabled=False):
+            # Get target log-probs for draft tokens (FP32 for numerical stability)
+            tgt_logp_all = torch.log_softmax(target_logits.to(torch.float32), dim=-1)  # [num_tokens, V]
+            p_tgt = tgt_logp_all.gather(-1, metadata.draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [num_tokens]
+
+            # Get draft log-probs (already in log-space from EAGLE)
+            q_logp = draft_logprobs.float()  # [num_tokens]
+
+            # Rejection sampling: accept if log(U) <= log(p_tgt / q_draft) = p_tgt - q_logp
+            log_u = torch.log(torch.rand_like(p_tgt))  # [num_tokens], in (-inf, 0]
+            accept_mask = (log_u <= (p_tgt - q_logp))  # [num_tokens], bool
+
+            # Count accepted vs proposed for metrics
+            num_accepted_global = int(accept_mask.sum().item())
+            num_proposed_global = int(accept_mask.numel())
+            accept_rate_global = num_accepted_global / num_proposed_global if num_proposed_global > 0 else 0.0
+
+            print(f"[ACCEPT_METRICS] Accepted {num_accepted_global}/{num_proposed_global} = {accept_rate_global:.1%}",
+                  file=sys.stderr, flush=True)
+
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,

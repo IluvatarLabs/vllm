@@ -231,6 +231,8 @@ class EagleProposer:
         # Stochastic sampling: disable autocast and force FP32
         with torch.cuda.amp.autocast(enabled=False):
             x = logits.to(torch.float32)
+            # Stabilizer: subtract max to prevent overflow/underflow
+            x = x - x.amax(dim=-1, keepdim=True)
 
             # Apply temperature in logits space
             temperature = getattr(self.opt_config, "draft_temperature", 1.0) or 1.0
