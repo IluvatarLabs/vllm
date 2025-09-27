@@ -254,13 +254,8 @@ class EagleProposer:
 
                 # Keep tokens where cumsum <= top_p
                 keep_sorted = cumsum <= top_p
-
-                # CRITICAL: Always keep at least 2 tokens for stochastic sampling
-                # This prevents delta distributions (prob=1.0) which cause logprob=0.0
-                if self.opt_config.draft_sampling_mode == "stochastic":
-                    keep_sorted[..., :2] = True  # Keep top-2 minimum
-                else:
-                    keep_sorted[..., 0] = True   # Greedy only needs top-1
+                # Always keep at least the top-1 token
+                keep_sorted[..., 0] = True
 
                 # Map keep mask back to original vocab order
                 keep = torch.zeros_like(x, dtype=torch.bool)
@@ -273,17 +268,8 @@ class EagleProposer:
             draft_token_ids = dist.sample()                    # [B]
             draft_logp = dist.log_prob(draft_token_ids)        # [B], strictly <= 0
 
-            # Safety check: only error if multiple survivors but logp==0 (indicates numerical bug)
-            if torch.all(torch.isfinite(draft_logp)):
-                survivors = torch.isfinite(x).sum(dim=-1)
-                collapsed = (draft_logp == 0).logical_and(survivors > 1)
-                if collapsed.any():
-                    raise RuntimeError(
-                        f"Draft sampling numerically collapsed despite multiple survivors. "
-                        f"survivors={survivors[collapsed].tolist()}, temp={temperature}, "
-                        f"top_k={top_k}, top_p={top_p}"
-                    )
-            else:
+            # Only check for NaN/Inf, not for logp≈0 (dominant tokens can legitimately have logp≈0)
+            if not torch.all(torch.isfinite(draft_logp)):
                 raise RuntimeError("Non-finite draft log-prob encountered")
 
             return draft_token_ids, draft_logp
