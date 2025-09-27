@@ -288,14 +288,14 @@ class EagleProposer:
                 keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
 
                 # Optional: enforce minimum survivors to prevent full collapse
-                min_survivors = int(getattr(self.opt_config, "draft_top_p_min_survivors", 2) or 2)
-                if min_survivors > 1:
+                min_keep = int(getattr(self.opt_config, "draft_min_keep", 0) or 0)
+                if min_keep > 0:
                     survivor_counts = keep.sum(dim=-1, keepdim=True)  # [B, 1]
-                    need_more = (survivor_counts < min_survivors)
+                    need_more = (survivor_counts < min_keep)
                     if need_more.any():
                         # Add next-best tokens in sorted space until floor is met
                         floor_sorted = torch.zeros_like(keep_sorted, dtype=torch.bool)
-                        floor_sorted[..., :min_survivors] = True
+                        floor_sorted[..., :min_keep] = True
                         keep_sorted = keep_sorted | floor_sorted
                         keep = torch.zeros_like(x, dtype=torch.bool)
                         keep.scatter_(dim=-1, index=sorted_idx, src=keep_sorted)
