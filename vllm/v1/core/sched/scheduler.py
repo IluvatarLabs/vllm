@@ -898,7 +898,9 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                # When all drafts accepted, bonus token is appended at end.
+                # Don't count bonus token as accepted draft token.
+                num_accepted = min(len(generated_token_ids) - 1, num_draft_tokens)
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled

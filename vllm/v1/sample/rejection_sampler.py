@@ -321,14 +321,34 @@ def rejection_sample(
     )
 
     # Sample recovered tokens for each position.
+    # CRITICAL: Apply temperature and top-p to the adjusted distribution.
+    # The adjusted distribution is (p_target - p_draft)_+, which needs filtering.
+    # Compute adjusted logits: log(max(p_target - p_draft, 0) + eps)
+    adjusted_probs = torch.clamp(target_probs - draft_probs, min=0.0)
+    # Add small epsilon to avoid log(0), then take log to get logits
+    adjusted_logits = torch.log(adjusted_probs + 1e-10)
+
+    # Apply temperature and top-p filtering via compute_probs
+    adjusted_probs_filtered = compute_probs(
+        adjusted_logits,
+        cu_num_draft_tokens,
+        sampling_metadata,
+    )
+
+    # CRITICAL: Pass zeros for draft_probs so kernel computes max(adjusted - 0, 0) = adjusted.
+    # Kernel does: prob = max(target_prob - draft_prob, 0)
+    # We want: prob = adjusted_probs_filtered (which is already the adjusted distribution)
+    # So we pass adjusted_probs_filtered as target and zeros as draft.
+    zero_draft_probs = torch.zeros_like(adjusted_probs_filtered)
+
     # [num_tokens]
     recovered_token_ids = sample_recovered_tokens(
         max_spec_len,
         num_draft_tokens,
         cu_num_draft_tokens,
         draft_token_ids,
-        draft_probs,
-        target_probs,
+        zero_draft_probs,  # Pass zeros to bypass kernel's subtraction
+        adjusted_probs_filtered,  # Pre-computed adjusted distribution with temp/top-p
         sampling_metadata,
         device,
     )
