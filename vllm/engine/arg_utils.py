@@ -373,12 +373,12 @@ class EngineArgs:
     # Draft sampling flags (fix for 100% acceptance issue)
     draft_sampling_mode: str = "stochastic"
     draft_temperature: float = 0.9
-    draft_top_p: float = 1.0
+    draft_top_p: float = 0.95
     draft_top_k: int = 0
     # Mixture proposal settings
-    draft_q_temp_offset: float = 0.25
-    draft_q_soft_temp: float = 2.0
-    draft_mix_lambda_max: float = 0.12
+    draft_q_temp_offset: float = 0.3
+    draft_tau_max: float = 2.0
+    draft_mix_lambda_max: float = 0.02
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
     rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")

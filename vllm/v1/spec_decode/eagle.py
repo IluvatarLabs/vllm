@@ -236,100 +236,78 @@ class EagleProposer:
         # Stochastic sampling: disable autocast and force FP32
         with torch.amp.autocast("cuda", enabled=False):
             x = logits.to(torch.float32)
-
-            # Log max BEFORE stabilization for meaningful debug
-            raw_max = x.max().item()
-
-            # Stabilizer: subtract max to prevent overflow/underflow
             x = x - x.amax(dim=-1, keepdim=True)
 
-            # MIXTURE PROPOSAL (entropy-based): Prevents delta collapse at low temps
-            # Get config parameters
+            # --- temperature for drafter q ---
             tau_d = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
-            delta_tau = float(getattr(self.opt_config, "draft_q_temp_offset", 0.25))
-            tau_soft = float(getattr(self.opt_config, "draft_q_soft_temp", 2.0))
-            lambda_max = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.12))
 
-            # Compute main and soft distributions BEFORE any masking
-            tau_main = tau_d + delta_tau
-            logq_main = torch.log_softmax(x / tau_main, dim=-1)  # [B, V], FP32
-            logq_soft = torch.log_softmax(x / tau_soft, dim=-1)  # [B, V], FP32
+            tau_q = tau_d + float(getattr(self.opt_config, "draft_q_temp_offset", 0.0))
+            tau_max = float(getattr(self.opt_config, "draft_tau_max", 0.0))
+            if tau_max > 0.0:
+                tau_q = min(tau_q, tau_max)
+            if not (tau_q > 0.0 and torch.isfinite(torch.tensor(tau_q))):
+                tau_q = tau_d
 
-            # Entropy-based lambda schedule
-            q_main = logq_main.exp()
-            q_soft = logq_soft.exp()
-            H_main = -(q_main * logq_main).sum(dim=-1)  # [B]
-            H_soft = -(q_soft * logq_soft).sum(dim=-1)  # [B]
+            x = x / tau_q
 
-            # Target entropy: S_tgt = max(2.0, 1.0 + 2.2/(tau_d + 1e-6))
-            import math
-            S_tgt_val = max(2.0, 1.0 + 2.2 / (tau_d + 1e-6))
-            H_tgt = torch.full_like(H_main, math.log(S_tgt_val))
+            # --- top-k (optional) ---
+            k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
+            if 0 < k < x.size(-1):
+                topv, topi = torch.topk(x, k, dim=-1)
+                masked = torch.full_like(x, -float("inf"))
+                x = masked.scatter(-1, topi, topv)
 
-            # Compute lambda per row
-            lambda_raw = (H_tgt - H_main) / (H_soft - H_main + 1e-8)
-            lam = torch.clamp(lambda_raw, 0.0, lambda_max)  # [B]
+            # --- top-p (nucleus) ---
+            tp = float(getattr(self.opt_config, "draft_top_p", 1.0))
 
-            # Mix in log-space using logaddexp
-            log_1mlam = torch.log(1 - lam + 1e-12).unsqueeze(-1)  # [B, 1]
-            log_lam = torch.log(lam + 1e-12).unsqueeze(-1)  # [B, 1]
-            logq_mix = torch.logaddexp(
-                logq_main + log_1mlam,
-                logq_soft + log_lam
-            )  # [B, V]
-
-            # Apply masking to MIXED distribution (not to branches separately)
-            top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
-            top_p = float(getattr(self.opt_config, "draft_top_p", 0.0) or 0.0)
-
-            # Convert log q_mix back to logits for masking
-            x_mix = logq_mix * tau_main  # Approximate conversion
-
-            # Apply top-k if set
-            if top_k and 0 < top_k < x_mix.size(-1):
-                tk_vals, tk_idx = torch.topk(x_mix, top_k, dim=-1)
-                mask = torch.full_like(x_mix, float('-inf'))
-                x_mix = mask.scatter(-1, tk_idx, tk_vals)
-
-            # Apply nucleus if set
-            if top_p and 0.0 < top_p < 1.0:
-                p = torch.softmax(x_mix, dim=-1)
-                sp, si = torch.sort(p, dim=-1, descending=True)
+            if 0.0 < tp < 1.0:
+                p = torch.softmax(x, dim=-1)
+                sp, si = torch.sort(p, dim=-1, descending=True)     # sorted probs
                 csum = sp.cumsum(dim=-1)
-                # Keep tokens where cumsum - prob <= top_p (exclusive)
-                keep_sorted = (csum - sp) <= top_p
-                keep_sorted[..., 0] = True  # Always keep top-1
-                keep = torch.zeros_like(p, dtype=torch.bool).scatter(-1, si, keep_sorted)
-                x_mix = torch.where(keep, x_mix, torch.full_like(x_mix, float('-inf')))
+                keep_sorted = torch.zeros_like(sp, dtype=torch.bool)
+                keep_sorted[..., 0] = True
+                keep_sorted[..., 1:] = csum[..., :-1] < tp          # STRICTLY below threshold
+                # enforce min_keep = 2
+                min_keep = 2
+                kth = sp[..., min_keep - 1:min_keep]                # shape [B,1]
+                keep_sorted = torch.logical_or(keep_sorted, sp >= kth)
 
-            # Final log probs after masking
-            logq_masked = torch.log_softmax(x_mix, dim=-1)  # [B, V], FP32
+                keep = torch.zeros_like(x, dtype=torch.bool).scatter(-1, si, keep_sorted)
+                x = torch.where(keep, x, torch.full_like(x, -float("inf")))
+            else:
+                keep = torch.isfinite(x)  # everything
 
-            # Sample from masked mixture
-            draft_token_ids = torch.distributions.Categorical(logits=logq_masked).sample()  # [B]
+            # --- tiny smoothing over kept set (prevents q==1.0 in ultracold corners) ---
+            lam = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.0))
+            if lam > 0.0:
+                K = keep.sum(dim=-1, keepdim=True).clamp_min(1)
+                uniform = keep.to(x.dtype) / K
+                p = torch.softmax(x, dim=-1)
+                p = (1.0 - lam) * p + lam * uniform
+                logp_full = (p + 1e-9).log()
+            else:
+                logp_full = torch.log_softmax(x, dim=-1)
 
-            # Gather log prob from masked distribution
-            draft_logp = logq_masked.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
+            # --- sample 1 token and gather its logp ---
+            cat = torch.distributions.Categorical(logits=logp_full)
+            tok = cat.sample()   # [B]
+            tok_logp = logp_full.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
 
-            std_before = x.std().item()
-            std_after = x_mix.std().item()
-            lam_mean = lam.mean().item()
-
-            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} soft_temp={tau_soft:.3f} lambda_mean={lam_mean:.3f} "
-                  f"raw_max={raw_max:.3f} std: {std_before:.4f}->{std_after:.4f}",
+            # --- Debug logging ---
+            survivors = keep.sum(dim=-1)
+            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} tau_q={tau_q:.3f}", file=sys.stderr, flush=True)
+            print(f"[NUC_DEBUG] survivors per row: min={survivors.min().item()}, "
+                  f"max={survivors.max().item()}, mean={survivors.float().mean().item():.1f}",
                   file=sys.stderr, flush=True)
 
-            # Debug: log mixture statistics
-            q_chosen = torch.exp(draft_logp)
-            if q_chosen.numel() > 0:
-                print(f"[Q_DEBUG] chosen q min/med/max: "
-                      f"{q_chosen.min().item():.3e}/"
-                      f"{q_chosen.median().item():.3e}/"
-                      f"{q_chosen.max().item():.3e}, "
-                      f"lambda_mean={lam_mean:.3f}",
-                      file=sys.stderr, flush=True)
+            q_chosen = torch.exp(tok_logp)
+            print(f"[Q_DEBUG] chosen q min/med/max: "
+                  f"{q_chosen.min().item():.3e}/"
+                  f"{q_chosen.median().item():.3e}/"
+                  f"{q_chosen.max().item():.3e}",
+                  file=sys.stderr, flush=True)
 
-            return draft_token_ids.contiguous(), draft_logp.contiguous()
+            return tok.contiguous(), tok_logp.contiguous()
 
     def propose(
         self,
