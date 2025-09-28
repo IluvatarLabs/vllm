@@ -284,6 +284,8 @@ class EagleProposer:
 
             # --- tiny smoothing over kept set (prevents q==1.0 in ultracold corners) ---
             lam = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.0))
+            print(f"[SMOOTH_DEBUG] lambda_max from config: {lam}, will run smoothing: {lam > 0.0}",
+                  file=sys.stderr, flush=True)
             if lam > 0.0:
                 K = keep.sum(dim=-1, keepdim=True).clamp_min(1)
                 uniform = keep.to(x.dtype) / K
