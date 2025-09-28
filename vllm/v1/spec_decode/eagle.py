@@ -262,8 +262,9 @@ class EagleProposer:
             H_soft = -(q_soft * logq_soft).sum(dim=-1)  # [B]
 
             # Target entropy: S_tgt = max(2.0, 1.0 + 2.2/(tau_d + 1e-6))
-            S_tgt = torch.clamp(1.0 + 2.2 / (tau_d + 1e-6), min=2.0)
-            H_tgt = torch.log(S_tgt * torch.ones_like(H_main))
+            import math
+            S_tgt_val = max(2.0, 1.0 + 2.2 / (tau_d + 1e-6))
+            H_tgt = torch.full_like(H_main, math.log(S_tgt_val))
 
             # Compute lambda per row
             lambda_raw = (H_tgt - H_main) / (H_soft - H_main + 1e-8)
