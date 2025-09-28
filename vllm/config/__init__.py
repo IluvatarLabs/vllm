@@ -259,9 +259,18 @@ class VllmConfig:
     speculative_config: Optional[SpeculativeConfig] = None
     """Speculative decoding configuration."""
     # Draft model sampling parameters (for spec decode)
+    draft_sampling_mode: str = "stochastic"
     draft_temperature: Optional[float] = None
     draft_top_p: Optional[float] = None
     draft_top_k: Optional[int] = None
+    draft_q_temp_offset: float = 0.25
+    draft_q_soft_temp: float = 1.0
+    draft_mix_lambda_max: float = 0.05
+    # NWOR/SCV optimization flags
+    use_shadow_kv: bool = False
+    scv_enabled: bool = False
+    verify_chunk_size: int = 4
+    enable_nvtx_ranges: bool = False
     structured_outputs_config: StructuredOutputsConfig = field(
         default_factory=StructuredOutputsConfig)
     """Structured outputs configuration."""

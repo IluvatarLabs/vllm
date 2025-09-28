@@ -1512,9 +1512,18 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             # Pass draft sampling parameters for spec decode
+            draft_sampling_mode=self.draft_sampling_mode,
             draft_temperature=self.draft_temperature,
             draft_top_p=self.draft_top_p,
             draft_top_k=self.draft_top_k,
+            draft_q_temp_offset=self.draft_q_temp_offset,
+            draft_q_soft_temp=self.draft_q_soft_temp,
+            draft_mix_lambda_max=self.draft_mix_lambda_max,
+            # NWOR/SCV optimization flags (CRITICAL - these were missing!)
+            use_shadow_kv=self.use_shadow_kv,
+            scv_enabled=self.scv_enabled,
+            verify_chunk_size=self.verify_chunk_size,
+            enable_nvtx_ranges=self.enable_nvtx_ranges,
             additional_config=self.additional_config,
         )
 
