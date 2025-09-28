@@ -2338,12 +2338,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             hasattr(self, 'drafter') and hasattr(self.drafter, 'kv_router') and
             self.drafter.kv_router is not None and
             hasattr(self.drafter, 'shadow_kv') and self.drafter.shadow_kv is not None):
+            print(f"🔴 NWOR: DEFERRING WRITES TO SHADOW (spec_decode active)", file=sys.stderr, flush=True)
             self.drafter.kv_router.defer(self.drafter.shadow_kv)
             self._router_token = set_router(self.drafter.kv_router)
             # Sanity check: router should be deferred after arming
             assert self.drafter.kv_router.is_deferred(), \
                 "Router token set but router not in deferred mode"
         else:
+            print(f"⚫ NWOR: NOT DEFERRING (spec_decode={spec_decode_metadata is not None}, "
+                  f"shadow_kv={getattr(getattr(self, 'drafter', None), 'shadow_kv', None)})",
+                  file=sys.stderr, flush=True)
             self._router_token = None
 
         # Run the model.
@@ -4422,20 +4426,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         except Exception:
             pass
 
-        # CRITICAL: Get actual acceptance metrics from rejection sampler
+        # Get real acceptance metrics from rejection sampler
         if hasattr(self, '_internal_metrics'):
             accepted = self._internal_metrics.get("accepted", 0)
             proposed = self._internal_metrics.get("proposed", 0)
             verifier_tokens = self._internal_metrics.get("verifier_tokens", 0)
             accept_rate = (accepted / proposed) if proposed > 0 else 0.0
 
-            # Use ShadowKV-compatible naming for benchmark compatibility
             metrics["acceptance"] = {
                 "accept_rate": accept_rate,
-                "acceptance_rate": accept_rate,
-                "total_committed": accepted,           # ShadowKV-style: accepted tokens
-                "total_rejected": proposed - accepted, # ShadowKV-style: rejected tokens
-                "total_staged": proposed,              # ShadowKV-style: total proposed
+                "acceptance_rate": accept_rate,  # Duplicate for compatibility
+                "total_committed": accepted,
+                "total_rejected": proposed - accepted,
+                "total_staged": proposed,
                 "verifier_tokens": verifier_tokens,
             }
 

@@ -261,6 +261,17 @@ class LLM:
         else:
             structured_outputs_instance = StructuredOutputsConfig()
 
+        # DEBUG: Log NWOR-related kwargs
+        import sys
+        if 'use_shadow_kv' in kwargs:
+            print(f"[LLM.__init__] use_shadow_kv in kwargs = {kwargs['use_shadow_kv']}", file=sys.stderr, flush=True)
+        else:
+            print("[LLM.__init__] use_shadow_kv NOT in kwargs", file=sys.stderr, flush=True)
+        if 'scv_enabled' in kwargs:
+            print(f"[LLM.__init__] scv_enabled in kwargs = {kwargs['scv_enabled']}", file=sys.stderr, flush=True)
+        else:
+            print("[LLM.__init__] scv_enabled NOT in kwargs", file=sys.stderr, flush=True)
+
         engine_args = EngineArgs(
             model=model,
             runner=runner,
@@ -1474,7 +1485,11 @@ class LLM:
             - drafter: Metrics from Eagle proposer (acceptance_rate, etc.)
             - shadow_kv: Metrics from ShadowKV (total_staged, total_committed, etc.)
         """
-        return self.llm_engine.get_internal_metrics()
+        import sys
+        print("[LLM.PY] get_internal_metrics called", file=sys.stderr, flush=True)
+        result = self.llm_engine.get_internal_metrics()
+        print(f"[LLM.PY] get_internal_metrics returning: {result}", file=sys.stderr, flush=True)
+        return result
 
     def _validate_and_add_requests(
         self,

@@ -6,6 +6,7 @@ Stages speculative KV writes during verification, commits only accepted tokens
 from typing import List, Optional
 import torch
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,8 @@ class ShadowKV:
             self._total_staged += 1
             self._debug_stage_calls += 1
             if self._debug_stage_calls == 1:
+                print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
+                      file=sys.stderr, flush=True)
                 logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
 
     @torch.no_grad()
@@ -149,9 +152,12 @@ class ShadowKV:
             rejected = self._len
             self._total_rejected += rejected
             self._len = 0
+            print(f"🔴 SHADOW: REJECTING ALL {rejected} STAGED TOKENS", file=sys.stderr, flush=True)
             logger.info("ShadowKV: Rejected all %d staged tokens", rejected)
             return
 
+        print(f"🔴 SHADOW: COMMITTING {accepted_len} OF {self._len} STAGED TOKENS",
+              file=sys.stderr, flush=True)
         # Commit accepted tokens to persistent storage
         for layer_idx in range(self.n_layers):
             # Get accepted KV slices

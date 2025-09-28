@@ -177,7 +177,15 @@ class EagleProposer:
         # Initialize NWOR components if enabled
         self.shadow_kv = None
         self.kv_router = None
+
+        # CRITICAL DEBUG: Log whether NWOR is actually enabled
+        print(f"[EAGLE_DEBUG] INIT: opt_config.use_shadow_kv = {getattr(self.opt_config, 'use_shadow_kv', 'MISSING')}",
+              file=sys.stderr, flush=True)
+        logger.warning("EAGLE INIT: opt_config.use_shadow_kv = %s",
+                      getattr(self.opt_config, 'use_shadow_kv', 'MISSING'))
+
         if self.opt_config.use_shadow_kv:
+            print(f"🔴🔴🔴 NWOR ENABLED - CREATING SHADOWKV 🔴🔴🔴", file=sys.stderr, flush=True)
             # Get model dimensions for ShadowKV from HF config
             hf_config = vllm_config.model_config.hf_config
             n_layers = hf_config.num_hidden_layers
@@ -199,8 +207,13 @@ class EagleProposer:
             self.kv_writer = None
             self.kv_router = None
 
-            logger.info("NWOR/ShadowKV enabled with %d layers, %d heads, %d head_dim",
-                       n_layers, n_heads, head_dim)
+            print(f"[EAGLE_DEBUG] NWOR/ShadowKV INITIALIZED: {n_layers} layers, {n_heads} heads, {head_dim} head_dim",
+                  file=sys.stderr, flush=True)
+            logger.warning("NWOR/ShadowKV INITIALIZED with %d layers, %d heads, %d head_dim",
+                          n_layers, n_heads, head_dim)
+        else:
+            print(f"⚫⚫⚫ NWOR DISABLED - NO SHADOWKV ⚫⚫⚫ (use_shadow_kv={self.opt_config.use_shadow_kv})",
+                  file=sys.stderr, flush=True)
 
         # Enable NVTX ranges if requested
         self.nvtx_enabled = self.opt_config.enable_nvtx_ranges
@@ -1158,9 +1171,19 @@ class EagleProposer:
             - total_rejected: Total tokens rejected
             - acceptance_rate: Fraction of staged tokens that were accepted
         """
+        # DEBUG: Log the state for troubleshooting
+        print(f"[EAGLE_METRICS] shadow_kv is {'NOT None' if self.shadow_kv is not None else 'None'}",
+              file=sys.stderr, flush=True)
+        print(f"[EAGLE_METRICS] use_shadow_kv = {getattr(self.opt_config, 'use_shadow_kv', 'MISSING')}",
+              file=sys.stderr, flush=True)
+
         if self.shadow_kv is not None:
-            return self.shadow_kv.get_metrics()
+            metrics = self.shadow_kv.get_metrics()
+            print(f"[EAGLE_METRICS] Returning shadow_kv metrics: {metrics}", file=sys.stderr, flush=True)
+            return metrics
         else:
+            logger.warning("EAGLE get_metrics: shadow_kv is None, returning zeros")
+            print(f"[EAGLE_METRICS] shadow_kv is None, returning zeros", file=sys.stderr, flush=True)
             return {
                 "total_staged": 0,
                 "total_committed": 0,

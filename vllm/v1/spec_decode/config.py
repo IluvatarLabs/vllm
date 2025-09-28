@@ -5,6 +5,7 @@ Configuration for SCV and NWOR optimizations in speculative decoding
 from dataclasses import dataclass
 from typing import Optional
 import os
+import sys
 import logging
 
 logger = logging.getLogger(__name__)
