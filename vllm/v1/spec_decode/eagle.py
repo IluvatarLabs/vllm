@@ -258,7 +258,9 @@ class EagleProposer:
                 x = torch.full_like(x, float("-inf")).scatter(-1, idx, vals)
 
             # Top-p (nucleus) with correct boundary rule
-            top_p = float(getattr(self.opt_config, "draft_top_p", 1.0) or 1.0)
+            top_p = float(getattr(self.opt_config, "draft_top_p", 0.95) or 0.95)
+            print(f"[NUCLEUS_DEBUG] draft_top_p from config: {top_p}, will run nucleus: {0.0 < top_p < 1.0}",
+                  file=sys.stderr, flush=True)
             if 0.0 < top_p < 1.0:
                 p = torch.softmax(x, dim=-1)
                 sp, si = torch.sort(p, dim=-1, descending=True)
@@ -272,6 +274,8 @@ class EagleProposer:
             # Optional smoothing with untempered baseline
             probs_full = torch.softmax(x, dim=-1)
             lam = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.0) or 0.0)
+            print(f"[SMOOTH_DEBUG] lambda_max from config: {lam}, will run smoothing: {lam > 0.0}",
+                  file=sys.stderr, flush=True)
             if lam > 0.0:
                 base = torch.softmax(logits_f32, dim=-1)  # untempered baseline
                 probs_full = (1.0 - lam) * probs_full + lam * base
