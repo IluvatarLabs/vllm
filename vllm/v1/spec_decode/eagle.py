@@ -268,22 +268,27 @@ class EagleProposer:
                 keep_sorted = torch.zeros_like(sp, dtype=torch.bool)
                 keep_sorted[..., 0] = True
                 keep_sorted[..., 1:] = csum[..., :-1] < top_p  # STRICTLY below (correct rule)
+                keep_sorted[..., :2] = True  # Force min_keep=2 (prevents survivors=1)
                 keep = torch.zeros_like(p, dtype=torch.bool).scatter(-1, si, keep_sorted)
                 x = torch.where(keep, x, torch.full_like(x, float("-inf")))
 
-            # Optional smoothing with untempered baseline
-            probs_full = torch.softmax(x, dim=-1)
+            # Optional smoothing over kept set (uniform mix)
             lam = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.0) or 0.0)
             print(f"[SMOOTH_DEBUG] lambda_max from config: {lam}, will run smoothing: {lam > 0.0}",
                   file=sys.stderr, flush=True)
+            logp_full = torch.log_softmax(x, dim=-1)
             if lam > 0.0:
-                base = torch.softmax(logits_f32, dim=-1)  # untempered baseline
-                probs_full = (1.0 - lam) * probs_full + lam * base
-                probs_full = probs_full / probs_full.sum(dim=-1, keepdim=True)
-            logp_full = torch.log(probs_full.clamp_min(1e-20))
+                kept = torch.isfinite(logp_full)
+                p = torch.exp(logp_full)
+                # Uniform over survivors only
+                u = kept.float() / kept.float().sum(dim=-1, keepdim=True).clamp_min(1.0)
+                p = (1.0 - lam) * p + lam * u
+                p = p * kept  # Ensure dropped stay at 0
+                logp_full = torch.log(p.clamp_min(1e-45))
 
             # Sample token and gather its logp
-            tok = torch.distributions.Categorical(probs=probs_full).sample()
+            cat = torch.distributions.Categorical(logits=logp_full)
+            tok = cat.sample()
             tok_logp = logp_full.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
 
             # Debug logging
@@ -318,9 +323,6 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         mm_embeds: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        # Store sampling_metadata so _sample_draft_tokens() can access target temperature
-        self._current_sampling_metadata = sampling_metadata
-
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 
