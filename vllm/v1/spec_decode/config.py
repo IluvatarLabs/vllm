@@ -29,7 +29,7 @@ class SpecDecodeOptConfig:
 
     # Draft-anchored adaptive temperature settings
     draft_q_temp_offset: float = 0.25  # Offset added to draft_temp
-    draft_q_soft_temp: float = 1.0  # Soft floor to prevent ultra-cold collapse
+    draft_q_soft_temp: float = 0.3  # Soft floor to prevent ultra-cold collapse
     draft_mix_lambda_max: float = 0.05  # Tiny smoothing over baseline
 
     # Debug and profiling settings
@@ -100,7 +100,7 @@ class SpecDecodeOptConfig:
         if hasattr(vllm_config, 'draft_q_soft_temp'):
             config.draft_q_soft_temp = vllm_config.draft_q_soft_temp
         else:
-            config.draft_q_soft_temp = float(os.environ.get('VLLM_DRAFT_Q_SOFT_TEMP', '1.0'))
+            config.draft_q_soft_temp = float(os.environ.get('VLLM_DRAFT_Q_SOFT_TEMP', '0.3'))
 
         if hasattr(vllm_config, 'draft_mix_lambda_max'):
             config.draft_mix_lambda_max = vllm_config.draft_mix_lambda_max
