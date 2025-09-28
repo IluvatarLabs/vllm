@@ -2333,20 +2333,37 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
 
-        # NWOR: Arm router before target verify pass if spec decode + shadow_kv enabled
-        if (spec_decode_metadata is not None and
-            hasattr(self, 'drafter') and hasattr(self.drafter, 'kv_router') and
-            self.drafter.kv_router is not None and
-            hasattr(self.drafter, 'shadow_kv') and self.drafter.shadow_kv is not None):
-            print(f"🔴 NWOR: DEFERRING WRITES TO SHADOW (spec_decode active)", file=sys.stderr, flush=True)
+        # NWOR: Better deferral logic that actually works
+        # Check if we're in decode phase (not prefill) and have shadow buffer
+        is_decode = bool(getattr(attn_metadata, "is_decode", True) if attn_metadata else False)
+        shadow_ready = getattr(getattr(self, "drafter", None), "shadow_kv", None) is not None
+        router_ready = getattr(getattr(self, "drafter", None), "kv_router", None) is not None
+
+        # For now, skip router requirement since it's not created yet
+        # We'll create it in next step
+        should_defer = is_decode and shadow_ready
+
+        # One-time detailed logging to debug gate conditions
+        if not getattr(self, "_nwor_gate_logged", False):
+            print(f"NWOR gate: decode={is_decode} shadow={shadow_ready} "
+                  f"router={router_ready} -> defer={should_defer}",
+                  file=sys.stderr, flush=True)
+            self._nwor_gate_logged = True
+
+        if should_defer and router_ready:
+            print(f"🔴 NWOR: DEFERRING WRITES TO SHADOW", file=sys.stderr, flush=True)
             self.drafter.kv_router.defer(self.drafter.shadow_kv)
             self._router_token = set_router(self.drafter.kv_router)
             # Sanity check: router should be deferred after arming
             assert self.drafter.kv_router.is_deferred(), \
                 "Router token set but router not in deferred mode"
+        elif should_defer and not router_ready:
+            print(f"⚠️ NWOR: SHOULD defer but router not ready (creating now...)",
+                  file=sys.stderr, flush=True)
+            # TODO: Create router here in next step
+            self._router_token = None
         else:
-            print(f"⚫ NWOR: NOT DEFERRING (spec_decode={spec_decode_metadata is not None}, "
-                  f"shadow_kv={getattr(getattr(self, 'drafter', None), 'shadow_kv', None)})",
+            print(f"⚫ NWOR: NOT DEFERRING (decode={is_decode}, shadow={shadow_ready}, router={router_ready})",
                   file=sys.stderr, flush=True)
             self._router_token = None
 
@@ -2504,16 +2521,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         print("[HANG_DEBUG] After EPLB", file=sys.stderr, flush=True)
 
         # NWOR: Commit accepted tokens from shadow_kv to persistent cache
-        if router_for_commit is not None:
+        if router_for_commit is not None and self.drafter.shadow_kv is not None:
             if isinstance(valid_sampled_token_ids, list):
                 num_accepted_list = [max(0, len(seq) - 1) for seq in valid_sampled_token_ids]
             else:
                 num_accepted_list = [max(0, (row >= 0).sum().item() - 1) for row in valid_sampled_token_ids]
 
-            # CRITICAL: commit() expects int (total tokens), not list (per-batch counts)
+            # CRITICAL: commit expects int (total tokens), not list (per-batch counts)
             # Shadow buffer stages tokens sequentially across all batches
             total_accepted = sum(num_accepted_list)
-            router_for_commit.commit(total_accepted)
+
+            # Call shadow_kv.commit_to() with the persistent writer
+            if total_accepted > 0:
+                print(f"🔴 SHADOW: COMMITTING {total_accepted} tokens", file=sys.stderr, flush=True)
+                # For now, pass None as writer since we don't have it yet
+                # TODO: Pass actual writer when kv_router is properly created
+                self.drafter.shadow_kv.commit_to(None, total_accepted)
+            else:
+                print(f"🔴 SHADOW: REJECTING ALL staged tokens", file=sys.stderr, flush=True)
+
+            # Reset router to immediate mode
             router_for_commit.immediate()
 
         print("[HANG_DEBUG] Creating output", file=sys.stderr, flush=True)
