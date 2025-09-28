@@ -2121,6 +2121,28 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._internal_metrics["proposed"] = self._internal_metrics.get("proposed", 0) + m["proposed"]
             self._internal_metrics["verifier_tokens"] = self._internal_metrics.get("verifier_tokens", 0) + m["verifier_tokens"]
 
+            # NWOR: Commit accepted tokens and discard rejected tail
+            if (self.drafter and self.drafter.kv_router and
+                self.drafter.kv_router.is_deferred()):
+                accepted_tokens = m["accepted"]
+                proposed_tokens = m["proposed"]
+
+                # Commit accepted prefix to persistent KV cache
+                if accepted_tokens > 0 and self.drafter.shadow_kv:
+                    # Note: seq_id would need to be tracked properly for multi-seq
+                    # For now assuming single sequence (seq_id=0)
+                    self.drafter.shadow_kv.commit_prefix(0, accepted_tokens)
+                    print(f"🔴 SHADOW: COMMITTING L={accepted_tokens} of K={proposed_tokens}",
+                          file=sys.stderr, flush=True)
+
+                # Discard rejected tail from shadow buffer
+                if self.drafter.shadow_kv:
+                    self.drafter.shadow_kv.discard_tail(0, accepted_tokens, proposed_tokens)
+
+                # Return router to immediate mode
+                self.drafter.kv_router.immediate()
+                print("🔴 NWOR: BACK TO IMMEDIATE MODE", file=sys.stderr, flush=True)
+
             # Clear draft_probs AFTER verification completes (it's no longer needed)
             self._draft_probs = None
 
@@ -2333,38 +2355,30 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
 
-        # NWOR: Better deferral logic that actually works
-        # Check if we're in decode phase (not prefill) and have shadow buffer
+        # NWOR: Defer writes to shadow buffer during spec decode verification
+        # Check if we're in decode phase (not prefill) and have NWOR components
         is_decode = bool(getattr(attn_metadata, "is_decode", True) if attn_metadata else False)
-        shadow_ready = getattr(getattr(self, "drafter", None), "shadow_kv", None) is not None
-        router_ready = getattr(getattr(self, "drafter", None), "kv_router", None) is not None
+        has_shadow = (self.drafter and
+                     getattr(self.drafter, "shadow_kv", None) is not None)
+        has_router = (self.drafter and
+                     getattr(self.drafter, "kv_router", None) is not None)
 
-        # For now, skip router requirement since it's not created yet
-        # We'll create it in next step
-        should_defer = is_decode and shadow_ready
-
-        # One-time detailed logging to debug gate conditions
+        # Log gate conditions once
         if not getattr(self, "_nwor_gate_logged", False):
-            print(f"NWOR gate: decode={is_decode} shadow={shadow_ready} "
-                  f"router={router_ready} -> defer={should_defer}",
+            print(f"NWOR gate: decode={is_decode} shadow={has_shadow} "
+                  f"router={has_router}",
                   file=sys.stderr, flush=True)
             self._nwor_gate_logged = True
 
-        if should_defer and router_ready:
+        # Defer if all components ready and we're in decode phase
+        if is_decode and has_shadow and has_router:
             print(f"🔴 NWOR: DEFERRING WRITES TO SHADOW", file=sys.stderr, flush=True)
             self.drafter.kv_router.defer(self.drafter.shadow_kv)
             self._router_token = set_router(self.drafter.kv_router)
             # Sanity check: router should be deferred after arming
             assert self.drafter.kv_router.is_deferred(), \
                 "Router token set but router not in deferred mode"
-        elif should_defer and not router_ready:
-            print(f"⚠️ NWOR: SHOULD defer but router not ready (creating now...)",
-                  file=sys.stderr, flush=True)
-            # TODO: Create router here in next step
-            self._router_token = None
         else:
-            print(f"⚫ NWOR: NOT DEFERRING (decode={is_decode}, shadow={shadow_ready}, router={router_ready})",
-                  file=sys.stderr, flush=True)
             self._router_token = None
 
         # Run the model.
@@ -4280,6 +4294,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+            # Initialize KV router for NWOR if shadow buffer exists
+            if self.drafter.shadow_kv is not None:
+                from vllm.v1.kv_cache.write_router import PersistentKVWriter, KVWriteRouter
+
+                # Create persistent writer with access to real KV caches
+                # Note: self.kv_caches is the list of KV cache tensors
+                kv_cache_dtype = self.cache_config.cache_dtype if hasattr(self, 'cache_config') else torch.float16
+                persistent_writer = PersistentKVWriter(
+                    kv_cache_manager=self.kv_caches,
+                    kv_cache_dtype=kv_cache_dtype
+                )
+
+                # Create router with JUST the persistent writer
+                self.drafter.kv_router = KVWriteRouter(persistent_writer)
+
+                print("🔴🔴🔴 KV ROUTER CREATED - NWOR READY 🔴🔴🔴",
+                      file=sys.stderr, flush=True)
+                logger.info("KV router initialized for NWOR with ShadowKV")
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
