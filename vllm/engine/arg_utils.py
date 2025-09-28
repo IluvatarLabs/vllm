@@ -377,7 +377,7 @@ class EngineArgs:
     draft_top_k: int = 0
     # Draft-anchored adaptive temperature settings
     draft_q_temp_offset: float = 0.25
-    draft_q_soft_temp: float = 0.3
+    draft_q_soft_temp: float = 1.0
     draft_mix_lambda_max: float = 0.05
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
@@ -1524,6 +1524,7 @@ class EngineArgs:
             scv_enabled=self.scv_enabled,
             verify_chunk_size=self.verify_chunk_size,
             enable_nvtx_ranges=self.enable_nvtx_ranges,
+            debug_alloc_counters=self.debug_alloc_counters,
             additional_config=self.additional_config,
         )
 

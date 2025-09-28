@@ -271,6 +271,7 @@ class VllmConfig:
     scv_enabled: bool = False
     verify_chunk_size: int = 4
     enable_nvtx_ranges: bool = False
+    debug_alloc_counters: bool = False
     structured_outputs_config: StructuredOutputsConfig = field(
         default_factory=StructuredOutputsConfig)
     """Structured outputs configuration."""
