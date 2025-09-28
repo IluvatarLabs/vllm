@@ -242,7 +242,13 @@ class EagleProposer:
             # Read from TARGET temperature (not draft_temperature)
             tau_d = 1.0
             if hasattr(self, '_current_sampling_metadata') and self._current_sampling_metadata is not None:
-                tau_d = float(getattr(self._current_sampling_metadata, 'temperature', 1.0))
+                temp = getattr(self._current_sampling_metadata, 'temperature', None)
+                if temp is not None:
+                    if isinstance(temp, torch.Tensor):
+                        # Temperature is a tensor [batch_size], take first element
+                        tau_d = float(temp.flatten()[0].item())
+                    else:
+                        tau_d = float(temp)
 
             tau_q = tau_d + float(getattr(self.opt_config, "draft_q_temp_offset", 0.0))
             tau_max = float(getattr(self.opt_config, "draft_tau_max", 0.0))
