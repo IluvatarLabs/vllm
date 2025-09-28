@@ -262,6 +262,8 @@ class EagleProposer:
 
             # --- top-p (nucleus) ---
             tp = float(getattr(self.opt_config, "draft_top_p", 0.95) or 0.95)
+            print(f"[NUCLEUS_DEBUG] draft_top_p from config: {tp}, will run nucleus: {0.0 < tp < 1.0}",
+                  file=sys.stderr, flush=True)
 
             if 0.0 < tp < 1.0:
                 p = torch.softmax(x, dim=-1)
