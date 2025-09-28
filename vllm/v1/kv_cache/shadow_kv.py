@@ -114,6 +114,12 @@ class ShadowKV:
         if v_slice.dim() == 2:
             v_slice = v_slice.unsqueeze(0)
 
+        # Emit STAGING marker on first write per step
+        if not getattr(self, "_staging_marked", False):
+            import sys
+            print(f"🔴 SHADOW: STAGING layer={layer_idx} t={t}", file=sys.stderr, flush=True)
+            self._staging_marked = True
+
         # Copy KV to staging buffer
         self._K[layer_idx][t:t+1].copy_(k_slice)
         self._V[layer_idx][t:t+1].copy_(v_slice)
@@ -147,6 +153,9 @@ class ShadowKV:
             persistent_writer: PersistentKVWriter instance
             accepted_len: Number of tokens accepted (rest are rejected)
         """
+        # Reset staging marker for next step
+        self._staging_marked = False
+
         if accepted_len <= 0:
             # All rejected - just reset
             rejected = self._len

@@ -217,3 +217,9 @@ class KVWriteRouter:
     def get_persistent_writer(self):
         """Get the underlying persistent writer for direct access if needed."""
         return self._persistent
+
+    def current_writer(self):
+        """Get the current active writer (persistent or shadow)."""
+        if self._mode == "defer" and self._shadow is not None:
+            return self._shadow
+        return self._persistent

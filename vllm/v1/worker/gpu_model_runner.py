@@ -2121,27 +2121,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._internal_metrics["proposed"] = self._internal_metrics.get("proposed", 0) + m["proposed"]
             self._internal_metrics["verifier_tokens"] = self._internal_metrics.get("verifier_tokens", 0) + m["verifier_tokens"]
 
-            # NWOR: Commit accepted tokens and discard rejected tail
-            if (self.drafter and self.drafter.kv_router and
-                self.drafter.kv_router.is_deferred()):
-                accepted_tokens = m["accepted"]
-                proposed_tokens = m["proposed"]
-
-                # Commit accepted prefix to persistent KV cache
-                if accepted_tokens > 0 and self.drafter.shadow_kv:
-                    # Note: seq_id would need to be tracked properly for multi-seq
-                    # For now assuming single sequence (seq_id=0)
-                    self.drafter.shadow_kv.commit_prefix(0, accepted_tokens)
-                    print(f"🔴 SHADOW: COMMITTING L={accepted_tokens} of K={proposed_tokens}",
-                          file=sys.stderr, flush=True)
-
-                # Discard rejected tail from shadow buffer
-                if self.drafter.shadow_kv:
-                    self.drafter.shadow_kv.discard_tail(0, accepted_tokens, proposed_tokens)
-
-                # Return router to immediate mode
-                self.drafter.kv_router.immediate()
-                print("🔴 NWOR: BACK TO IMMEDIATE MODE", file=sys.stderr, flush=True)
+            # (removed) Commit/discard and router reset happen after bookkeeping
+            # where we have the final accepted count for all sequences
 
             # Clear draft_probs AFTER verification completes (it's no longer needed)
             self._draft_probs = None
@@ -2378,8 +2359,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Sanity check: router should be deferred after arming
             assert self.drafter.kv_router.is_deferred(), \
                 "Router token set but router not in deferred mode"
-        else:
-            self._router_token = None
+
+            # Verify active sink is ShadowKV
+            if self.drafter.kv_router.is_deferred():
+                sink = self.drafter.kv_router._shadow
+                print(f"🔴 NWOR: ACTIVE SINK = {type(sink).__name__ if sink else 'None'}",
+                      file=sys.stderr, flush=True)
+        # Don't clear _router_token in else - it might have been set by a previous call!
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -2475,6 +2461,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             reset_router(self._router_token)
             self._router_token = None
             router_for_commit = self.drafter.kv_router
+            print(f"🔴 NWOR: Router token reset, will commit after bookkeeping", file=sys.stderr, flush=True)
+        else:
+            print(f"⚫ NWOR: No router token to reset", file=sys.stderr, flush=True)
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2535,6 +2524,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         print("[HANG_DEBUG] After EPLB", file=sys.stderr, flush=True)
 
         # NWOR: Commit accepted tokens from shadow_kv to persistent cache
+        print(f"⚫ NWOR COMMIT CHECK: router_for_commit={router_for_commit is not None}, "
+              f"shadow_kv={self.drafter.shadow_kv is not None if self.drafter else False}",
+              file=sys.stderr, flush=True)
         if router_for_commit is not None and self.drafter.shadow_kv is not None:
             if isinstance(valid_sampled_token_ids, list):
                 num_accepted_list = [max(0, len(seq) - 1) for seq in valid_sampled_token_ids]
@@ -2548,14 +2540,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Call shadow_kv.commit_to() with the persistent writer
             if total_accepted > 0:
                 print(f"🔴 SHADOW: COMMITTING {total_accepted} tokens", file=sys.stderr, flush=True)
-                # For now, pass None as writer since we don't have it yet
-                # TODO: Pass actual writer when kv_router is properly created
-                self.drafter.shadow_kv.commit_to(None, total_accepted)
+                # Pass the actual persistent writer from the router
+                persistent_writer = getattr(router_for_commit, 'current_writer', lambda: None)()
+                self.drafter.shadow_kv.commit_to(persistent_writer, total_accepted)
             else:
                 print(f"🔴 SHADOW: REJECTING ALL staged tokens", file=sys.stderr, flush=True)
 
             # Reset router to immediate mode
             router_for_commit.immediate()
+            print("🔴 NWOR: BACK TO IMMEDIATE MODE", file=sys.stderr, flush=True)
+
+            # Assert router is no longer deferred (catch leaks)
+            assert not router_for_commit.is_deferred(), "Router must not remain deferred after step"
 
         print("[HANG_DEBUG] Creating output", file=sys.stderr, flush=True)
         output = ModelRunnerOutput(
