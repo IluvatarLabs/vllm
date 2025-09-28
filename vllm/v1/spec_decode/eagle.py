@@ -235,80 +235,57 @@ class EagleProposer:
 
         # Stochastic sampling: disable autocast and force FP32
         with torch.amp.autocast("cuda", enabled=False):
-            x = logits.to(torch.float32)
-            x = x - x.amax(dim=-1, keepdim=True)
+            logits_f32 = logits.to(torch.float32)
+            logits_f32 = logits_f32 - logits_f32.amax(dim=-1, keepdim=True)
 
-            # --- temperature for drafter q ---
-            # Read from TARGET temperature (not draft_temperature)
-            tau_d = 1.0
-            if hasattr(self, '_current_sampling_metadata') and self._current_sampling_metadata is not None:
-                temp = getattr(self._current_sampling_metadata, 'temperature', None)
-                if temp is not None:
-                    if isinstance(temp, torch.Tensor):
-                        # Temperature is a tensor [batch_size], take first element
-                        tau_d = float(temp.flatten()[0].item())
-                    else:
-                        tau_d = float(temp)
+            # Draft-anchored temperature with adaptive soft floor
+            tau_d = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
+            tau_off = float(getattr(self.opt_config, "draft_q_temp_offset", 0.0) or 0.0)
+            tau_soft = float(getattr(self.opt_config, "draft_q_soft_temp", 0.0) or 0.0)
 
-            tau_q = tau_d + float(getattr(self.opt_config, "draft_q_temp_offset", 0.0))
-            tau_max = float(getattr(self.opt_config, "draft_tau_max", 0.0))
-            if tau_max > 0.0:
-                tau_q = min(tau_q, tau_max)
-            if not (tau_q > 0.0 and torch.isfinite(torch.tensor(tau_q))):
-                tau_q = tau_d
+            # Adaptive: add offset, apply soft floor to prevent ultra-cold collapse
+            tau_q = tau_d + tau_off
+            if tau_soft > 0.0 and tau_q < tau_soft:
+                tau_q = tau_soft
+            tau_q = max(tau_q, 1e-6)
 
-            x = x / tau_q
+            x = logits_f32 / tau_q
 
-            # --- top-k (optional) ---
-            k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
-            if 0 < k < x.size(-1):
-                topv, topi = torch.topk(x, k, dim=-1)
-                masked = torch.full_like(x, -float("inf"))
-                x = masked.scatter(-1, topi, topv)
+            # Top-k masking (optional)
+            top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
+            if 0 < top_k < x.size(-1):
+                vals, idx = torch.topk(x, top_k, dim=-1)
+                x = torch.full_like(x, float("-inf")).scatter(-1, idx, vals)
 
-            # --- top-p (nucleus) ---
-            tp = float(getattr(self.opt_config, "draft_top_p", 0.95) or 0.95)
-            print(f"[NUCLEUS_DEBUG] draft_top_p from config: {tp}, will run nucleus: {0.0 < tp < 1.0}",
-                  file=sys.stderr, flush=True)
-
-            if 0.0 < tp < 1.0:
+            # Top-p (nucleus) with correct boundary rule
+            top_p = float(getattr(self.opt_config, "draft_top_p", 1.0) or 1.0)
+            if 0.0 < top_p < 1.0:
                 p = torch.softmax(x, dim=-1)
-                sp, si = torch.sort(p, dim=-1, descending=True)     # sorted probs
+                sp, si = torch.sort(p, dim=-1, descending=True)
                 csum = sp.cumsum(dim=-1)
                 keep_sorted = torch.zeros_like(sp, dtype=torch.bool)
                 keep_sorted[..., 0] = True
-                keep_sorted[..., 1:] = csum[..., :-1] < tp          # STRICTLY below threshold
-                # enforce min_keep = 2
-                min_keep = 2
-                kth = sp[..., min_keep - 1:min_keep]                # shape [B,1]
-                keep_sorted = torch.logical_or(keep_sorted, sp >= kth)
+                keep_sorted[..., 1:] = csum[..., :-1] < top_p  # STRICTLY below (correct rule)
+                keep = torch.zeros_like(p, dtype=torch.bool).scatter(-1, si, keep_sorted)
+                x = torch.where(keep, x, torch.full_like(x, float("-inf")))
 
-                keep = torch.zeros_like(x, dtype=torch.bool).scatter(-1, si, keep_sorted)
-                x = torch.where(keep, x, torch.full_like(x, -float("inf")))
-            else:
-                keep = torch.isfinite(x)  # everything
-
-            # --- tiny smoothing over kept set (prevents q==1.0 in ultracold corners) ---
-            lam = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.0))
-            print(f"[SMOOTH_DEBUG] lambda_max from config: {lam}, will run smoothing: {lam > 0.0}",
-                  file=sys.stderr, flush=True)
+            # Optional smoothing with untempered baseline
+            probs_full = torch.softmax(x, dim=-1)
+            lam = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.0) or 0.0)
             if lam > 0.0:
-                K = keep.sum(dim=-1, keepdim=True).clamp_min(1)
-                uniform = keep.to(x.dtype) / K
-                p = torch.softmax(x, dim=-1)
-                p = (1.0 - lam) * p + lam * uniform
-                logp_full = (p + 1e-9).log()
-            else:
-                logp_full = torch.log_softmax(x, dim=-1)
+                base = torch.softmax(logits_f32, dim=-1)  # untempered baseline
+                probs_full = (1.0 - lam) * probs_full + lam * base
+                probs_full = probs_full / probs_full.sum(dim=-1, keepdim=True)
+            logp_full = torch.log(probs_full.clamp_min(1e-20))
 
-            # --- sample 1 token and gather its logp ---
-            cat = torch.distributions.Categorical(logits=logp_full)
-            tok = cat.sample()   # [B]
+            # Sample token and gather its logp
+            tok = torch.distributions.Categorical(probs=probs_full).sample()
             tok_logp = logp_full.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
 
-            # --- Debug logging ---
-            survivors = keep.sum(dim=-1)
-            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} tau_q={tau_q:.3f}", file=sys.stderr, flush=True)
+            # Debug logging
+            survivors = torch.isfinite(x).sum(dim=-1)
+            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} tau_q={tau_q:.3f} (offset={tau_off:.2f}, soft={tau_soft:.2f})",
+                  file=sys.stderr, flush=True)
             print(f"[NUC_DEBUG] survivors per row: min={survivors.min().item()}, "
                   f"max={survivors.max().item()}, mean={survivors.float().mean().item():.1f}",
                   file=sys.stderr, flush=True)

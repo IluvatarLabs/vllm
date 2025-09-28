@@ -27,10 +27,10 @@ class SpecDecodeOptConfig:
     draft_top_p: float = 0.95  # Nucleus sampling for drafter
     draft_top_k: int = 0  # 0 = disabled
 
-    # Mixture proposal settings (prevents q collapse at low temps)
-    draft_q_temp_offset: float = 0.3  # Offset over user's temp (NOT floor)
-    draft_tau_max: float = 2.0  # Optional cap on tau_q
-    draft_mix_lambda_max: float = 0.02  # Tiny smoothing over kept set
+    # Draft-anchored adaptive temperature settings
+    draft_q_temp_offset: float = 0.15  # Offset added to draft_temp
+    draft_q_soft_temp: float = 0.50  # Soft floor to prevent ultra-cold collapse
+    draft_mix_lambda_max: float = 0.05  # Tiny smoothing over baseline
 
     # Debug and profiling settings
     enable_nvtx_ranges: bool = False
@@ -91,21 +91,21 @@ class SpecDecodeOptConfig:
         else:
             config.draft_top_k = int(os.environ.get('VLLM_DRAFT_TOP_K', '0'))
 
-        # Mixture proposal settings
+        # Draft-anchored adaptive temperature settings
         if hasattr(vllm_config, 'draft_q_temp_offset'):
             config.draft_q_temp_offset = vllm_config.draft_q_temp_offset
         else:
-            config.draft_q_temp_offset = float(os.environ.get('VLLM_DRAFT_Q_TEMP_OFFSET', '0.3'))
+            config.draft_q_temp_offset = float(os.environ.get('VLLM_DRAFT_Q_TEMP_OFFSET', '0.15'))
 
-        if hasattr(vllm_config, 'draft_tau_max'):
-            config.draft_tau_max = vllm_config.draft_tau_max
+        if hasattr(vllm_config, 'draft_q_soft_temp'):
+            config.draft_q_soft_temp = vllm_config.draft_q_soft_temp
         else:
-            config.draft_tau_max = float(os.environ.get('VLLM_DRAFT_TAU_MAX', '2.0'))
+            config.draft_q_soft_temp = float(os.environ.get('VLLM_DRAFT_Q_SOFT_TEMP', '0.50'))
 
         if hasattr(vllm_config, 'draft_mix_lambda_max'):
             config.draft_mix_lambda_max = vllm_config.draft_mix_lambda_max
         else:
-            config.draft_mix_lambda_max = float(os.environ.get('VLLM_DRAFT_MIX_LAMBDA_MAX', '0.02'))
+            config.draft_mix_lambda_max = float(os.environ.get('VLLM_DRAFT_MIX_LAMBDA_MAX', '0.05'))
 
         # Debug settings
         if hasattr(vllm_config, 'enable_nvtx_ranges'):
