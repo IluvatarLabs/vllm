@@ -258,7 +258,7 @@ class EagleProposer:
                 x = masked.scatter(-1, topi, topv)
 
             # --- top-p (nucleus) ---
-            tp = float(getattr(self.opt_config, "draft_top_p", 1.0) or 1.0)
+            tp = float(getattr(self.opt_config, "draft_top_p", 0.95) or 0.95)
 
             if 0.0 < tp < 1.0:
                 p = torch.softmax(x, dim=-1)
