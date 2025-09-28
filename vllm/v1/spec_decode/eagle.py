@@ -243,64 +243,78 @@ class EagleProposer:
             # Stabilizer: subtract max to prevent overflow/underflow
             x = x - x.amax(dim=-1, keepdim=True)
 
-            # MIXTURE PROPOSAL: Prevents delta collapse at low temps
+            # MIXTURE PROPOSAL (entropy-based): Prevents delta collapse at low temps
             # Get config parameters
             tau_d = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
-            tau_s = float(getattr(self.opt_config, "draft_mix_temp", 1.0) or 1.0)
-            lam0 = float(getattr(self.opt_config, "draft_mix_lambda", 0.10))
-            lam_max = float(getattr(self.opt_config, "draft_mix_cap", 0.50))
+            delta_tau = float(getattr(self.opt_config, "draft_q_temp_offset", 0.25))
+            tau_soft = float(getattr(self.opt_config, "draft_q_soft_temp", 2.0))
+            lambda_max = float(getattr(self.opt_config, "draft_mix_lambda_max", 0.12))
 
-            # Adaptive lambda: stronger at low temps
-            lam = min(lam_max, lam0 / max(tau_d, 1e-3))
+            # Compute main and soft distributions BEFORE any masking
+            tau_main = tau_d + delta_tau
+            logq_main = torch.log_softmax(x / tau_main, dim=-1)  # [B, V], FP32
+            logq_soft = torch.log_softmax(x / tau_soft, dim=-1)  # [B, V], FP32
 
-            # Helper function to apply top-k/top-p masking
-            def apply_topkp(y, top_k, top_p):
-                # Apply top-k if set
-                if top_k and 0 < top_k < y.size(-1):
-                    tk_vals, tk_idx = torch.topk(y, top_k, dim=-1)
-                    mask = torch.full_like(y, float('-inf'))
-                    y = mask.scatter(-1, tk_idx, tk_vals)
-                # Apply nucleus if set
-                if top_p and 0.0 < top_p < 1.0:
-                    p = torch.softmax(y, dim=-1)
-                    sp, si = torch.sort(p, dim=-1, descending=True)
-                    csum = sp.cumsum(dim=-1)
-                    # Keep tokens where cumsum - prob <= top_p (exclusive)
-                    keep_sorted = (csum - sp) <= top_p
-                    keep_sorted[..., 0] = True  # Always keep top-1
-                    keep = torch.zeros_like(p, dtype=torch.bool).scatter(-1, si, keep_sorted)
-                    y = torch.where(keep, y, torch.full_like(y, float('-inf')))
-                return y
+            # Entropy-based lambda schedule
+            q_main = logq_main.exp()
+            q_soft = logq_soft.exp()
+            H_main = -(q_main * logq_main).sum(dim=-1)  # [B]
+            H_soft = -(q_soft * logq_soft).sum(dim=-1)  # [B]
 
+            # Target entropy: S_tgt = max(2.0, 1.0 + 2.2/(tau_d + 1e-6))
+            S_tgt = torch.clamp(1.0 + 2.2 / (tau_d + 1e-6), min=2.0)
+            H_tgt = torch.log(S_tgt * torch.ones_like(H_main))
+
+            # Compute lambda per row
+            lambda_raw = (H_tgt - H_main) / (H_soft - H_main + 1e-8)
+            lam = torch.clamp(lambda_raw, 0.0, lambda_max)  # [B]
+
+            # Mix in log-space using logaddexp
+            log_1mlam = torch.log(1 - lam + 1e-12).unsqueeze(-1)  # [B, 1]
+            log_lam = torch.log(lam + 1e-12).unsqueeze(-1)  # [B, 1]
+            logq_mix = torch.logaddexp(
+                logq_main + log_1mlam,
+                logq_soft + log_lam
+            )  # [B, V]
+
+            # Apply masking to MIXED distribution (not to branches separately)
             top_k = int(getattr(self.opt_config, "draft_top_k", 0) or 0)
             top_p = float(getattr(self.opt_config, "draft_top_p", 0.0) or 0.0)
 
-            # Two branches: share same masking logic at their own temperatures
-            x_hard = apply_topkp(x / max(tau_d, 1e-8), top_k, top_p)
-            x_soft = apply_topkp(x / max(tau_s, 1e-8), top_k, top_p)
+            # Convert log q_mix back to logits for masking
+            x_mix = logq_mix * tau_main  # Approximate conversion
 
-            logp_hard = torch.log_softmax(x_hard, dim=-1)  # [B, V], FP32
-            logp_soft = torch.log_softmax(x_soft, dim=-1)  # [B, V], FP32
+            # Apply top-k if set
+            if top_k and 0 < top_k < x_mix.size(-1):
+                tk_vals, tk_idx = torch.topk(x_mix, top_k, dim=-1)
+                mask = torch.full_like(x_mix, float('-inf'))
+                x_mix = mask.scatter(-1, tk_idx, tk_vals)
 
-            # Sample from mixture with coin flip (correct distribution for q_mix)
-            B = x.size(0)
-            coin = (torch.rand(B, device=x.device) < lam)
+            # Apply nucleus if set
+            if top_p and 0.0 < top_p < 1.0:
+                p = torch.softmax(x_mix, dim=-1)
+                sp, si = torch.sort(p, dim=-1, descending=True)
+                csum = sp.cumsum(dim=-1)
+                # Keep tokens where cumsum - prob <= top_p (exclusive)
+                keep_sorted = (csum - sp) <= top_p
+                keep_sorted[..., 0] = True  # Always keep top-1
+                keep = torch.zeros_like(p, dtype=torch.bool).scatter(-1, si, keep_sorted)
+                x_mix = torch.where(keep, x_mix, torch.full_like(x_mix, float('-inf')))
 
-            tok_hard = torch.distributions.Categorical(logits=logp_hard).sample()  # [B]
-            tok_soft = torch.distributions.Categorical(logits=logp_soft).sample()  # [B]
-            draft_token_ids = torch.where(coin, tok_soft, tok_hard)
+            # Final log probs after masking
+            logq_masked = torch.log_softmax(x_mix, dim=-1)  # [B, V], FP32
 
-            # Compute q_mix at the *chosen* token
-            hard_ptok = logp_hard.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).exp()
-            soft_ptok = logp_soft.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1).exp()
-            qtok = (1.0 - lam) * hard_ptok + lam * soft_ptok
+            # Sample from masked mixture
+            draft_token_ids = torch.distributions.Categorical(logits=logq_masked).sample()  # [B]
 
-            draft_logp = torch.log(qtok.clamp_min(1e-12))  # FP32, finite
+            # Gather log prob from masked distribution
+            draft_logp = logq_masked.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)  # [B]
 
             std_before = x.std().item()
-            std_after = x_hard.std().item()
+            std_after = x_mix.std().item()
+            lam_mean = lam.mean().item()
 
-            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} soft_temp={tau_s:.3f} lambda={lam:.3f} "
+            print(f"[TEMP_DEBUG] EAGLE draft_temp={tau_d:.3f} soft_temp={tau_soft:.3f} lambda_mean={lam_mean:.3f} "
                   f"raw_max={raw_max:.3f} std: {std_before:.4f}->{std_after:.4f}",
                   file=sys.stderr, flush=True)
 
@@ -311,7 +325,7 @@ class EagleProposer:
                       f"{q_chosen.min().item():.3e}/"
                       f"{q_chosen.median().item():.3e}/"
                       f"{q_chosen.max().item():.3e}, "
-                      f"lambda={lam:.3f}",
+                      f"lambda_mean={lam_mean:.3f}",
                       file=sys.stderr, flush=True)
 
             return draft_token_ids.contiguous(), draft_logp.contiguous()
