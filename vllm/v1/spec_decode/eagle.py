@@ -239,7 +239,10 @@ class EagleProposer:
             x = x - x.amax(dim=-1, keepdim=True)
 
             # --- temperature for drafter q ---
-            tau_d = float(getattr(self.opt_config, "draft_temperature", 1.0) or 1.0)
+            # Read from TARGET temperature (not draft_temperature)
+            tau_d = 1.0
+            if hasattr(self, '_current_sampling_metadata') and self._current_sampling_metadata is not None:
+                tau_d = float(getattr(self._current_sampling_metadata, 'temperature', 1.0))
 
             tau_q = tau_d + float(getattr(self.opt_config, "draft_q_temp_offset", 0.0))
             tau_max = float(getattr(self.opt_config, "draft_tau_max", 0.0))
@@ -324,6 +327,9 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         mm_embeds: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # Store sampling_metadata so _sample_draft_tokens() can access target temperature
+        self._current_sampling_metadata = sampling_metadata
+
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 
