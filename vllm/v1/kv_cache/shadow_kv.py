@@ -190,6 +190,10 @@ class ShadowKV:
             # Build concatenated slot mapping for accepted tokens
             layer_slots = self._slot_mappings[layer_idx][:accepted_len]
 
+            # Skip layers that staged nothing
+            if not layer_slots:
+                continue
+
             # Concatenate slot mappings for this layer's accepted tokens
             if all(s is not None for s in layer_slots):
                 # Different builds may have different slot mapping shapes
@@ -216,6 +220,7 @@ class ShadowKV:
                     "Missing slot mappings for layer %d, skipping commit",
                     layer_idx
                 )
+                continue
 
         # Update metrics
         rejected = self._len - accepted_len
