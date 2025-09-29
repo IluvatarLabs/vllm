@@ -193,11 +193,15 @@ class EagleProposer:
             head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
             # Create ShadowKV staging buffer
+            num_spec_tokens = vllm_config.speculative_config.num_speculative_tokens
+            # Pad ShadowKV chunk generously for SCV/padded verification windows.
+            shadow_max_chunk = max(128, num_spec_tokens * 8)
+
             self.shadow_kv = ShadowKV(
                 n_layers=n_layers,
                 n_heads=n_heads,
                 head_dim=head_dim,
-                max_chunk=max(16, vllm_config.speculative_config.num_speculative_tokens),
+                max_chunk=shadow_max_chunk,
                 device="cuda",
                 dtype=torch.float16,
             )
