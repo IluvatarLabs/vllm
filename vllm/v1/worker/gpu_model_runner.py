@@ -15,6 +15,27 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+
+try:
+    import torch._dynamo as torch_dynamo  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - torch._dynamo unavailable in some builds
+    torch_dynamo = None
+
+
+def _shadowkv_guard_active() -> bool:
+    """Return True while dynamo tracing or CUDA graph capture is active."""
+    if torch_dynamo is not None:
+        try:
+            if torch_dynamo.is_compiling():
+                return True
+        except AttributeError:
+            pass
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except (RuntimeError, AttributeError):
+        return False
+
+
 from tqdm import tqdm
 from typing_extensions import TypeAlias
 
@@ -2134,8 +2155,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # owns both the shadow buffer and the writer, so keep the handoff
                 # centralized to avoid desync.
                 # Skip commit during CUDA graph capture (FakeTensors have no storage)
-                import torch._dynamo
-                if accepted_tokens and not torch._dynamo.is_compiling():
+                if accepted_tokens and not _shadowkv_guard_active():
                     self.drafter.kv_router.commit(accepted_tokens)
 
                 # Return router to immediate mode
@@ -2573,8 +2593,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Let the router handle the staged buffer regardless of acceptance count.
             # Skip commit during CUDA graph capture (FakeTensors have no storage)
-            import torch._dynamo
-            if not torch._dynamo.is_compiling():
+            if not _shadowkv_guard_active():
                 router_for_commit.commit(total_accepted)
 
             # Reset router to immediate mode

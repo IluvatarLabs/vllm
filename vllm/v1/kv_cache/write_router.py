@@ -4,8 +4,25 @@ Routes KV cache writes through ShadowKV during speculative verification
 """
 
 from typing import Optional
+import logging
 import torch
 import vllm._custom_ops as ops  # reshape_and_cache_flash is here
+
+logger = logging.getLogger(__name__)
+
+
+def _tensor_has_storage(tensor: torch.Tensor) -> bool:
+    """Return False for Fake/Meta tensors that can't expose a data pointer."""
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    try:
+        tensor.data_ptr()
+        return True
+    except (RuntimeError, NotImplementedError) as exc:
+        msg = str(exc)
+        if "doesn't have storage" in msg or "meta tensor" in msg:
+            return False
+        raise
 
 
 class PersistentKVWriter:
@@ -80,6 +97,11 @@ class PersistentKVWriter:
         # Get layer KV cache tensors
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
 
+        # Skip if cache tensors are fake (during warmup/compilation)
+        if not (_tensor_has_storage(key_cache) and _tensor_has_storage(value_cache)):
+            logger.debug("PersistentKVWriter.append_slice: skipping fake KV cache write on layer %d", layer_idx)
+            return
+
         # Call the fused cache writer used by flash-attn backends
         ops.reshape_and_cache_flash(
             k_slice,
@@ -103,6 +125,11 @@ class PersistentKVWriter:
         Uses the same reshape_and_cache_flash for bulk write.
         """
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
+
+        # Skip if cache tensors are fake (during warmup/compilation)
+        if not (_tensor_has_storage(key_cache) and _tensor_has_storage(value_cache)):
+            logger.debug("PersistentKVWriter.append_run: skipping fake KV cache write on layer %d", layer_idx)
+            return
 
         # Bulk write using the same op
         ops.reshape_and_cache_flash(

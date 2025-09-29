@@ -8,6 +8,26 @@ import numpy as np
 import torch
 import sys
 
+try:
+    import torch._dynamo as torch_dynamo  # type: ignore[attr-defined]
+except Exception:
+    torch_dynamo = None
+
+
+def _shadowkv_guard_active() -> bool:
+    """Return True while dynamo tracing or CUDA graph capture is active."""
+    if torch_dynamo is not None:
+        try:
+            if torch_dynamo.is_compiling():
+                return True
+        except AttributeError:
+            pass
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except (RuntimeError, AttributeError):
+        return False
+
+
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -519,8 +539,7 @@ class FlashAttentionImpl(AttentionImpl):
             deferred = (router is not None and router.is_deferred())
 
             # Skip staging during torch.compile graph capture (FakeTensors have no storage)
-            import torch._dynamo
-            if deferred and torch._dynamo.is_compiling():
+            if deferred and _shadowkv_guard_active():
                 deferred = False
 
             # Resolve cached index if needed
