@@ -10,17 +10,29 @@ import vllm._custom_ops as ops  # reshape_and_cache_flash is here
 
 logger = logging.getLogger(__name__)
 
+# Import FakeTensor to detect fake tensors explicitly
+try:
+    from torch._subclasses.fake_tensor import FakeTensor
+except Exception:  # pragma: no cover
+    FakeTensor = ()
+
 
 def _tensor_has_storage(tensor: torch.Tensor) -> bool:
     """Return False for Fake/Meta tensors that can't expose a data pointer."""
     if not isinstance(tensor, torch.Tensor):
         return False
+    # Check for FakeTensor explicitly (some PyTorch versions don't raise on data_ptr())
+    if isinstance(tensor, FakeTensor):
+        return False
+    # Check for meta tensors
+    if tensor.is_meta:
+        return False
     try:
         tensor.data_ptr()
         return True
-    except (RuntimeError, NotImplementedError) as exc:
+    except (RuntimeError, NotImplementedError, AssertionError) as exc:
         msg = str(exc)
-        if "doesn't have storage" in msg or "meta tensor" in msg:
+        if "doesn't have storage" in msg or "meta tensor" in msg or "FakeTensor" in msg:
             return False
         raise
 
@@ -97,13 +109,16 @@ class PersistentKVWriter:
         # Get layer KV cache tensors
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
 
+        # Flatten slot mapping before checking (flattened view might be fake even if original isn't)
+        slot_mapping_flat = slot_mapping_1t.flatten()
+
         # Skip if ANY tensor is fake (during warmup/compilation)
         tensors_ok = (
             _tensor_has_storage(key_cache)
             and _tensor_has_storage(value_cache)
             and _tensor_has_storage(k_slice)
             and _tensor_has_storage(v_slice)
-            and _tensor_has_storage(slot_mapping_1t)
+            and _tensor_has_storage(slot_mapping_flat)
         )
         if not tensors_ok:
             logger.debug("PersistentKVWriter.append_slice: skipping write with fake tensors on layer %d", layer_idx)
@@ -115,7 +130,7 @@ class PersistentKVWriter:
             v_slice,
             key_cache,
             value_cache,
-            slot_mapping_1t.flatten(),  # Flatten for the op
+            slot_mapping_flat,
             self.kv_cache_dtype,
             None,  # k_scale for quantized KV
             None   # v_scale for quantized KV
@@ -133,13 +148,16 @@ class PersistentKVWriter:
         """
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
 
+        # Flatten slot mapping before checking (flattened view might be fake even if original isn't)
+        slot_mapping_flat = slot_mapping_run.flatten()
+
         # Skip if ANY tensor is fake (during warmup/compilation)
         tensors_ok = (
             _tensor_has_storage(key_cache)
             and _tensor_has_storage(value_cache)
             and _tensor_has_storage(K_run)
             and _tensor_has_storage(V_run)
-            and _tensor_has_storage(slot_mapping_run)
+            and _tensor_has_storage(slot_mapping_flat)
         )
         if not tensors_ok:
             logger.debug("PersistentKVWriter.append_run: skipping write with fake tensors on layer %d", layer_idx)
@@ -151,7 +169,7 @@ class PersistentKVWriter:
             V_run,
             key_cache,
             value_cache,
-            slot_mapping_run.flatten(),  # Flatten for the op
+            slot_mapping_flat,
             self.kv_cache_dtype,
             None,
             None
