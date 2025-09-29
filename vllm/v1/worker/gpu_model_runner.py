@@ -2127,17 +2127,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 accepted_tokens = m["accepted"]
                 proposed_tokens = m["proposed"]
 
-                # Commit accepted prefix to persistent KV cache
-                if accepted_tokens > 0 and self.drafter.shadow_kv:
-                    # Note: seq_id would need to be tracked properly for multi-seq
-                    # For now assuming single sequence (seq_id=0)
-                    self.drafter.shadow_kv.commit_prefix(0, accepted_tokens)
-                    print(f"🔴 SHADOW: COMMITTING L={accepted_tokens} of K={proposed_tokens}",
-                          file=sys.stderr, flush=True)
+                print(f"🔴 SHADOW: COMMITTING L={accepted_tokens} of K={proposed_tokens}",
+                      file=sys.stderr, flush=True)
 
-                # Discard rejected tail from shadow buffer
-                if self.drafter.shadow_kv:
-                    self.drafter.shadow_kv.discard_tail(0, accepted_tokens, proposed_tokens)
+                # Route the accepted prefix into the persistent cache; the router
+                # owns both the shadow buffer and the writer, so keep the handoff
+                # centralized to avoid desync.
+                self.drafter.kv_router.commit(accepted_tokens)
 
                 # Return router to immediate mode
                 self.drafter.kv_router.immediate()
@@ -2554,11 +2550,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Call shadow_kv.commit_to() with the persistent writer
             if total_accepted > 0:
                 print(f"🔴 SHADOW: COMMITTING {total_accepted} tokens", file=sys.stderr, flush=True)
-                # For now, pass None as writer since we don't have it yet
-                # TODO: Pass actual writer when kv_router is properly created
-                self.drafter.shadow_kv.commit_to(None, total_accepted)
             else:
                 print(f"🔴 SHADOW: REJECTING ALL staged tokens", file=sys.stderr, flush=True)
+
+            # Let the router handle the staged buffer regardless of acceptance count.
+            router_for_commit.commit(total_accepted)
 
             # Reset router to immediate mode
             router_for_commit.immediate()
