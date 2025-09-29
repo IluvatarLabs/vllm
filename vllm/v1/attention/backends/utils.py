@@ -83,6 +83,10 @@ class CommonAttentionMetadata:
     # Needed by CrossAttentionBuilder
     encoder_seq_lens: Optional[np.ndarray] = None
 
+    # NWOR routing control (0=persistent, 1=shadow)
+    kv_route: int = 0
+    kv_route_epoch: int = 0  # Optional debug counter
+
 
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,

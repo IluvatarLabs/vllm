@@ -18,8 +18,7 @@ from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
                                            get_flash_attn_version,
                                            is_flash_attn_varlen_func_available)
 
-# NWOR imports
-from vllm.kvcache.route_ctx import get_router
+# NWOR imports - removed old ContextVar approach
 try:
     from torch.cuda import nvtx
 except Exception:
@@ -510,10 +509,24 @@ class FlashAttentionImpl(AttentionImpl):
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
 
-            # NWOR: Route KV writes through router if deferred
-            router = get_router()
+            # NWOR: Check routing intent from metadata
             slot_map = attn_metadata.slot_mapping
-            if router is None or not router.is_deferred() or slot_map is None:
+            should_defer = getattr(attn_metadata, 'kv_route', 0) == 1
+
+            # Debug print to verify routing intent
+            print(f"[FLASH_ATTN] kv_route={getattr(attn_metadata, 'kv_route', 0)}, should_defer={should_defer}",
+                  file=sys.stderr, flush=True)
+
+            # Get the local router for this worker
+            router = None
+            if should_defer:
+                from vllm.v1.kv_cache.router_registry import get_local_router
+                router = get_local_router()
+                print(f"[FLASH_ATTN] Got local router: {router is not None}, "
+                      f"is_deferred: {router.is_deferred() if router else 'N/A'}",
+                      file=sys.stderr, flush=True)
+
+            if not should_defer or router is None or slot_map is None:
                 # Original direct write path (baseline)
                 reshape_and_cache_flash(
                     key,
