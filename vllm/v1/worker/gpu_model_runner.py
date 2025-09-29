@@ -2368,10 +2368,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
               f"shadow={has_shadow} router={has_router} → defer={should_defer}",
               file=sys.stderr, flush=True)
 
+        def _set_kv_route_flag(metadata, value: int) -> None:
+            """Set kv_route on each attention metadata object in container."""
+            if metadata is None:
+                return
+            if isinstance(metadata, dict):
+                for meta in metadata.values():
+                    _set_kv_route_flag(meta, value)
+                return
+            if isinstance(metadata, (list, tuple)):
+                for meta in metadata:
+                    _set_kv_route_flag(meta, value)
+                return
+            if hasattr(metadata, "kv_route"):
+                setattr(metadata, "kv_route", value)
+
         # Defer if we should (verification or decode) and have NWOR components
         if should_defer:
             if attn_metadata is not None:
-                setattr(attn_metadata, 'kv_route', 1)
+                _set_kv_route_flag(attn_metadata, 1)
             print(f"🔴 NWOR: DEFERRING WRITES TO SHADOW", file=sys.stderr, flush=True)
             self.drafter.kv_router.defer(self.drafter.shadow_kv)
             self._router_token = set_router(self.drafter.kv_router)
@@ -2380,7 +2395,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "Router token set but router not in deferred mode"
         else:
             if attn_metadata is not None:
-                setattr(attn_metadata, 'kv_route', 0)
+                _set_kv_route_flag(attn_metadata, 0)
             self._router_token = None
 
         # Run the model.
@@ -2721,7 +2736,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             Broadcasted tensor on all ranks
         """
         tp_group = get_tp_group()
-        if tp_group is None or tp_group.world_size == 1:
+        if tp_group is None:
+            raise RuntimeError("Tensor-parallel group is None inside _tp_broadcast_draft_probs")
+        if tp_group.world_size == 1:
             # Single TP rank - no broadcast needed
             if tensor_src is None:
                 raise RuntimeError("TP=1 but draft_probs is None")
@@ -2729,6 +2746,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         tp_rank = get_tensor_model_parallel_rank()
         src_rank = 0
+
+        import sys
 
         # Broadcast shape [rows, cols] first
         if tp_rank == src_rank:
@@ -2738,10 +2757,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             shape_buf = torch.tensor([rows, cols],
                                     device=tensor_src.device,
                                     dtype=torch.int64)
+            print(f"[TP_BCAST] rank={tp_rank} broadcasting shape rows={rows} cols={cols}",
+                  file=sys.stderr, flush=True)
         else:
             # Non-source ranks: allocate shape buffer
             dev = torch.device("cuda", torch.cuda.current_device())
             shape_buf = torch.empty(2, device=dev, dtype=torch.int64)
+            print(f"[TP_BCAST] rank={tp_rank} ready to recv shape", file=sys.stderr, flush=True)
 
         torch.distributed.broadcast(shape_buf, src=src_rank,
                                    group=tp_group.device_group)
@@ -2751,14 +2773,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if tp_rank == src_rank:
             # CRITICAL: Cast to FP32 before broadcast (src rank must match dst dtype)
             buf = tensor_src.to(torch.float32).contiguous()
+            print(f"[TP_BCAST] rank={tp_rank} broadcasting payload", file=sys.stderr, flush=True)
         else:
             # Non-source ranks: allocate buffer with correct shape
             buf = torch.empty((rows, cols), device=shape_buf.device,
                              dtype=torch.float32)
+            print(f"[TP_BCAST] rank={tp_rank} ready to recv payload (rows={rows}, cols={cols})",
+                  file=sys.stderr, flush=True)
 
         torch.distributed.broadcast(buf, src=src_rank,
                                    group=tp_group.device_group)
 
+        print(f"[TP_BCAST] rank={tp_rank} broadcast complete", file=sys.stderr, flush=True)
         return buf
 
     def propose_draft_token_ids(
