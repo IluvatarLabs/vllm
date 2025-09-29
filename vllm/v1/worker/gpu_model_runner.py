@@ -2365,6 +2365,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._nwor_epoch = getattr(self, "_nwor_epoch", 0) + 1
             attn_metadata.kv_route_epoch = self._nwor_epoch
 
+            # CRITICAL FIX: Set router in local registry so flash_attn can find it
+            from vllm.v1.kv_cache.router_registry import set_local_router
+            set_local_router(self.drafter.kv_router)
+            print("🔴🔴🔴 LOCAL ROUTER SET ON WORKER 🔴🔴🔴", file=sys.stderr, flush=True)
+
             # Defer this worker's router
             self.drafter.kv_router.defer(self.drafter.shadow_kv)
             print(f"🔴 NWOR: ACTIVE SINK = {type(self.drafter.shadow_kv).__name__}",

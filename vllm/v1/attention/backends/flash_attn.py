@@ -546,6 +546,8 @@ class FlashAttentionImpl(AttentionImpl):
                 seg_lens = (qsl[1:] - qsl[:-1]).to(device="cpu", dtype=torch.int32)
                 T_total = key.size(0)
                 router.begin(T_total, slot_map.contiguous(), seg_lens)
+                # CRITICAL DEBUG: This proves we're in the deferred path
+                print(f"🔴 SHADOW: STAGING seq=unknown T_total={T_total}", file=sys.stderr, flush=True)
                 with nvtx.range("cache_stage_verify"):
                     key_c = key.contiguous()
                     value_c = value.contiguous()
