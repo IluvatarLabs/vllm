@@ -525,7 +525,7 @@ class KVWriteRouter:
             self._shadow.commit_to(writer, accepted_len)
         except RuntimeError as err:
             if "doesn't have storage" in str(err):
-                logger.warning("NWOR commit hit storage-less tensors; reverting to warmup")
+                logger.warning("NWOR commit hit storage-less tensors; reverting to warmup (%s)", err)
                 self._shadow.commit_to(None, 0)
                 self.transition_to_warmup()
                 return

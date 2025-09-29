@@ -73,13 +73,13 @@ class ShadowKV:
         self.device = device
         self.dtype = dtype
 
-        # Pre-allocate staging buffers for each layer
+        # Pre-allocate staging buffers for each layer (force real memory now)
         self._K: List[torch.Tensor] = [
-            torch.empty((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
+            torch.zeros((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
             for _ in range(n_layers)
         ]
         self._V: List[torch.Tensor] = [
-            torch.empty((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
+            torch.zeros((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
             for _ in range(n_layers)
         ]
 
@@ -161,10 +161,10 @@ class ShadowKV:
         self._K[layer_idx][t:t+1].copy_(k_slice)
         self._V[layer_idx][t:t+1].copy_(v_slice)
 
-        # Normalize slot mapping to int32 on the staging device.
+        # Normalize slot mapping to int64 on the staging device (matches cache op).
         # Force a real owning tensor (copy=True) so we never hold on to fake/meta views.
         try:
-            slot_gpu = slot_mapping_1t.to(dtype=torch.int32,
+            slot_gpu = slot_mapping_1t.to(dtype=torch.int64,
                                           device=self.device,
                                           copy=True).contiguous()
         except (RuntimeError, NotImplementedError) as exc:
@@ -201,14 +201,16 @@ class ShadowKV:
         # Reset staging marker for next step
         self._staging_marked = False
 
+        staged_tokens = self._len
+
         # Short-circuit if nothing was staged
-        if self._len == 0:
+        if staged_tokens == 0:
             if accepted_len:
                 logger.debug("ShadowKV: commit requested but staging buffer empty")
             return
 
         if persistent_writer is None:
-            rejected = self._len
+            rejected = staged_tokens
             self._total_rejected += rejected
             self._len = 0
             print(f"🔴 SHADOW: REJECTING ALL {rejected} STAGED TOKENS", file=sys.stderr, flush=True)
@@ -217,7 +219,7 @@ class ShadowKV:
             return
 
         if accepted_len <= 0:
-            rejected = self._len
+            rejected = staged_tokens
             self._total_rejected += rejected
             self._len = 0
             print(f"🔴 SHADOW: REJECTING ALL {rejected} STAGED TOKENS", file=sys.stderr, flush=True)
@@ -256,7 +258,7 @@ class ShadowKV:
                 # Transfer slot mapping from CPU to GPU (non-blocking for performance)
                 slot_mapping_run = slot_mapping_run.to(
                     device=self.device,
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     non_blocking=True,
                     copy=True).contiguous()
 
