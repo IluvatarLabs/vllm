@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -209,6 +210,14 @@ class Attention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
         self.attn_type = attn_type
+
+        # Extract and store layer index for NWOR optimization
+        try:
+            self._nwor_layer_idx = extract_layer_index(prefix)
+        except (ValueError, AssertionError):
+            # Some attention modules may not have extractable indices
+            # (e.g., encoder-only attention), which is fine
+            self._nwor_layer_idx = None
 
         if kv_sharing_target_layer_name is not None:
             validate_kv_sharing_target(

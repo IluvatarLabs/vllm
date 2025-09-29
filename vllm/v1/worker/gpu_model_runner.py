@@ -4414,18 +4414,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         use_mla = self.vllm_config.model_config.use_mla
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-
-        # Stamp layer indices on attention modules for NWOR
-        from vllm.model_executor.models.utils import extract_layer_index
-        for layer_name, attn_module in attn_layers.items():
-            try:
-                layer_idx = extract_layer_index(layer_name)
-                attn_module._nwor_layer_idx = layer_idx
-            except (ValueError, AssertionError):
-                # Some attention modules may not have extractable indices
-                # (e.g., encoder-only attention), which is fine
-                pass
-
         for layer_name, attn_module in attn_layers.items():
             if (kv_tgt_layer :=
                     attn_module.kv_sharing_target_layer_name) is not None:
