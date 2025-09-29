@@ -138,14 +138,16 @@ class ShadowKV:
         self._K[layer_idx][t:t+1].copy_(k_slice)
         self._V[layer_idx][t:t+1].copy_(v_slice)
 
-        # Persist slot mapping on CPU immediately to avoid pinning device memory
-        slot_cpu = slot_mapping_1t.to(dtype=torch.int32, device="cpu", copy=True)
+        # Normalize slot mapping to int32 on the staging device.
+        slot_gpu = slot_mapping_1t.to(dtype=torch.int32,
+                                      device=self.device,
+                                      copy=False)
 
         # Append to this layer's slot mappings
         if len(self._slot_mappings[layer_idx]) <= t:
             # Extend list if needed
             self._slot_mappings[layer_idx].extend([None] * (t + 1 - len(self._slot_mappings[layer_idx])))
-        self._slot_mappings[layer_idx][t] = slot_cpu
+        self._slot_mappings[layer_idx][t] = slot_gpu.contiguous()
 
         if t + 1 > self._len:
             self._len = t + 1
@@ -174,8 +176,16 @@ class ShadowKV:
                 logger.debug("ShadowKV: commit requested but staging buffer empty")
             return
 
-        if accepted_len <= 0 or persistent_writer is None:
-            # All rejected - just reset
+        if persistent_writer is None:
+            rejected = self._len
+            self._total_rejected += rejected
+            self._len = 0
+            print(f"🔴 SHADOW: REJECTING ALL {rejected} STAGED TOKENS", file=sys.stderr, flush=True)
+            logger.info("ShadowKV: Writer missing; rejected all %d staged tokens",
+                        rejected)
+            return
+
+        if accepted_len <= 0:
             rejected = self._len
             self._total_rejected += rejected
             self._len = 0

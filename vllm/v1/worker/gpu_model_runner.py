@@ -2363,7 +2363,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Opportunistically check if router can activate
         if router and not router.is_ready():
-            router.maybe_activate()
+            router.mark_ready_if_possible()
 
         router_ready = bool(router and router.is_ready())
 
@@ -3822,13 +3822,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     elapsed_time, cuda_graph_size / (1 << 30))
 
         # NWOR: Try to activate router now that warmup is complete
-        if (self.drafter and getattr(self.drafter, "kv_router", None)
-                and not self.drafter.kv_router.is_ready()):
-            self.drafter.kv_router.maybe_activate()
-            if self.drafter.kv_router.is_ready():
-                logger.info("NWOR router activated after warmup")
-            else:
+        if self.drafter and getattr(self.drafter, "kv_router", None):
+            self.drafter.kv_router.mark_ready_if_possible()
+            if not self.drafter.kv_router.is_ready():
                 logger.warning("NWOR router still not ready after warmup - KV cache may not be materialized")
+            else:
+                logger.info("NWOR router activated after warmup")
 
         return cuda_graph_size
 
@@ -4364,12 +4363,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.drafter.kv_router.transition_to_warmup()
 
                 # Log cudagraph mode for debugging
-                from vllm.config import CUDAGraphMode
-                logger.info(f"NWOR: cudagraph_mode={self.compilation_config.cudagraph_mode}")
+                logger.info("NWOR: cudagraph_mode=%s",
+                            self.compilation_config.cudagraph_mode)
 
                 # If CUDA graphs are disabled, try to activate immediately
                 if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-                    self.drafter.kv_router.maybe_activate()
+                    self.drafter.kv_router.mark_ready_if_possible()
                     if self.drafter.kv_router.is_ready():
                         logger.info("NWOR: Activated immediately (no CUDA graphs)")
                     else:

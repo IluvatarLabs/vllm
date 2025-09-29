@@ -73,6 +73,7 @@ class PersistentKVWriter:
         """
         self.mgr = kv_cache_manager
         self.kv_cache_dtype = kv_cache_dtype
+        self._has_real_storage = False
 
     def get_kv_cache_tensors(self, layer_idx: int):
         """Get key and value cache tensors for a specific layer."""
@@ -117,6 +118,30 @@ class PersistentKVWriter:
             return kv_cache[0], kv_cache[1]  # [key_cache, value_cache]
 
         raise AttributeError(f"Cannot find KV cache tensors in manager: {dir(mgr)}")
+
+    def has_real_storage(self) -> bool:
+        """Return True once any KV tensor owns device storage."""
+        if self._has_real_storage:
+            return True
+
+        candidates = []
+        mgr = self.mgr
+        try:
+            if isinstance(mgr, (list, tuple)) and len(mgr) > 0:
+                candidates.append(self.get_kv_cache_tensors(0))
+            elif hasattr(mgr, 'kv_cache') and mgr.kv_cache:
+                candidates.append(mgr.kv_cache[0])
+            elif hasattr(mgr, 'key_caches') and getattr(mgr, 'key_caches'):
+                candidates.append((mgr.key_caches[0], mgr.value_caches[0]))
+        except Exception:
+            return False
+
+        for key_cache, value_cache in candidates:
+            if (_tensor_has_storage(key_cache)
+                    and _tensor_has_storage(value_cache)):
+                self._has_real_storage = True
+                return True
+        return False
 
     def has_real_storage(self) -> bool:
         """Check whether ALL underlying KV cache tensors have real storage."""
@@ -257,17 +282,16 @@ class KVWriteRouter:
 
     @staticmethod
     def _in_restricted_context() -> bool:
-        """Return True while torch.compile tracing is active.
-
-        Note: CUDA graph capture detection via is_current_stream_capturing() is
-        unreliable - there are gaps between capture phases where it returns False
-        even though tensors are still fake. Instead, we rely on has_real_storage()
-        to detect when KV cache has materialized.
-        """
+        """Return True while tracing or CUDA graph capture is active."""
         try:
             import torch._dynamo as torch_dynamo  # type: ignore[attr-defined]
-            return torch_dynamo.is_compiling()
+            if torch_dynamo.is_compiling():
+                return True
         except (ImportError, AttributeError):
+            pass
+        try:
+            return torch.cuda.is_current_stream_capturing()
+        except (RuntimeError, AttributeError):
             return False
 
     def immediate(self):
@@ -338,7 +362,7 @@ class KVWriteRouter:
         """Get current router state."""
         return self._state
 
-    def maybe_activate(self) -> None:
+    def mark_ready_if_possible(self) -> None:
         """Promote from WARMUP to READY when storage is available."""
         if self._state in (KVWriteRouter.RouterState.DISABLED,
                            KVWriteRouter.RouterState.READY):
