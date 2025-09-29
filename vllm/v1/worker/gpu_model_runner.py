@@ -2890,11 +2890,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_embeds=mm_embeds,
             )
             # Store draft_probs for use in rejection sampler
+            tp_rank = get_tensor_model_parallel_rank() if get_tp_group() else 0
             local_draft_probs = getattr(proposals, "logprobs", None)
-            if local_draft_probs is None:
-                raise RuntimeError("EAGLE proposer did not populate proposals.logprobs")
 
-            # Broadcast to all TP ranks (critical for TP > 1)
+            # Only rank 0 should have valid logprobs from the draft model
+            if tp_rank == 0 and local_draft_probs is None:
+                raise RuntimeError("EAGLE proposer did not populate proposals.logprobs on rank 0")
+
+            # ALL ranks must participate in the broadcast for NCCL synchronization
+            # Non-rank-0 passes None, rank 0 passes the actual logprobs
             self._draft_probs = self._tp_broadcast_draft_probs(local_draft_probs)
 
             # CRITICAL: Synchronize CUDA streams after TP broadcast to prevent rank divergence
