@@ -35,6 +35,18 @@ except AttributeError:
     tag_cudagraph_unsafe = ()  # type: ignore[assignment]
 
 
+def _nwor_extract_layer_index(layer_name: str) -> Optional[int]:
+    """Extract layer index for NWOR optimization.
+
+    Accept tokens like "...layers.17...." and return 17.
+    """
+    parts = layer_name.split("layers.")
+    if len(parts) < 2:
+        return None
+    tail = parts[1].split(".", 1)[0]
+    return int(tail) if tail.isdigit() else None
+
+
 def check_xformers_availability():
     global USE_XFORMERS_OPS
     if USE_XFORMERS_OPS is not None:
@@ -211,19 +223,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.attn_type = attn_type
 
         # Extract and store layer index for NWOR optimization
-        # Simple local parsing to avoid circular dependency
-        def _extract_layer_idx(name: str) -> Optional[int]:
-            """Extract layer index from prefix like 'model.layers.0.self_attn'."""
-            parts = name.split('.')
-            for i, part in enumerate(parts):
-                if part == 'layers' and i + 1 < len(parts):
-                    try:
-                        return int(parts[i + 1])
-                    except ValueError:
-                        pass
-            return None
-
-        self._nwor_layer_idx = _extract_layer_idx(prefix)
+        self._nwor_layer_idx = _nwor_extract_layer_index(prefix)
 
         if kv_sharing_target_layer_name is not None:
             validate_kv_sharing_target(

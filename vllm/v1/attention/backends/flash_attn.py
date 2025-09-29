@@ -38,7 +38,6 @@ if is_flash_attn_varlen_func_available():
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils import cdiv
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               AttentionMetadataBuilder,
@@ -498,16 +497,8 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # Resolve layer index once (needed for router staging/commit)
-        if layer_idx is None and kv_router is not None:
-            layer_idx = getattr(layer, "_nwor_layer_idx", None)
-            if layer_idx is None and hasattr(layer, "layer_name"):
-                try:
-                    layer_idx = extract_layer_index(layer.layer_name)
-                except AssertionError:
-                    layer_idx = None
-                else:
-                    setattr(layer, "_nwor_layer_idx", layer_idx)
+        # Use cached layer index from Attention module for NWOR
+        layer_idx = layer_idx if layer_idx is not None else getattr(layer, "_nwor_layer_idx", None)
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
@@ -538,20 +529,10 @@ class FlashAttentionImpl(AttentionImpl):
             # Check if we should use deferred path
             if deferred and slot_map is None:
                 print(f"⚫ NWOR FALLBACK: deferred but slot_map is None", file=sys.stderr, flush=True)
+            if deferred and layer_idx is None:
+                print(f"⚫ NWOR FALLBACK: deferred but layer_idx is None", file=sys.stderr, flush=True)
 
-            if (not deferred) or (slot_map is None):
-                # Original direct write path (baseline)
-                reshape_and_cache_flash(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    slot_map,
-                    self.kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
-            else:
+            if deferred and slot_map is not None and layer_idx is not None:
                 # DEFERRED (NWOR): stage per-timestep instead of persisting now
                 qsl = getattr(attn_metadata, "query_start_loc", None)
                 if qsl is None:
@@ -565,6 +546,19 @@ class FlashAttentionImpl(AttentionImpl):
                     value_c = value.contiguous()
                     for t in range(T_total):
                         router.stage(layer_idx, t, key_c[t:t+1], value_c[t:t+1])
+            else:
+                # Original direct write path (baseline)
+                # Fall back here if deferred=False, slot_map=None, or layer_idx=None
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_map,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
