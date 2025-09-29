@@ -2133,7 +2133,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Route the accepted prefix into the persistent cache; the router
                 # owns both the shadow buffer and the writer, so keep the handoff
                 # centralized to avoid desync.
-                self.drafter.kv_router.commit(accepted_tokens)
+                # Skip commit during CUDA graph capture (FakeTensors have no storage)
+                import torch._dynamo
+                if accepted_tokens and not torch._dynamo.is_compiling():
+                    self.drafter.kv_router.commit(accepted_tokens)
 
                 # Return router to immediate mode
                 self.drafter.kv_router.immediate()
@@ -2569,7 +2572,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 print(f"🔴 SHADOW: REJECTING ALL staged tokens", file=sys.stderr, flush=True)
 
             # Let the router handle the staged buffer regardless of acceptance count.
-            router_for_commit.commit(total_accepted)
+            # Skip commit during CUDA graph capture (FakeTensors have no storage)
+            import torch._dynamo
+            if not torch._dynamo.is_compiling():
+                router_for_commit.commit(total_accepted)
 
             # Reset router to immediate mode
             router_for_commit.immediate()
