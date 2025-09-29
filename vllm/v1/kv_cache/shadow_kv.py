@@ -149,15 +149,14 @@ class ShadowKV:
         self._V[layer_idx][t:t+1].copy_(v_slice)
 
         # Store slot mapping for this token
-        # Ensure it's on the right device
-        if slot_mapping_1t.device != self.device:
-            slot_mapping_1t = slot_mapping_1t.to(self.device)
+        # Move slot mapping to CPU immediately so warmup doesn't pin CUDA memory
+        slot_cpu = slot_mapping_1t.to(dtype=torch.int32, device="cpu", copy=True)
 
         # Append to this layer's slot mappings
         if len(self._slot_mappings[layer_idx]) <= t:
             # Extend list if needed
             self._slot_mappings[layer_idx].extend([None] * (t + 1 - len(self._slot_mappings[layer_idx])))
-        self._slot_mappings[layer_idx][t] = slot_mapping_1t
+        self._slot_mappings[layer_idx][t] = slot_cpu
 
         if t + 1 > self._len:
             self._len = t + 1
@@ -224,13 +223,12 @@ class ShadowKV:
                     # 2D or higher - flatten and concatenate
                     slot_mapping_run = torch.cat([s.flatten() for s in layer_slots])
 
-                # Ensure contiguous and correct dtype for the CUDA kernel
-                slot_mapping_run = slot_mapping_run.contiguous()
-                if slot_mapping_run.dtype != torch.int32:
-                    slot_mapping_run = slot_mapping_run.to(torch.int32)
-
                 # Commit to persistent cache
                 if persistent_writer is not None:
+                    # Transfer slot mapping from CPU to GPU (non-blocking for performance)
+                    slot_mapping_run = slot_mapping_run.to(
+                        device=self.device, dtype=torch.int32, non_blocking=True)
+                    slot_mapping_run = slot_mapping_run.contiguous()
                     persistent_writer.append_run(
                         layer_idx,
                         K_accepted,

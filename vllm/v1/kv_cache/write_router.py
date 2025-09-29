@@ -3,6 +3,7 @@ KV Write Router for vLLM v0.11+ - NWOR Implementation
 Routes KV cache writes through ShadowKV during speculative verification
 """
 
+from enum import Enum, auto
 from typing import Optional
 import logging
 import torch
@@ -203,6 +204,11 @@ class KVWriteRouter:
     or to a ShadowKV staging buffer (defer mode) during verify windows.
     """
 
+    class RouterState(Enum):
+        DISABLED = auto()  # Feature disabled or setup failed
+        WARMUP = auto()    # Armed but waiting for warmup to complete
+        READY = auto()     # Fully operational
+
     def __init__(self, persistent_writer: PersistentKVWriter):
         """
         Args:
@@ -212,11 +218,13 @@ class KVWriteRouter:
         self._shadow = None
         self._mode = "immediate"  # or "defer"
         self._slot_mapping = None  # Stored during begin() for use in stage()
+        self._state = KVWriteRouter.RouterState.WARMUP  # Start in warmup
 
     def immediate(self):
         """Switch to immediate write mode (normal operation)."""
         self._mode = "immediate"
         self._shadow = None
+        self._slot_mapping = None
 
     def defer(self, shadow):
         """
@@ -225,13 +233,18 @@ class KVWriteRouter:
         Args:
             shadow: ShadowKV instance to stage writes
 
-        Raises:
-            RuntimeError: If shadow is None
+        Returns:
+            bool: True if deferral was armed, False if router not ready
         """
         if shadow is None:
             raise RuntimeError("KVWriteRouter.defer() requires a ShadowKV instance")
+        if self._state != KVWriteRouter.RouterState.READY:
+            logger.debug("KVWriteRouter.defer ignored because router is %s",
+                        self._state.name)
+            return False
         self._mode = "defer"
         self._shadow = shadow
+        return True
 
     def is_deferred(self) -> bool:
         """
@@ -241,6 +254,29 @@ class KVWriteRouter:
             True if router is armed for NWOR staging
         """
         return self._mode == "defer" and self._shadow is not None
+
+    def is_ready(self) -> bool:
+        """Check if router is in READY state and can accept deferral requests."""
+        return self._state == KVWriteRouter.RouterState.READY
+
+    def transition_to_warmup(self) -> None:
+        """Transition to WARMUP state. Router will not arm deferral until READY."""
+        self._state = KVWriteRouter.RouterState.WARMUP
+        self.immediate()
+
+    def transition_to_ready(self) -> None:
+        """Transition to READY state. Router can now accept deferral requests."""
+        self._state = KVWriteRouter.RouterState.READY
+        self.immediate()
+
+    def disable(self) -> None:
+        """Disable NWOR permanently (setup failed or feature not requested)."""
+        self._state = KVWriteRouter.RouterState.DISABLED
+        self.immediate()
+
+    def get_state(self) -> "KVWriteRouter.RouterState":
+        """Get current router state."""
+        return self._state
 
     @torch.no_grad()
     def begin(self, length_hint: int, slot_mapping: torch.Tensor, seg_lens: Optional[torch.Tensor] = None):
@@ -323,6 +359,10 @@ class KVWriteRouter:
             accepted_len: Number of accepted tokens to commit
         """
         if self._mode != "defer" or self._shadow is None:
+            return
+        if self._state != KVWriteRouter.RouterState.READY:
+            logger.debug("KVWriteRouter.commit skipped; router state is %s",
+                        self._state.name)
             return
         writer = self._persistent if isinstance(self._persistent, PersistentKVWriter) else None
         self._shadow.commit_to(writer, accepted_len)

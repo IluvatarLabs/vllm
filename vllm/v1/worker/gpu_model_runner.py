@@ -16,26 +16,6 @@ import torch
 import torch.distributed
 import torch.nn as nn
 
-try:
-    import torch._dynamo as torch_dynamo  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover - torch._dynamo unavailable in some builds
-    torch_dynamo = None
-
-
-def _shadowkv_guard_active() -> bool:
-    """Return True while dynamo tracing or CUDA graph capture is active."""
-    if torch_dynamo is not None:
-        try:
-            if torch_dynamo.is_compiling():
-                return True
-        except AttributeError:
-            pass
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except (RuntimeError, AttributeError):
-        return False
-
-
 from tqdm import tqdm
 from typing_extensions import TypeAlias
 
@@ -99,6 +79,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         KVCacheGroupSpec, KVCacheSpec,
                                         MambaSpec, SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
+from vllm.v1.kv_cache.write_router import KVWriteRouter, PersistentKVWriter
 # yapf: enable
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, LogprobsLists, LogprobsTensors,
@@ -2154,8 +2135,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Route the accepted prefix into the persistent cache; the router
                 # owns both the shadow buffer and the writer, so keep the handoff
                 # centralized to avoid desync.
-                # Skip commit during CUDA graph capture (FakeTensors have no storage)
-                if accepted_tokens and not _shadowkv_guard_active():
+                if accepted_tokens:
                     self.drafter.kv_router.commit(accepted_tokens)
 
                 # Return router to immediate mode
@@ -2378,17 +2358,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Check if we're in decode phase (not prefill) OR verification phase
         is_decode = bool(getattr(attn_metadata, "is_decode", False) if attn_metadata else False)
         is_verification = (spec_decode_metadata is not None) and (getattr(self, "_draft_probs", None) is not None)
-        has_shadow = (self.drafter and
-                     getattr(self.drafter, "shadow_kv", None) is not None)
-        has_router = (self.drafter and
-                     getattr(self.drafter, "kv_router", None) is not None)
+        router = getattr(self.drafter, "kv_router", None) if self.drafter else None
+        has_shadow = self.drafter and getattr(self.drafter, "shadow_kv", None) is not None
+        router_ready = bool(router and router.is_ready())
 
-        # NEW: defer during verification OR regular decode
-        should_defer = (is_verification or is_decode) and has_shadow and has_router
+        # NEW: defer during verification OR regular decode (only if router is READY)
+        should_defer = (is_verification or is_decode) and has_shadow and router_ready
 
         # Always log gate conditions for debugging
         print(f"⚫ NWOR GATE: is_decode={is_decode} is_verification={is_verification} "
-              f"shadow={has_shadow} router={has_router} → defer={should_defer}",
+              f"shadow={has_shadow} router_ready={router_ready} → defer={should_defer}",
               file=sys.stderr, flush=True)
 
         def _set_kv_route_flag(metadata, value: int) -> None:
@@ -2410,12 +2389,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if should_defer:
             if attn_metadata is not None:
                 _set_kv_route_flag(attn_metadata, 1)
-            print(f"🔴 NWOR: DEFERRING WRITES TO SHADOW", file=sys.stderr, flush=True)
-            self.drafter.kv_router.defer(self.drafter.shadow_kv)
-            self._router_token = set_router(self.drafter.kv_router)
-            # Sanity check: router should be deferred after arming
-            assert self.drafter.kv_router.is_deferred(), \
-                "Router token set but router not in deferred mode"
+            print("🔴 NWOR: DEFERRING WRITES TO SHADOW", file=sys.stderr, flush=True)
+            if self.drafter.kv_router.defer(self.drafter.shadow_kv):
+                self._router_token = set_router(self.drafter.kv_router)
+                # Sanity check: router should be deferred after arming
+                assert self.drafter.kv_router.is_deferred(), \
+                    "Router token set but router not in deferred mode"
+            else:
+                self._router_token = None
         else:
             if attn_metadata is not None:
                 _set_kv_route_flag(attn_metadata, 0)
@@ -2591,10 +2572,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 print(f"🔴 SHADOW: REJECTING ALL staged tokens", file=sys.stderr, flush=True)
 
-            # Let the router handle the staged buffer regardless of acceptance count.
-            # Skip commit during CUDA graph capture (FakeTensors have no storage)
-            if not _shadowkv_guard_active():
-                router_for_commit.commit(total_accepted)
+            # Let the router handle the staged buffer regardless of acceptance count
+            router_for_commit.commit(total_accepted)
 
             # Reset router to immediate mode
             router_for_commit.immediate()
@@ -3836,6 +3815,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # This usually takes 5~20 seconds.
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
+
+        # NWOR: Transition router to READY state after warmup completes
+        if (self.drafter and getattr(self.drafter, "kv_router", None)
+                and not self.drafter.kv_router.is_ready()):
+            self.drafter.kv_router.transition_to_ready()
+            logger.info("NWOR router activated (transitioned to READY state)")
+
         return cuda_graph_size
 
     def _capture_cudagraphs(self, compilation_cases: list[int],
@@ -4366,6 +4352,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 # Create router with JUST the persistent writer
                 self.drafter.kv_router = KVWriteRouter(persistent_writer)
+                # Start in WARMUP state
+                self.drafter.kv_router.transition_to_warmup()
+                # If CUDA graphs are disabled, activate immediately
+                from vllm.config import CUDAGraphMode
+                if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+                    self.drafter.kv_router.transition_to_ready()
                 from vllm.v1.kv_cache.router_registry import set_local_router
                 set_local_router(self.drafter.kv_router)
 
