@@ -518,6 +518,11 @@ class FlashAttentionImpl(AttentionImpl):
             router = get_local_router()
             deferred = (router is not None and router.is_deferred())
 
+            # Skip staging during torch.compile graph capture (FakeTensors have no storage)
+            import torch._dynamo
+            if deferred and torch._dynamo.is_compiling():
+                deferred = False
+
             # Resolve cached index if needed
             if layer_idx is None and router is not None:
                 layer_idx = getattr(layer, "_nwor_layer_idx", None)
