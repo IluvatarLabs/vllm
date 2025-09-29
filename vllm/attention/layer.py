@@ -211,14 +211,19 @@ class Attention(nn.Module, AttentionLayerBase):
         self.attn_type = attn_type
 
         # Extract and store layer index for NWOR optimization
-        # Lazy import to avoid circular dependency
-        from vllm.model_executor.models.utils import extract_layer_index
-        try:
-            self._nwor_layer_idx = extract_layer_index(prefix)
-        except (ValueError, AssertionError):
-            # Some attention modules may not have extractable indices
-            # (e.g., encoder-only attention), which is fine
-            self._nwor_layer_idx = None
+        # Simple local parsing to avoid circular dependency
+        def _extract_layer_idx(name: str) -> Optional[int]:
+            """Extract layer index from prefix like 'model.layers.0.self_attn'."""
+            parts = name.split('.')
+            for i, part in enumerate(parts):
+                if part == 'layers' and i + 1 < len(parts):
+                    try:
+                        return int(parts[i + 1])
+                    except ValueError:
+                        pass
+            return None
+
+        self._nwor_layer_idx = _extract_layer_idx(prefix)
 
         if kv_sharing_target_layer_name is not None:
             validate_kv_sharing_target(
