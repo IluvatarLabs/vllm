@@ -2350,12 +2350,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         has_router = (self.drafter and
                      getattr(self.drafter, "kv_router", None) is not None)
 
-        # Log gate conditions once
-        if not getattr(self, "_nwor_gate_logged", False):
-            print(f"NWOR gate: decode={is_decode} shadow={has_shadow} "
-                  f"router={has_router}",
-                  file=sys.stderr, flush=True)
-            self._nwor_gate_logged = True
+        # ALWAYS log to see what's happening
+        print(f"🔴 NWOR CHECK: drafter={self.drafter is not None}, "
+              f"decode={is_decode}, shadow={has_shadow}, router={has_router}",
+              file=sys.stderr, flush=True)
 
         # Set routing intent for all workers via metadata
         if is_decode and has_shadow and has_router:
