@@ -6,6 +6,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import sys
 
 from vllm import _custom_ops as ops
 from vllm import envs
@@ -37,6 +38,7 @@ if is_flash_attn_varlen_func_available():
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils import cdiv
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               AttentionMetadataBuilder,
@@ -496,6 +498,17 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
+        # Resolve layer index once (needed for router staging/commit)
+        if layer_idx is None and kv_router is not None:
+            layer_idx = getattr(layer, "_nwor_layer_idx", None)
+            if layer_idx is None and hasattr(layer, "layer_name"):
+                try:
+                    layer_idx = extract_layer_index(layer.layer_name)
+                except AssertionError:
+                    layer_idx = None
+                else:
+                    setattr(layer, "_nwor_layer_idx", layer_idx)
+
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
         # in KV cache.
@@ -547,6 +560,8 @@ class FlashAttentionImpl(AttentionImpl):
                 T_total = key.size(0)
                 router.begin(T_total, slot_map.contiguous(), seg_lens)
                 print(f"🔴 SHADOW: STAGING T_total={T_total}", file=sys.stderr, flush=True)
+                if layer_idx is None:
+                    raise RuntimeError("NWOR staging requires a valid layer index")
                 with nvtx.range("cache_stage_verify"):
                     key_c = key.contiguous()
                     value_c = value.contiguous()
@@ -845,4 +860,3 @@ def cascade_attention(
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output,
                       suffix_lse)
-
