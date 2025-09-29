@@ -189,9 +189,9 @@ class ShadowKV:
               file=sys.stderr, flush=True)
         # Commit accepted tokens to persistent storage
         for layer_idx in range(self.n_layers):
-            # Get accepted KV slices
-            K_accepted = self._K[layer_idx][:accepted_len]
-            V_accepted = self._V[layer_idx][:accepted_len]
+            # Get accepted KV slices - make them contiguous
+            K_accepted = self._K[layer_idx][:accepted_len].contiguous()
+            V_accepted = self._V[layer_idx][:accepted_len].contiguous()
 
             # Build concatenated slot mapping for accepted tokens
             layer_slots = self._slot_mappings[layer_idx][:accepted_len]
@@ -213,6 +213,11 @@ class ShadowKV:
                 else:
                     # 2D or higher - flatten and concatenate
                     slot_mapping_run = torch.cat([s.flatten() for s in layer_slots])
+
+                # Ensure contiguous and correct dtype for the CUDA kernel
+                slot_mapping_run = slot_mapping_run.contiguous()
+                if slot_mapping_run.dtype != torch.int32:
+                    slot_mapping_run = slot_mapping_run.to(torch.int32)
 
                 # Commit to persistent cache
                 persistent_writer.append_run(
