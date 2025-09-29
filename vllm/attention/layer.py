@@ -35,16 +35,32 @@ except AttributeError:
     tag_cudagraph_unsafe = ()  # type: ignore[assignment]
 
 
-def _nwor_extract_layer_index(layer_name: str) -> Optional[int]:
+def _nwor_extract_layer_index(name: str) -> Optional[int]:
     """Extract layer index for NWOR optimization.
 
-    Accept tokens like "...layers.17...." and return 17.
+    First tries to extract from 'layers.N' pattern, then falls back
+    to finding any integer in the name.
     """
-    parts = layer_name.split("layers.")
-    if len(parts) < 2:
-        return None
-    tail = parts[1].split(".", 1)[0]
-    return int(tail) if tail.isdigit() else None
+    # Primary method: extract digits after "layers."
+    parts = name.split("layers.")
+    if len(parts) >= 2:
+        tail = parts[1]
+        digits = []
+        for ch in tail:
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                break
+        if digits:
+            return int("".join(digits))
+
+    # Fallback: find any integer in the path
+    parts = name.split(".")
+    for part in parts:
+        if part.isdigit():
+            return int(part)
+
+    return None
 
 
 def check_xformers_availability():

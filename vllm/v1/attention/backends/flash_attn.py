@@ -498,7 +498,8 @@ class FlashAttentionImpl(AttentionImpl):
         key_cache, value_cache = kv_cache.unbind(0)
 
         # Use cached layer index from Attention module for NWOR
-        layer_idx = layer_idx if layer_idx is not None else getattr(layer, "_nwor_layer_idx", None)
+        if layer_idx is None and kv_router is not None:
+            layer_idx = getattr(layer, "_nwor_layer_idx", None)
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached

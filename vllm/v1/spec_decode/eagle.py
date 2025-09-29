@@ -189,7 +189,19 @@ class EagleProposer:
             # Get model dimensions for ShadowKV from HF config
             hf_config = vllm_config.model_config.hf_config
             n_layers = hf_config.num_hidden_layers
-            n_heads = getattr(hf_config, 'num_key_value_heads', None) or hf_config.num_attention_heads
+
+            # Get total KV heads and adjust for tensor parallelism
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+
+            n_kv_heads_total = getattr(hf_config, 'num_key_value_heads', hf_config.num_attention_heads)
+            tp_size = max(1, get_tensor_model_parallel_world_size())
+            n_heads = n_kv_heads_total // tp_size
+
+            if n_kv_heads_total % tp_size != 0:
+                raise ValueError(
+                    f"num_key_value_heads ({n_kv_heads_total}) must divide evenly by TP size ({tp_size})"
+                )
+
             head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
             # Create ShadowKV staging buffer
@@ -199,7 +211,7 @@ class EagleProposer:
 
             self.shadow_kv = ShadowKV(
                 n_layers=n_layers,
-                n_heads=n_heads,
+                n_heads=n_heads,  # Use per-rank head count
                 head_dim=head_dim,
                 max_chunk=shadow_max_chunk,
                 device="cuda",
@@ -215,10 +227,12 @@ class EagleProposer:
             self.kv_writer = None
             self.kv_router = None
 
-            print(f"[EAGLE_DEBUG] NWOR/ShadowKV INITIALIZED: {n_layers} layers, {n_heads} heads, {head_dim} head_dim",
+            print(f"[EAGLE_DEBUG] NWOR/ShadowKV INITIALIZED: {n_layers} layers, "
+                  f"{n_kv_heads_total} total heads → {n_heads} local heads (TP={tp_size}), "
+                  f"{head_dim} head_dim",
                   file=sys.stderr, flush=True)
-            logger.warning("NWOR/ShadowKV INITIALIZED with %d layers, %d heads, %d head_dim",
-                          n_layers, n_heads, head_dim)
+            logger.warning("NWOR/ShadowKV INITIALIZED with %d layers, %d total heads → %d local heads (TP=%d), %d head_dim",
+                          n_layers, n_kv_heads_total, n_heads, tp_size, head_dim)
         else:
             print(f"⚫⚫⚫ NWOR DISABLED - NO SHADOWKV ⚫⚫⚫ (use_shadow_kv={self.opt_config.use_shadow_kv})",
                   file=sys.stderr, flush=True)
