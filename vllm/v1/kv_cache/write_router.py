@@ -73,7 +73,32 @@ class PersistentKVWriter:
         """
         self.mgr = kv_cache_manager
         self.kv_cache_dtype = kv_cache_dtype
-        self._has_real_storage = False
+
+        # Readiness tracking: each layer must materialize before NWOR arms.
+        self._layer_count_warning_emitted = False
+        self._num_layers = self._detect_layer_count()
+        if self._num_layers is None:
+            self._layer_ready = None
+            self._layers_pending = None
+        else:
+            self._layer_ready = [False] * self._num_layers
+            self._layers_pending = self._num_layers
+        self._all_layers_real = False
+
+    def _detect_layer_count(self) -> Optional[int]:
+        """Best-effort detection of the number of KV cache layers."""
+        mgr = self.mgr
+        try:
+            if isinstance(mgr, (list, tuple)):
+                return len(mgr)
+            if hasattr(mgr, 'kv_cache') and hasattr(mgr.kv_cache, '__len__'):
+                return len(mgr.kv_cache)
+            if hasattr(mgr, 'key_caches') and hasattr(mgr.key_caches, '__len__'):
+                return len(mgr.key_caches)
+        except Exception as exc:
+            logger.debug("PersistentKVWriter: layer count detection failed: %s", exc)
+            return None
+        return None
 
     def get_kv_cache_tensors(self, layer_idx: int):
         """Get key and value cache tensors for a specific layer."""
@@ -120,63 +145,79 @@ class PersistentKVWriter:
         raise AttributeError(f"Cannot find KV cache tensors in manager: {dir(mgr)}")
 
     def has_real_storage(self) -> bool:
-        """Return True once any KV tensor owns device storage."""
-        if self._has_real_storage:
+        """Return True only after every KV layer has real device storage."""
+        if self._all_layers_real:
             return True
 
-        candidates = []
-        mgr = self.mgr
-        try:
-            if isinstance(mgr, (list, tuple)) and len(mgr) > 0:
-                candidates.append(self.get_kv_cache_tensors(0))
-            elif hasattr(mgr, 'kv_cache') and mgr.kv_cache:
-                candidates.append(mgr.kv_cache[0])
-            elif hasattr(mgr, 'key_caches') and getattr(mgr, 'key_caches'):
-                candidates.append((mgr.key_caches[0], mgr.value_caches[0]))
-        except Exception:
-            return False
+        if self._layer_ready is None or self._layers_pending is None:
+            if not self._layer_count_warning_emitted:
+                logger.warning(
+                    "PersistentKVWriter: unable to determine KV layer count; "
+                    "falling back to full storage scan until materialized")
+                self._layer_count_warning_emitted = True
+            all_real, layer_count = self._full_scan_all_layers()
+            if all_real:
+                self._all_layers_real = True
+                if layer_count:
+                    logger.info("NWOR: KV cache materialized across %d layers", layer_count)
+            return self._all_layers_real
 
-        for key_cache, value_cache in candidates:
+        for layer_idx, ready in enumerate(self._layer_ready):
+            if ready:
+                continue
+            try:
+                key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
+            except Exception as exc:
+                logger.debug(
+                    "PersistentKVWriter: failed to fetch KV tensors for layer %d: %s",
+                    layer_idx, exc)
+                return False
+
             if (_tensor_has_storage(key_cache)
                     and _tensor_has_storage(value_cache)):
-                self._has_real_storage = True
-                return True
+                self._layer_ready[layer_idx] = True
+                self._layers_pending -= 1
+                if self._layers_pending == 0:
+                    self._all_layers_real = True
+                    logger.info("NWOR: KV cache materialized across %d layers",
+                                len(self._layer_ready))
+                    return True
+
         return False
 
-    def has_real_storage(self) -> bool:
-        """Check whether ALL underlying KV cache tensors have real storage."""
+    def _full_scan_all_layers(self) -> tuple[bool, int]:
+        """Fallback readiness check that scans every layer on each call."""
+        mgr = self.mgr
         try:
-            if isinstance(self.mgr, (list, tuple)):
-                # Check ALL layers have real storage
-                for layer_idx in range(len(self.mgr)):
-                    key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
-                    if not (_tensor_has_storage(key_cache)
-                            and _tensor_has_storage(value_cache)):
-                        return False  # Found a fake layer
-                return True  # All layers are real
+            if isinstance(mgr, (list, tuple)):
+                indices = range(len(mgr))
+            elif hasattr(mgr, 'kv_cache') and hasattr(mgr.kv_cache, '__len__'):
+                indices = range(len(mgr.kv_cache))
+            elif hasattr(mgr, 'key_caches') and hasattr(mgr, 'value_caches'):
+                indices = range(len(mgr.key_caches))
+            else:
+                return False, 0
+        except Exception as exc:
+            logger.debug("PersistentKVWriter: unable to enumerate KV layers: %s", exc)
+            return False, 0
 
-            if hasattr(self.mgr, 'kv_cache'):
-                # Check ALL layers in kv_cache
-                for key_cache, value_cache in self.mgr.kv_cache:
-                    if not (_tensor_has_storage(key_cache)
-                            and _tensor_has_storage(value_cache)):
-                        return False
-                return True
+        count = 0
+        for layer_idx in indices:
+            count += 1
+            try:
+                key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
+            except Exception as exc:
+                logger.debug(
+                    "PersistentKVWriter: failed to fetch KV tensors for layer %d during full scan: %s",
+                    layer_idx, exc)
+                return False, count
+            if not (_tensor_has_storage(key_cache)
+                    and _tensor_has_storage(value_cache)):
+                return False, count
 
-            if hasattr(self.mgr, 'key_caches') and hasattr(self.mgr, 'value_caches'):
-                # Check ALL layers in separate key/value lists
-                for key_cache, value_cache in zip(self.mgr.key_caches,
-                                                  self.mgr.value_caches):
-                    if not (_tensor_has_storage(key_cache)
-                            and _tensor_has_storage(value_cache)):
-                        return False
-                return True
-
-        except Exception as e:
-            logger.debug(f"has_real_storage check failed: {e}")
-            return False
-
-        return False
+        if count == 0:
+            return False, 0
+        return True, count
 
     @torch.no_grad()
     def append_slice(self,

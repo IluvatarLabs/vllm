@@ -10,6 +10,23 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+
+def _tensor_has_storage(tensor: torch.Tensor) -> bool:
+    """Return False for fake/meta tensors that can't expose a data pointer."""
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    if tensor.is_meta:
+        return False
+    try:
+        tensor.data_ptr()
+        return True
+    except (RuntimeError, NotImplementedError) as exc:
+        msg = str(exc)
+        if "doesn't have storage" in msg or "meta tensor" in msg:
+            return False
+        raise
+
+
 # Global registry for per-process shadow_kv instance
 _local_shadow_kv: Optional["ShadowKV"] = None
 
@@ -134,14 +151,28 @@ class ShadowKV:
             print(f"🔴 SHADOW: STAGING layer={layer_idx} t={t}", file=sys.stderr, flush=True)
             self._staging_marked = True
 
-        # Copy KV to staging buffer
+        # Skip staging entirely if KV slices are still fake (e.g. during torch.compile capture).
+        if not (_tensor_has_storage(k_slice) and _tensor_has_storage(v_slice)):
+            logger.debug("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
+                         layer_idx, t)
+            return
+
+        # Copy KV to staging buffer now that the slices are confirmed real
         self._K[layer_idx][t:t+1].copy_(k_slice)
         self._V[layer_idx][t:t+1].copy_(v_slice)
 
         # Normalize slot mapping to int32 on the staging device.
-        slot_gpu = slot_mapping_1t.to(dtype=torch.int32,
-                                      device=self.device,
-                                      copy=False)
+        # Force a real owning tensor (copy=True) so we never hold on to fake/meta views.
+        try:
+            slot_gpu = slot_mapping_1t.to(dtype=torch.int32,
+                                          device=self.device,
+                                          copy=True).contiguous()
+        except (RuntimeError, NotImplementedError) as exc:
+            msg = str(exc)
+            if "doesn't have storage" in msg or "meta tensor" in msg:
+                logger.debug("ShadowKV: skipping staging for fake slot mapping on layer %d", layer_idx)
+                return
+            raise
 
         # Append to this layer's slot mappings
         if len(self._slot_mappings[layer_idx]) <= t:
@@ -224,8 +255,10 @@ class ShadowKV:
 
                 # Transfer slot mapping from CPU to GPU (non-blocking for performance)
                 slot_mapping_run = slot_mapping_run.to(
-                    device=self.device, dtype=torch.int32, non_blocking=True)
-                slot_mapping_run = slot_mapping_run.contiguous()
+                    device=self.device,
+                    dtype=torch.int32,
+                    non_blocking=True,
+                    copy=True).contiguous()
 
                 persistent_writer.append_run(
                     layer_idx,
