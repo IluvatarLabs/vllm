@@ -19,7 +19,6 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -212,6 +211,8 @@ class Attention(nn.Module, AttentionLayerBase):
         self.attn_type = attn_type
 
         # Extract and store layer index for NWOR optimization
+        # Lazy import to avoid circular dependency
+        from vllm.model_executor.models.utils import extract_layer_index
         try:
             self._nwor_layer_idx = extract_layer_index(prefix)
         except (ValueError, AssertionError):
