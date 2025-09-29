@@ -220,6 +220,20 @@ class KVWriteRouter:
         self._slot_mapping = None  # Stored during begin() for use in stage()
         self._state = KVWriteRouter.RouterState.WARMUP  # Start in warmup
 
+    @staticmethod
+    def _in_restricted_context() -> bool:
+        """Return True while CUDA graph capture or torch.compile tracing is active."""
+        try:
+            import torch._dynamo as torch_dynamo  # type: ignore[attr-defined]
+            if torch_dynamo.is_compiling():
+                return True
+        except (ImportError, AttributeError):
+            pass
+        try:
+            return torch.cuda.is_current_stream_capturing()
+        except (RuntimeError, AttributeError):
+            return False
+
     def immediate(self):
         """Switch to immediate write mode (normal operation)."""
         self._mode = "immediate"
@@ -239,8 +253,11 @@ class KVWriteRouter:
         if shadow is None:
             raise RuntimeError("KVWriteRouter.defer() requires a ShadowKV instance")
         if self._state != KVWriteRouter.RouterState.READY:
-            logger.debug("KVWriteRouter.defer ignored because router is %s",
+            logger.debug("KVWriteRouter.defer ignored; router state=%s",
                         self._state.name)
+            return False
+        if KVWriteRouter._in_restricted_context():
+            logger.debug("KVWriteRouter.defer skipped inside capture context")
             return False
         self._mode = "defer"
         self._shadow = shadow
@@ -257,7 +274,8 @@ class KVWriteRouter:
 
     def is_ready(self) -> bool:
         """Check if router is in READY state and can accept deferral requests."""
-        return self._state == KVWriteRouter.RouterState.READY
+        return (self._state == KVWriteRouter.RouterState.READY
+                and not KVWriteRouter._in_restricted_context())
 
     def transition_to_warmup(self) -> None:
         """Transition to WARMUP state. Router will not arm deferral until READY."""
@@ -360,11 +378,13 @@ class KVWriteRouter:
         """
         if self._mode != "defer" or self._shadow is None:
             return
-        if self._state != KVWriteRouter.RouterState.READY:
-            logger.debug("KVWriteRouter.commit skipped; router state is %s",
-                        self._state.name)
+        if (self._state != KVWriteRouter.RouterState.READY or
+                KVWriteRouter._in_restricted_context()):
+            # Discard staged tokens but keep persistent cache untouched.
+            self._shadow.commit_to(None, 0)
             return
-        writer = self._persistent if isinstance(self._persistent, PersistentKVWriter) else None
+        writer = (self._persistent if isinstance(self._persistent,
+                   PersistentKVWriter) else None)
         self._shadow.commit_to(writer, accepted_len)
 
     def get_persistent_writer(self):

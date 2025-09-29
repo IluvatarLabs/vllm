@@ -122,16 +122,6 @@ class ShadowKV:
             v_slice: Value tensor [1, H, D]
             slot_mapping_1t: Slot mapping for this single timestep
         """
-        # Skip staging if slot_mapping is a FakeTensor (fallback path already wrote it)
-        try:
-            slot_mapping_1t.data_ptr()
-        except (RuntimeError, NotImplementedError) as exc:
-            msg = str(exc)
-            if "doesn't have storage" in msg or "meta tensor" in msg:
-                return
-            else:
-                raise
-
         # Handle both [1, H, D] and [H, D] shapes
         if k_slice.dim() == 2:
             k_slice = k_slice.unsqueeze(0)
@@ -148,8 +138,7 @@ class ShadowKV:
         self._K[layer_idx][t:t+1].copy_(k_slice)
         self._V[layer_idx][t:t+1].copy_(v_slice)
 
-        # Store slot mapping for this token
-        # Move slot mapping to CPU immediately so warmup doesn't pin CUDA memory
+        # Persist slot mapping on CPU immediately to avoid pinning device memory
         slot_cpu = slot_mapping_1t.to(dtype=torch.int32, device="cpu", copy=True)
 
         # Append to this layer's slot mappings
@@ -182,10 +171,10 @@ class ShadowKV:
         # Short-circuit if nothing was staged
         if self._len == 0:
             if accepted_len:
-                logger.debug("ShadowKV: commit requested but nothing staged; skipping.")
+                logger.debug("ShadowKV: commit requested but staging buffer empty")
             return
 
-        if accepted_len <= 0:
+        if accepted_len <= 0 or persistent_writer is None:
             # All rejected - just reset
             rejected = self._len
             self._total_rejected += rejected
@@ -223,24 +212,22 @@ class ShadowKV:
                     # 2D or higher - flatten and concatenate
                     slot_mapping_run = torch.cat([s.flatten() for s in layer_slots])
 
-                # Commit to persistent cache
-                if persistent_writer is not None:
-                    # Transfer slot mapping from CPU to GPU (non-blocking for performance)
-                    slot_mapping_run = slot_mapping_run.to(
-                        device=self.device, dtype=torch.int32, non_blocking=True)
-                    slot_mapping_run = slot_mapping_run.contiguous()
-                    persistent_writer.append_run(
-                        layer_idx,
-                        K_accepted,
-                        V_accepted,
-                        slot_mapping_run
-                    )
-            elif persistent_writer is not None:
+                # Transfer slot mapping from CPU to GPU (non-blocking for performance)
+                slot_mapping_run = slot_mapping_run.to(
+                    device=self.device, dtype=torch.int32, non_blocking=True)
+                slot_mapping_run = slot_mapping_run.contiguous()
+
+                persistent_writer.append_run(
+                    layer_idx,
+                    K_accepted,
+                    V_accepted,
+                    slot_mapping_run
+                )
+            else:
                 logger.warning(
                     "Missing slot mappings for layer %d, skipping commit",
                     layer_idx
                 )
-                continue
 
         # Update metrics
         staged_tokens = self._len
