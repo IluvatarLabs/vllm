@@ -97,9 +97,16 @@ class PersistentKVWriter:
         # Get layer KV cache tensors
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
 
-        # Skip if cache tensors are fake (during warmup/compilation)
-        if not (_tensor_has_storage(key_cache) and _tensor_has_storage(value_cache)):
-            logger.debug("PersistentKVWriter.append_slice: skipping fake KV cache write on layer %d", layer_idx)
+        # Skip if ANY tensor is fake (during warmup/compilation)
+        tensors_ok = (
+            _tensor_has_storage(key_cache)
+            and _tensor_has_storage(value_cache)
+            and _tensor_has_storage(k_slice)
+            and _tensor_has_storage(v_slice)
+            and _tensor_has_storage(slot_mapping_1t)
+        )
+        if not tensors_ok:
+            logger.debug("PersistentKVWriter.append_slice: skipping write with fake tensors on layer %d", layer_idx)
             return
 
         # Call the fused cache writer used by flash-attn backends
@@ -126,9 +133,16 @@ class PersistentKVWriter:
         """
         key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
 
-        # Skip if cache tensors are fake (during warmup/compilation)
-        if not (_tensor_has_storage(key_cache) and _tensor_has_storage(value_cache)):
-            logger.debug("PersistentKVWriter.append_run: skipping fake KV cache write on layer %d", layer_idx)
+        # Skip if ANY tensor is fake (during warmup/compilation)
+        tensors_ok = (
+            _tensor_has_storage(key_cache)
+            and _tensor_has_storage(value_cache)
+            and _tensor_has_storage(K_run)
+            and _tensor_has_storage(V_run)
+            and _tensor_has_storage(slot_mapping_run)
+        )
+        if not tensors_ok:
+            logger.debug("PersistentKVWriter.append_run: skipping write with fake tensors on layer %d", layer_idx)
             return
 
         # Bulk write using the same op
