@@ -36,31 +36,18 @@ except AttributeError:
 
 
 def _nwor_extract_layer_index(name: str) -> Optional[int]:
-    """Extract layer index for NWOR optimization.
-
-    First tries to extract from 'layers.N' pattern, then falls back
-    to finding any integer in the name.
-    """
-    # Primary method: extract digits after "layers."
-    parts = name.split("layers.")
-    if len(parts) >= 2:
-        tail = parts[1]
-        digits = []
-        for ch in tail:
-            if ch.isdigit():
-                digits.append(ch)
-            else:
-                break
-        if digits:
-            return int("".join(digits))
-
-    # Fallback: find any integer in the path
-    parts = name.split(".")
-    for part in parts:
-        if part.isdigit():
-            return int(part)
-
-    return None
+    # Pull the digits immediately following "layers."
+    parts = name.split("layers.", 1)
+    if len(parts) < 2:
+        return None
+    tail = parts[1]
+    digits: list[str] = []
+    for ch in tail:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    return int("".join(digits)) if digits else None
 
 
 def check_xformers_availability():

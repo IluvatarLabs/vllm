@@ -170,6 +170,12 @@ class ShadowKV:
         # Reset staging marker for next step
         self._staging_marked = False
 
+        # Short-circuit if nothing was staged
+        if self._len == 0:
+            if accepted_len:
+                logger.debug("ShadowKV: commit requested but nothing staged; skipping.")
+            return
+
         if accepted_len <= 0:
             # All rejected - just reset
             rejected = self._len
@@ -223,9 +229,11 @@ class ShadowKV:
                 continue
 
         # Update metrics
-        rejected = self._len - accepted_len
+        staged_tokens = self._len
+        rejected = max(0, staged_tokens - accepted_len)
         self._total_committed += accepted_len
-        self._total_rejected += rejected
+        if rejected:
+            self._total_rejected += rejected
         self._len = 0
 
         logger.info(

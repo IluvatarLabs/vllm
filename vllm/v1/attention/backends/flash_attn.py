@@ -497,10 +497,6 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # Use cached layer index from Attention module for NWOR
-        if layer_idx is None and kv_router is not None:
-            layer_idx = getattr(layer, "_nwor_layer_idx", None)
-
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
         # in KV cache.
@@ -522,17 +518,11 @@ class FlashAttentionImpl(AttentionImpl):
             router = get_local_router()
             deferred = (router is not None and router.is_deferred())
 
-            # Debug print to verify routing state
-            print(f"[FLASH_ATTN] router exists={router is not None}, "
-                  f"is_deferred={router.is_deferred() if router else False} → defer={deferred}",
-                  file=sys.stderr, flush=True)
+            # Resolve cached index if needed
+            if layer_idx is None and router is not None:
+                layer_idx = getattr(layer, "_nwor_layer_idx", None)
 
-            # Check if we should use deferred path
-            if deferred and slot_map is None:
-                print(f"⚫ NWOR FALLBACK: deferred but slot_map is None", file=sys.stderr, flush=True)
-            if deferred and layer_idx is None:
-                print(f"⚫ NWOR FALLBACK: deferred but layer_idx is None", file=sys.stderr, flush=True)
-
+            # Only use deferred path if all conditions are met
             if deferred and slot_map is not None and layer_idx is not None:
                 # DEFERRED (NWOR): stage per-timestep instead of persisting now
                 qsl = getattr(attn_metadata, "query_start_loc", None)
