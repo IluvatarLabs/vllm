@@ -118,6 +118,41 @@ class PersistentKVWriter:
 
         raise AttributeError(f"Cannot find KV cache tensors in manager: {dir(mgr)}")
 
+    def has_real_storage(self) -> bool:
+        """Check whether ALL underlying KV cache tensors have real storage."""
+        try:
+            if isinstance(self.mgr, (list, tuple)):
+                # Check ALL layers have real storage
+                for layer_idx in range(len(self.mgr)):
+                    key_cache, value_cache = self.get_kv_cache_tensors(layer_idx)
+                    if not (_tensor_has_storage(key_cache)
+                            and _tensor_has_storage(value_cache)):
+                        return False  # Found a fake layer
+                return True  # All layers are real
+
+            if hasattr(self.mgr, 'kv_cache'):
+                # Check ALL layers in kv_cache
+                for key_cache, value_cache in self.mgr.kv_cache:
+                    if not (_tensor_has_storage(key_cache)
+                            and _tensor_has_storage(value_cache)):
+                        return False
+                return True
+
+            if hasattr(self.mgr, 'key_caches') and hasattr(self.mgr, 'value_caches'):
+                # Check ALL layers in separate key/value lists
+                for key_cache, value_cache in zip(self.mgr.key_caches,
+                                                  self.mgr.value_caches):
+                    if not (_tensor_has_storage(key_cache)
+                            and _tensor_has_storage(value_cache)):
+                        return False
+                return True
+
+        except Exception as e:
+            logger.debug(f"has_real_storage check failed: {e}")
+            return False
+
+        return False
+
     @torch.no_grad()
     def append_slice(self,
                      layer_idx: int,
@@ -222,16 +257,17 @@ class KVWriteRouter:
 
     @staticmethod
     def _in_restricted_context() -> bool:
-        """Return True while CUDA graph capture or torch.compile tracing is active."""
+        """Return True while torch.compile tracing is active.
+
+        Note: CUDA graph capture detection via is_current_stream_capturing() is
+        unreliable - there are gaps between capture phases where it returns False
+        even though tensors are still fake. Instead, we rely on has_real_storage()
+        to detect when KV cache has materialized.
+        """
         try:
             import torch._dynamo as torch_dynamo  # type: ignore[attr-defined]
-            if torch_dynamo.is_compiling():
-                return True
+            return torch_dynamo.is_compiling()
         except (ImportError, AttributeError):
-            pass
-        try:
-            return torch.cuda.is_current_stream_capturing()
-        except (RuntimeError, AttributeError):
             return False
 
     def immediate(self):
@@ -274,8 +310,14 @@ class KVWriteRouter:
 
     def is_ready(self) -> bool:
         """Check if router is in READY state and can accept deferral requests."""
-        return (self._state == KVWriteRouter.RouterState.READY
-                and not KVWriteRouter._in_restricted_context())
+        if self._state != KVWriteRouter.RouterState.READY:
+            return False
+        if KVWriteRouter._in_restricted_context():
+            return False
+        # Check if KV cache has real storage
+        if isinstance(self._persistent, PersistentKVWriter):
+            return self._persistent.has_real_storage()
+        return False
 
     def transition_to_warmup(self) -> None:
         """Transition to WARMUP state. Router will not arm deferral until READY."""
@@ -295,6 +337,27 @@ class KVWriteRouter:
     def get_state(self) -> "KVWriteRouter.RouterState":
         """Get current router state."""
         return self._state
+
+    def maybe_activate(self) -> None:
+        """Promote from WARMUP to READY when storage is available."""
+        if self._state in (KVWriteRouter.RouterState.DISABLED,
+                           KVWriteRouter.RouterState.READY):
+            return
+
+        if KVWriteRouter._in_restricted_context():
+            logger.debug("NWOR: Cannot activate - in restricted context")
+            return
+
+        if not isinstance(self._persistent, PersistentKVWriter):
+            logger.debug("NWOR: Cannot activate - no persistent writer")
+            return
+
+        if not self._persistent.has_real_storage():
+            logger.debug("NWOR: Cannot activate - KV cache not materialized")
+            return
+
+        logger.info("NWOR: KV cache materialized, transitioning to READY")
+        self.transition_to_ready()
 
     @torch.no_grad()
     def begin(self, length_hint: int, slot_mapping: torch.Tensor, seg_lens: Optional[torch.Tensor] = None):
@@ -378,14 +441,30 @@ class KVWriteRouter:
         """
         if self._mode != "defer" or self._shadow is None:
             return
-        if (self._state != KVWriteRouter.RouterState.READY or
-                KVWriteRouter._in_restricted_context()):
-            # Discard staged tokens but keep persistent cache untouched.
+
+        # Check if we're ready to commit
+        has_real = (isinstance(self._persistent, PersistentKVWriter)
+                    and self._persistent.has_real_storage())
+
+        if (self._state != KVWriteRouter.RouterState.READY
+                or KVWriteRouter._in_restricted_context()
+                or not has_real):
+            # Discard staged tokens; we are not ready to persist them yet
             self._shadow.commit_to(None, 0)
             return
+
         writer = (self._persistent if isinstance(self._persistent,
                    PersistentKVWriter) else None)
-        self._shadow.commit_to(writer, accepted_len)
+
+        try:
+            self._shadow.commit_to(writer, accepted_len)
+        except RuntimeError as err:
+            if "doesn't have storage" in str(err):
+                logger.warning("NWOR commit hit storage-less tensors; reverting to warmup")
+                self._shadow.commit_to(None, 0)
+                self.transition_to_warmup()
+                return
+            raise
 
     def get_persistent_writer(self):
         """Get the underlying persistent writer for direct access if needed."""

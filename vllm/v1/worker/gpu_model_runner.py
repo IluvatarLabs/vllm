@@ -2360,6 +2360,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         is_verification = (spec_decode_metadata is not None) and (getattr(self, "_draft_probs", None) is not None)
         router = getattr(self.drafter, "kv_router", None) if self.drafter else None
         has_shadow = self.drafter and getattr(self.drafter, "shadow_kv", None) is not None
+
+        # Opportunistically check if router can activate
+        if router and not router.is_ready():
+            router.maybe_activate()
+
         router_ready = bool(router and router.is_ready())
 
         # NEW: defer during verification OR regular decode (only if router is READY)
@@ -3816,11 +3821,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
 
-        # NWOR: Transition router to READY state after warmup completes
+        # NWOR: Try to activate router now that warmup is complete
         if (self.drafter and getattr(self.drafter, "kv_router", None)
                 and not self.drafter.kv_router.is_ready()):
-            self.drafter.kv_router.transition_to_ready()
-            logger.info("NWOR router activated (transitioned to READY state)")
+            self.drafter.kv_router.maybe_activate()
+            if self.drafter.kv_router.is_ready():
+                logger.info("NWOR router activated after warmup")
+            else:
+                logger.warning("NWOR router still not ready after warmup - KV cache may not be materialized")
 
         return cuda_graph_size
 
@@ -4354,10 +4362,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.drafter.kv_router = KVWriteRouter(persistent_writer)
                 # Start in WARMUP state
                 self.drafter.kv_router.transition_to_warmup()
-                # If CUDA graphs are disabled, activate immediately
+
+                # Log cudagraph mode for debugging
                 from vllm.config import CUDAGraphMode
+                logger.info(f"NWOR: cudagraph_mode={self.compilation_config.cudagraph_mode}")
+
+                # If CUDA graphs are disabled, try to activate immediately
                 if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-                    self.drafter.kv_router.transition_to_ready()
+                    self.drafter.kv_router.maybe_activate()
+                    if self.drafter.kv_router.is_ready():
+                        logger.info("NWOR: Activated immediately (no CUDA graphs)")
+                    else:
+                        logger.info("NWOR: Staying in WARMUP - KV cache not yet materialized")
+                else:
+                    logger.info("NWOR: Staying in WARMUP until capture completes")
                 from vllm.v1.kv_cache.router_registry import set_local_router
                 set_local_router(self.drafter.kv_router)
 
