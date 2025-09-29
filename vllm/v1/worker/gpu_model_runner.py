@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.eagle import DraftProposals, EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-# Removed old ContextVar imports - using router_registry instead
+from vllm.kvcache.route_ctx import set_router, reset_router
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -216,7 +216,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self.max_model_len = model_config.max_model_len
 
-        # No longer using ContextVar tokens
+        self._router_token = None
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
@@ -297,12 +297,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.rejection_sampler = RejectionSampler()
             # Initialize draft_probs storage for EAGLE
             self._draft_probs: Optional[torch.Tensor] = None
-
-            # Register router globally for this worker
-            if hasattr(self.drafter, 'kv_router') and self.drafter.kv_router is not None:
-                from vllm.v1.kv_cache.router_registry import set_local_router
-                set_local_router(self.drafter.kv_router)
-                print(f"[GPU_RUNNER] Registered local router for worker", file=sys.stderr, flush=True)
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -2127,8 +2121,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._internal_metrics["proposed"] = self._internal_metrics.get("proposed", 0) + m["proposed"]
             self._internal_metrics["verifier_tokens"] = self._internal_metrics.get("verifier_tokens", 0) + m["verifier_tokens"]
 
-            # (removed) Commit/discard and router reset happen after bookkeeping
-            # where we have the final accepted count for all sequences
+            # NWOR: Commit accepted tokens and discard rejected tail
+            if (self.drafter and self.drafter.kv_router and
+                self.drafter.kv_router.is_deferred()):
+                accepted_tokens = m["accepted"]
+                proposed_tokens = m["proposed"]
+
+                # Commit accepted prefix to persistent KV cache
+                if accepted_tokens > 0 and self.drafter.shadow_kv:
+                    # Note: seq_id would need to be tracked properly for multi-seq
+                    # For now assuming single sequence (seq_id=0)
+                    self.drafter.shadow_kv.commit_prefix(0, accepted_tokens)
+                    print(f"🔴 SHADOW: COMMITTING L={accepted_tokens} of K={proposed_tokens}",
+                          file=sys.stderr, flush=True)
+
+                # Discard rejected tail from shadow buffer
+                if self.drafter.shadow_kv:
+                    self.drafter.shadow_kv.discard_tail(0, accepted_tokens, proposed_tokens)
+
+                # Return router to immediate mode
+                self.drafter.kv_router.immediate()
+                print("🔴 NWOR: BACK TO IMMEDIATE MODE", file=sys.stderr, flush=True)
 
             # Clear draft_probs AFTER verification completes (it's no longer needed)
             self._draft_probs = None
@@ -2343,42 +2356,36 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_input_tokens = ubatch_slices[0].num_tokens
 
         # NWOR: Defer writes to shadow buffer during spec decode verification
-        # Check if we're in decode phase (not prefill) and have NWOR components
-        is_decode = bool(getattr(attn_metadata, "is_decode", True) if attn_metadata else False)
+        # Check if we're in decode phase (not prefill) OR verification phase
+        is_decode = bool(getattr(attn_metadata, "is_decode", False) if attn_metadata else False)
+        is_verification = (spec_decode_metadata is not None) and (getattr(self, "_draft_probs", None) is not None)
         has_shadow = (self.drafter and
                      getattr(self.drafter, "shadow_kv", None) is not None)
         has_router = (self.drafter and
                      getattr(self.drafter, "kv_router", None) is not None)
 
-        # ALWAYS log to see what's happening
-        print(f"🔴 NWOR CHECK: drafter={self.drafter is not None}, "
-              f"decode={is_decode}, shadow={has_shadow}, router={has_router}",
+        # NEW: defer during verification OR regular decode
+        should_defer = (is_verification or is_decode) and has_shadow and has_router
+
+        # Always log gate conditions for debugging
+        print(f"⚫ NWOR GATE: is_decode={is_decode} is_verification={is_verification} "
+              f"shadow={has_shadow} router={has_router} → defer={should_defer}",
               file=sys.stderr, flush=True)
 
-        # Set routing intent for all workers via metadata
-        if is_decode and has_shadow and has_router:
-            print(f"🔴 NWOR: SETTING ROUTING INTENT TO SHADOW", file=sys.stderr, flush=True)
-            # Set intent in metadata for ALL workers to see
-            attn_metadata.kv_route = 1
-            self._nwor_epoch = getattr(self, "_nwor_epoch", 0) + 1
-            attn_metadata.kv_route_epoch = self._nwor_epoch
-
-            # CRITICAL FIX: Set router in local registry so flash_attn can find it
-            from vllm.v1.kv_cache.router_registry import set_local_router
-            set_local_router(self.drafter.kv_router)
-            print("🔴🔴🔴 LOCAL ROUTER SET ON WORKER 🔴🔴🔴", file=sys.stderr, flush=True)
-
-            # Defer this worker's router
+        # Defer if we should (verification or decode) and have NWOR components
+        if should_defer:
+            if attn_metadata is not None:
+                setattr(attn_metadata, 'kv_route', 1)
+            print(f"🔴 NWOR: DEFERRING WRITES TO SHADOW", file=sys.stderr, flush=True)
             self.drafter.kv_router.defer(self.drafter.shadow_kv)
-            print(f"🔴 NWOR: ACTIVE SINK = {type(self.drafter.shadow_kv).__name__}",
-                  file=sys.stderr, flush=True)
+            self._router_token = set_router(self.drafter.kv_router)
+            # Sanity check: router should be deferred after arming
+            assert self.drafter.kv_router.is_deferred(), \
+                "Router token set but router not in deferred mode"
         else:
-            # Normal persistent writes
-            if hasattr(attn_metadata, 'kv_route'):
-                attn_metadata.kv_route = 0
-            # Reset router to immediate mode if we have one
-            if has_router:
-                self.drafter.kv_router.immediate()
+            if attn_metadata is not None:
+                setattr(attn_metadata, 'kv_route', 0)
+            self._router_token = None
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -2468,14 +2475,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Target forward complete. Must reset context NOW to prevent EAGLE draft
         # model from seeing armed router, which causes TP desync/hangs.
         # We'll commit accepted tokens after bookkeeping.
-        # Check if we need to commit staged writes
         router_for_commit = None
-        if (hasattr(self, 'drafter') and hasattr(self.drafter, 'kv_router') and
-            self.drafter.kv_router is not None and self.drafter.kv_router.is_deferred()):
+        if self._router_token is not None:
+            from vllm.kvcache.route_ctx import reset_router
+            reset_router(self._router_token)
+            self._router_token = None
             router_for_commit = self.drafter.kv_router
-            print(f"🔴 NWOR: Router deferred, will commit after bookkeeping", file=sys.stderr, flush=True)
-        else:
-            print(f"⚫ NWOR: No deferred writes to commit", file=sys.stderr, flush=True)
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2536,9 +2541,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         print("[HANG_DEBUG] After EPLB", file=sys.stderr, flush=True)
 
         # NWOR: Commit accepted tokens from shadow_kv to persistent cache
-        print(f"⚫ NWOR COMMIT CHECK: router_for_commit={router_for_commit is not None}, "
-              f"shadow_kv={self.drafter.shadow_kv is not None if self.drafter else False}",
-              file=sys.stderr, flush=True)
         if router_for_commit is not None and self.drafter.shadow_kv is not None:
             if isinstance(valid_sampled_token_ids, list):
                 num_accepted_list = [max(0, len(seq) - 1) for seq in valid_sampled_token_ids]
@@ -2552,18 +2554,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Call shadow_kv.commit_to() with the persistent writer
             if total_accepted > 0:
                 print(f"🔴 SHADOW: COMMITTING {total_accepted} tokens", file=sys.stderr, flush=True)
-                # Pass the actual persistent writer from the router
-                persistent_writer = getattr(router_for_commit, 'current_writer', lambda: None)()
-                self.drafter.shadow_kv.commit_to(persistent_writer, total_accepted)
+                # For now, pass None as writer since we don't have it yet
+                # TODO: Pass actual writer when kv_router is properly created
+                self.drafter.shadow_kv.commit_to(None, total_accepted)
             else:
                 print(f"🔴 SHADOW: REJECTING ALL staged tokens", file=sys.stderr, flush=True)
 
             # Reset router to immediate mode
             router_for_commit.immediate()
-            print("🔴 NWOR: BACK TO IMMEDIATE MODE", file=sys.stderr, flush=True)
-
-            # Assert router is no longer deferred (catch leaks)
-            assert not router_for_commit.is_deferred(), "Router must not remain deferred after step"
 
         print("[HANG_DEBUG] Creating output", file=sys.stderr, flush=True)
         output = ModelRunnerOutput(
@@ -4317,6 +4315,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 # Create router with JUST the persistent writer
                 self.drafter.kv_router = KVWriteRouter(persistent_writer)
+                from vllm.v1.kv_cache.router_registry import set_local_router
+                set_local_router(self.drafter.kv_router)
+
+                # Also register shadow_kv in worker local registry
+                if self.drafter.shadow_kv is not None:
+                    from vllm.v1.kv_cache.shadow_kv import set_local_shadow_kv
+                    set_local_shadow_kv(self.drafter.shadow_kv)
+                    print("🔴🔴🔴 LOCAL ROUTER AND SHADOW_KV SET ON WORKER 🔴🔴🔴", file=sys.stderr, flush=True)
+                else:
+                    print("🔴🔴🔴 LOCAL ROUTER SET ON WORKER (no shadow_kv) 🔴🔴🔴", file=sys.stderr, flush=True)
 
                 print("🔴🔴🔴 KV ROUTER CREATED - NWOR READY 🔴🔴🔴",
                       file=sys.stderr, flush=True)

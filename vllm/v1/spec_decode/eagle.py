@@ -202,6 +202,10 @@ class EagleProposer:
                 dtype=torch.float16,
             )
 
+            # Register shadow_kv in local registry for workers to find
+            from vllm.v1.kv_cache.shadow_kv import set_local_shadow_kv
+            set_local_shadow_kv(self.shadow_kv)
+
             # KV writer will be initialized when load_model is called
             # and we have access to the target model's KV cache
             self.kv_writer = None

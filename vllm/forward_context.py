@@ -326,10 +326,64 @@ def set_forward_context(
                                              cudagraph_runtime_mode,
                                              batch_descriptor, ubatch_slices)
 
+    # NWOR: Flip router state IN EACH WORKER based on metadata flag
+    _prev_deferred = None
+    _kv_router = None
     try:
+        # Check if we need to flip router state in this worker
+        if attn_metadata is not None and hasattr(attn_metadata, 'kv_route'):
+            kv_route = getattr(attn_metadata, 'kv_route', 0)
+            # Try to get local router
+            try:
+                from vllm.v1.kv_cache.router_registry import get_local_router
+                _kv_router = get_local_router()
+                if _kv_router is not None:
+                    _prev_deferred = _kv_router.is_deferred()
+                    if kv_route == 1:
+                        # Need shadow_kv for defer - try to get it
+                        try:
+                            from vllm.v1.kv_cache.shadow_kv import get_local_shadow_kv
+                            shadow_kv = get_local_shadow_kv()
+                            if shadow_kv is not None:
+                                _kv_router.defer(shadow_kv)
+                                import sys
+                                print(f"🔴 WORKER: Armed router for deferral (kv_route=1)",
+                                      file=sys.stderr, flush=True)
+                            else:
+                                print(f"⚫ WORKER: kv_route=1 but no shadow_kv",
+                                      file=sys.stderr, flush=True)
+                        except ImportError:
+                            # Fallback: defer without shadow_kv arg if method exists
+                            if hasattr(_kv_router, 'defer'):
+                                _kv_router.defer(None)
+                    else:
+                        _kv_router.immediate()
+                        import sys
+                        print(f"⚫ WORKER: Set router to immediate (kv_route=0)",
+                              file=sys.stderr, flush=True)
+            except ImportError:
+                pass  # No router registry available
+
         with override_forward_context(forward_context):
             yield
     finally:
+        # NWOR: Restore router state if we changed it
+        if _kv_router is not None and _prev_deferred is not None:
+            try:
+                if _prev_deferred:
+                    # Was deferred before, restore it
+                    from vllm.v1.kv_cache.shadow_kv import get_local_shadow_kv
+                    shadow_kv = get_local_shadow_kv()
+                    if shadow_kv is not None:
+                        _kv_router.defer(shadow_kv)
+                    elif hasattr(_kv_router, 'defer'):
+                        _kv_router.defer(None)
+                else:
+                    # Was immediate before, restore it
+                    _kv_router.immediate()
+            except ImportError:
+                pass  # Can't restore without imports
+
         global last_logging_time, batchsize_logging_interval
         if need_to_track_batchsize:
             if hasattr(attn_metadata, "num_prefill_tokens"):

@@ -509,24 +509,24 @@ class FlashAttentionImpl(AttentionImpl):
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
 
-            # NWOR: Check routing intent from metadata
+            # NWOR: Check router state directly (not metadata flag)
             slot_map = attn_metadata.slot_mapping
-            should_defer = getattr(attn_metadata, 'kv_route', 0) == 1
 
-            # Debug print to verify routing intent
-            print(f"[FLASH_ATTN] kv_route={getattr(attn_metadata, 'kv_route', 0)}, should_defer={should_defer}",
+            # Get the local router and check if it's in deferred mode
+            from vllm.v1.kv_cache.router_registry import get_local_router
+            router = get_local_router()
+            deferred = (router is not None and router.is_deferred())
+
+            # Debug print to verify routing state
+            print(f"[FLASH_ATTN] router exists={router is not None}, "
+                  f"is_deferred={router.is_deferred() if router else False} → defer={deferred}",
                   file=sys.stderr, flush=True)
 
-            # Get the local router for this worker
-            router = None
-            if should_defer:
-                from vllm.v1.kv_cache.router_registry import get_local_router
-                router = get_local_router()
-                print(f"[FLASH_ATTN] Got local router: {router is not None}, "
-                      f"is_deferred: {router.is_deferred() if router else 'N/A'}",
-                      file=sys.stderr, flush=True)
+            # Check if we should use deferred path
+            if deferred and slot_map is None:
+                print(f"⚫ NWOR FALLBACK: deferred but slot_map is None", file=sys.stderr, flush=True)
 
-            if not should_defer or router is None or slot_map is None:
+            if (not deferred) or (slot_map is None):
                 # Original direct write path (baseline)
                 reshape_and_cache_flash(
                     key,
@@ -546,8 +546,7 @@ class FlashAttentionImpl(AttentionImpl):
                 seg_lens = (qsl[1:] - qsl[:-1]).to(device="cpu", dtype=torch.int32)
                 T_total = key.size(0)
                 router.begin(T_total, slot_map.contiguous(), seg_lens)
-                # CRITICAL DEBUG: This proves we're in the deferred path
-                print(f"🔴 SHADOW: STAGING seq=unknown T_total={T_total}", file=sys.stderr, flush=True)
+                print(f"🔴 SHADOW: STAGING T_total={T_total}", file=sys.stderr, flush=True)
                 with nvtx.range("cache_stage_verify"):
                     key_c = key.contiguous()
                     value_c = value.contiguous()
@@ -846,3 +845,4 @@ def cascade_attention(
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output,
                       suffix_lse)
+

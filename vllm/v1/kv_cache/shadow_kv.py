@@ -10,6 +10,20 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+# Global registry for per-process shadow_kv instance
+_local_shadow_kv: Optional["ShadowKV"] = None
+
+
+def set_local_shadow_kv(shadow_kv: Optional["ShadowKV"]) -> None:
+    """Set the per-process local shadow_kv instance."""
+    global _local_shadow_kv
+    _local_shadow_kv = shadow_kv
+
+
+def get_local_shadow_kv() -> Optional["ShadowKV"]:
+    """Get the per-process local shadow_kv instance."""
+    return _local_shadow_kv
+
 
 class ShadowKV:
     """
