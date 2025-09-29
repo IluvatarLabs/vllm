@@ -73,13 +73,14 @@ class ShadowKV:
         self.device = device
         self.dtype = dtype
 
-        # Pre-allocate staging buffers for each layer (force real memory now)
+        # Pre-allocate staging buffers for each layer. During CUDA graph capture
+        # these may be lazy tensors; we will materialize them after warmup.
         self._K: List[torch.Tensor] = [
-            torch.zeros((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
+            torch.empty((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
             for _ in range(n_layers)
         ]
         self._V: List[torch.Tensor] = [
-            torch.zeros((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
+            torch.empty((max_chunk, n_heads, head_dim), device=device, dtype=dtype)
             for _ in range(n_layers)
         ]
 
@@ -88,6 +89,9 @@ class ShadowKV:
         self._slot_mappings: List[List[torch.Tensor]] = [
             [] for _ in range(n_layers)
         ]
+
+        # Track whether buffers have been materialized post-warmup.
+        self._materialized = False
 
         # Current staged length
         self._len = 0
@@ -121,6 +125,18 @@ class ShadowKV:
             layer_slots.clear()
 
         logger.debug("ShadowKV: Beginning staging for %d tokens", length_hint)
+
+    def materialize(self) -> None:
+        """Force real device buffers after CUDA graph warmup."""
+        if self._materialized:
+            return
+
+        shape = (self.max_chunk, self.n_heads, self.head_dim)
+        for idx in range(self.n_layers):
+            self._K[idx] = torch.zeros(shape, device=self.device, dtype=self.dtype)
+            self._V[idx] = torch.zeros(shape, device=self.device, dtype=self.dtype)
+
+        self._materialized = True
 
     @torch.no_grad()
     def stage(self,
@@ -275,7 +291,6 @@ class ShadowKV:
                 )
 
         # Update metrics
-        staged_tokens = self._len
         rejected = max(0, staged_tokens - accepted_len)
         self._total_committed += accepted_len
         if rejected:

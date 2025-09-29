@@ -394,6 +394,15 @@ class KVWriteRouter:
         self._state = KVWriteRouter.RouterState.READY
         self.immediate()
 
+        # Materialize ShadowKV buffers now that we're outside graph capture.
+        try:
+            from vllm.v1.kv_cache.shadow_kv import get_local_shadow_kv
+            shadow = get_local_shadow_kv()
+            if shadow is not None:
+                shadow.materialize()
+        except ImportError:
+            pass
+
     def disable(self) -> None:
         """Disable NWOR permanently (setup failed or feature not requested)."""
         self._state = KVWriteRouter.RouterState.DISABLED
