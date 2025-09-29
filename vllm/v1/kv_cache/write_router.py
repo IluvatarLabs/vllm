@@ -25,16 +25,47 @@ class PersistentKVWriter:
 
     def get_kv_cache_tensors(self, layer_idx: int):
         """Get key and value cache tensors for a specific layer."""
-        # Access the cache tensors from the manager
-        # The exact attribute depends on your v0.10.2 build
-        if hasattr(self.mgr, 'key_caches') and hasattr(self.mgr, 'value_caches'):
-            return self.mgr.key_caches[layer_idx], self.mgr.value_caches[layer_idx]
-        elif hasattr(self.mgr, 'kv_cache'):
+        mgr = self.mgr
+
+        # Modern path: engine hands us the runner's kv_caches list directly.
+        if isinstance(mgr, (list, tuple)):
+            kv_cache = mgr[layer_idx]
+
+            # Torch tensor packing keys/values along the first dimension.
+            if isinstance(kv_cache, torch.Tensor):
+                if kv_cache.dim() == 0:
+                    raise ValueError("KV cache tensor is scalar; expected stacked K/V tensors")
+
+                if kv_cache.shape[0] == 2:
+                    key_cache, value_cache = kv_cache.unbind(0)
+                    return key_cache, value_cache
+
+                # Fallback: split the leading dimension in half.
+                if kv_cache.shape[0] % 2 == 0:
+                    mid = kv_cache.shape[0] // 2
+                    return kv_cache[:mid], kv_cache[mid:]
+
+                raise ValueError(
+                    f"Unrecognized KV cache tensor layout for layer {layer_idx}: "
+                    f"shape={tuple(kv_cache.shape)}")
+
+            # Some builds may already expose (key, value) tuples/lists per layer.
+            if isinstance(kv_cache, (list, tuple)) and len(kv_cache) >= 2:
+                return kv_cache[0], kv_cache[1]
+
+            raise AttributeError(
+                f"Cannot interpret KV cache entry for layer {layer_idx}: "
+                f"type={type(kv_cache)}")
+
+        # Legacy paths: manager objects with explicit attributes.
+        if hasattr(mgr, 'key_caches') and hasattr(mgr, 'value_caches'):
+            return mgr.key_caches[layer_idx], mgr.value_caches[layer_idx]
+        if hasattr(mgr, 'kv_cache'):
             # Some builds use a combined structure
-            kv_cache = self.mgr.kv_cache[layer_idx]
+            kv_cache = mgr.kv_cache[layer_idx]
             return kv_cache[0], kv_cache[1]  # [key_cache, value_cache]
-        else:
-            raise AttributeError(f"Cannot find KV cache tensors in manager: {dir(self.mgr)}")
+
+        raise AttributeError(f"Cannot find KV cache tensors in manager: {dir(mgr)}")
 
     @torch.no_grad()
     def append_slice(self,
