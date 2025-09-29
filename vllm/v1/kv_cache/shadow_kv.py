@@ -122,6 +122,16 @@ class ShadowKV:
             v_slice: Value tensor [1, H, D]
             slot_mapping_1t: Slot mapping for this single timestep
         """
+        # Skip staging if slot_mapping is a FakeTensor (fallback path already wrote it)
+        try:
+            slot_mapping_1t.data_ptr()
+        except (RuntimeError, NotImplementedError) as exc:
+            msg = str(exc)
+            if "doesn't have storage" in msg or "meta tensor" in msg:
+                return
+            else:
+                raise
+
         # Handle both [1, H, D] and [H, D] shapes
         if k_slice.dim() == 2:
             k_slice = k_slice.unsqueeze(0)

@@ -542,6 +542,18 @@ class FlashAttentionImpl(AttentionImpl):
             if deferred and _shadowkv_guard_active():
                 deferred = False
 
+            # Skip staging if slot_mapping is a FakeTensor
+            if deferred and slot_map is not None:
+                try:
+                    slot_map.data_ptr()
+                except (RuntimeError, NotImplementedError) as exc:
+                    msg = str(exc)
+                    if "doesn't have storage" in msg or "meta tensor" in msg:
+                        deferred = False
+                        slot_map = None
+                    else:
+                        raise
+
             # Resolve cached index if needed
             if layer_idx is None and router is not None:
                 layer_idx = getattr(layer, "_nwor_layer_idx", None)
