@@ -230,13 +230,14 @@ class ShadowKV:
                     slot_mapping_run = slot_mapping_run.to(torch.int32)
 
                 # Commit to persistent cache
-                persistent_writer.append_run(
-                    layer_idx,
-                    K_accepted,
-                    V_accepted,
-                    slot_mapping_run
-                )
-            else:
+                if persistent_writer is not None:
+                    persistent_writer.append_run(
+                        layer_idx,
+                        K_accepted,
+                        V_accepted,
+                        slot_mapping_run
+                    )
+            elif persistent_writer is not None:
                 logger.warning(
                     "Missing slot mappings for layer %d, skipping commit",
                     layer_idx

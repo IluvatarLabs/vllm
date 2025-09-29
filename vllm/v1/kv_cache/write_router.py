@@ -322,8 +322,10 @@ class KVWriteRouter:
         Args:
             accepted_len: Number of accepted tokens to commit
         """
-        if self._mode == "defer" and self._shadow is not None:
-            self._shadow.commit_to(self._persistent, accepted_len)
+        if self._mode != "defer" or self._shadow is None:
+            return
+        writer = self._persistent if isinstance(self._persistent, PersistentKVWriter) else None
+        self._shadow.commit_to(writer, accepted_len)
 
     def get_persistent_writer(self):
         """Get the underlying persistent writer for direct access if needed."""
