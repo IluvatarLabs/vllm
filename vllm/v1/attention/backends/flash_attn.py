@@ -559,9 +559,7 @@ class FlashAttentionImpl(AttentionImpl):
                 seg_lens = (qsl[1:] - qsl[:-1]).to(device="cpu", dtype=torch.int32)
                 T_total = key.size(0)
                 router.begin(T_total, slot_map.contiguous(), seg_lens)
-                print(f"🔴 SHADOW: STAGING T_total={T_total}", file=sys.stderr, flush=True)
-                if layer_idx is None:
-                    raise RuntimeError("NWOR staging requires a valid layer index")
+                print(f"🔴 SHADOW: STAGING T_total={T_total}, layer_idx={layer_idx}", file=sys.stderr, flush=True)
                 with nvtx.range("cache_stage_verify"):
                     key_c = key.contiguous()
                     value_c = value.contiguous()
