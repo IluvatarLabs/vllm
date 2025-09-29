@@ -16,13 +16,34 @@ try:
 except Exception:  # pragma: no cover
     FakeTensor = ()
 
+# Import PyTorch's internal FakeTensor detection (PyTorch >= 2.1)
+try:
+    from torch._C import _is_fake_tensor as _torch_is_fake_tensor
+except Exception:
+    _torch_is_fake_tensor = None
+
+
+def _is_fake_tensor(t: torch.Tensor) -> bool:
+    """Detect FakeTensors using multiple methods for robustness."""
+    # Direct isinstance check
+    if isinstance(t, FakeTensor) or t.__class__.__name__ == "FakeTensor":
+        return True
+    # Use PyTorch's internal function if available
+    if _torch_is_fake_tensor is not None:
+        try:
+            if _torch_is_fake_tensor(t):
+                return True
+        except TypeError:
+            pass
+    return False
+
 
 def _tensor_has_storage(tensor: torch.Tensor) -> bool:
     """Return False for Fake/Meta tensors that can't expose a data pointer."""
     if not isinstance(tensor, torch.Tensor):
         return False
-    # Check for FakeTensor explicitly (some PyTorch versions don't raise on data_ptr())
-    if isinstance(tensor, FakeTensor):
+    # Check for FakeTensor using robust detection
+    if _is_fake_tensor(tensor):
         return False
     # Check for meta tensors
     if tensor.is_meta:
