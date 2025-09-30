@@ -133,6 +133,9 @@ class ShadowKV:
         self._total_rejected = 0
         self._debug_stage_calls = 0  # Track if staging is actually happening
 
+        # Track duplicate stages to debug inflation
+        self._stage_tracker = set()
+
         logger.info(
             "Initialized ShadowKV: %d layers, %d heads, %d head_dim, max_chunk=%d",
             n_layers, n_heads, head_dim, max_chunk
@@ -150,10 +153,19 @@ class ShadowKV:
             raise ValueError(
                 f"ShadowKV max_chunk={self.max_chunk}, got length_hint={length_hint}"
             )
+
+        # Warn if discarding staged data
+        if self._len > 0:
+            logger.warning("ShadowKV.begin(): discarding %d staged tokens", self._len)
+
         self._len = 0
         # Clear slot mappings from previous round
         for layer_slots in self._slot_mappings:
             layer_slots.clear()
+
+        # Clear duplicate tracker and reset staging flag
+        self._stage_tracker.clear()
+        self._staging_marked = False
 
         logger.debug("ShadowKV: Beginning staging for %d tokens", length_hint)
 
@@ -192,6 +204,16 @@ class ShadowKV:
             v_slice: Value tensor [1, H, D]
             slot_mapping_1t: Slot mapping for this single timestep
         """
+        # Bounds checking
+        if not (0 <= layer_idx < self.n_layers):
+            logger.error("ShadowKV.stage: layer_idx=%d out of bounds [0, %d)",
+                        layer_idx, self.n_layers)
+            return
+        if not (0 <= t < self.max_chunk):
+            logger.error("ShadowKV.stage: t=%d out of bounds [0, %d)",
+                        t, self.max_chunk)
+            return
+
         # Handle both [1, H, D] and [H, D] shapes
         if k_slice.dim() == 2:
             k_slice = k_slice.unsqueeze(0)
@@ -199,14 +221,14 @@ class ShadowKV:
             v_slice = v_slice.unsqueeze(0)
 
         # Emit STAGING marker on first write per step
-        if not getattr(self, "_staging_marked", False):
+        if not self._staging_marked:
             import sys
             print(f"🔴 SHADOW: STAGING layer={layer_idx} t={t}", file=sys.stderr, flush=True)
             self._staging_marked = True
 
         # Skip staging entirely if KV slices are still fake (e.g. during torch.compile capture).
         if not (_tensor_has_storage(k_slice) and _tensor_has_storage(v_slice)):
-            logger.info("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
+            logger.debug("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
                         layer_idx, t)
             return
 
@@ -227,6 +249,15 @@ class ShadowKV:
                 return
             raise
 
+        # Track duplicate stages for debugging
+        stage_key = (layer_idx, t)
+        if stage_key in self._stage_tracker:
+            logger.warning("DUPLICATE stage detected: layer=%d, t=%d", layer_idx, t)
+        else:
+            self._stage_tracker.add(stage_key)
+            # Only count unique stage operations
+            self._total_staged += 1
+
         # Append to this layer's slot mappings
         if len(self._slot_mappings[layer_idx]) <= t:
             # Extend list if needed
@@ -236,7 +267,6 @@ class ShadowKV:
         if t + 1 > self._len:
             self._len = t + 1
 
-        self._total_staged += 1
         self._debug_stage_calls += 1
         if self._debug_stage_calls == 1:
             print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
@@ -295,9 +325,17 @@ class ShadowKV:
 
             layer_slots = self._slot_mappings[layer_idx][:accepted_len]
 
-            if len(layer_slots) != accepted_len or not layer_slots or not all(s is not None for s in layer_slots):
+            # Check for None gaps from out-of-order staging
+            none_count = sum(1 for s in layer_slots if s is None)
+            if none_count > 0:
                 logger.warning(
-                    "ShadowKV: Missing slot mappings for layer %d (have %d, expected %d); skipping",
+                    "ShadowKV: layer %d has %d None gaps in slot mappings (out-of-order staging?); skipping",
+                    layer_idx, none_count)
+                continue
+
+            if len(layer_slots) != accepted_len:
+                logger.warning(
+                    "ShadowKV: layer %d has insufficient slot mappings (have %d, expected %d); skipping",
                     layer_idx, len(layer_slots), accepted_len)
                 continue
 
@@ -327,8 +365,20 @@ class ShadowKV:
                 continue
 
         # Update metrics based on successful layers
-        committed_tokens = (accepted_len * successful_commits) // self.n_layers if successful_commits else 0
-        rejected = staged_tokens - committed_tokens
+        # If ANY layers succeeded, we consider it a partial success
+        if successful_commits > 0:
+            # Log partial success if not all layers committed
+            if successful_commits < self.n_layers:
+                logger.warning("ShadowKV: Partial commit - only %d/%d layers succeeded for %d tokens",
+                              successful_commits, self.n_layers, accepted_len)
+            # Still count as committed if at least one layer succeeded
+            committed_tokens = accepted_len
+            rejected = staged_tokens - committed_tokens
+        else:
+            # Total failure - no layers succeeded
+            committed_tokens = 0
+            rejected = staged_tokens
+
         self._total_committed += committed_tokens
         if rejected > 0:
             self._total_rejected += rejected

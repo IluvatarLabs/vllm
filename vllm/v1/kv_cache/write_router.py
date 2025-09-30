@@ -501,8 +501,10 @@ class KVWriteRouter:
         """
         if self._mode == "defer" and self._shadow is not None:
             # Extract slot mapping for this specific timestep
-            if self._slot_mapping is not None and t < len(self._slot_mapping):
-                slot_t = self._slot_mapping[t:t+1].to(dtype=torch.int32)
+            if self._slot_mapping is not None and t < self._slot_mapping.size(0):
+                slot_t = self._slot_mapping[t:t+1]
+                if slot_t.dtype != torch.int32:
+                    slot_t = slot_t.to(dtype=torch.int32)
             else:
                 logger.debug("KVWriteRouter.stage: slot mapping missing for t=%d; using fallback", t)
                 slot_t = torch.tensor([t], dtype=torch.int32, device=k_slice.device)
@@ -511,8 +513,10 @@ class KVWriteRouter:
             self._shadow.stage(layer_idx, t, k_slice, v_slice, slot_t)
         elif self._mode == "immediate":
             # In immediate mode, write directly to persistent cache
-            if self._slot_mapping is not None:
-                slot_t = self._slot_mapping[t:t+1].to(dtype=torch.int32)
+            if self._slot_mapping is not None and t < self._slot_mapping.size(0):
+                slot_t = self._slot_mapping[t:t+1]
+                if slot_t.dtype != torch.int32:
+                    slot_t = slot_t.to(dtype=torch.int32)
             else:
                 slot_t = torch.tensor([t], dtype=torch.int32, device=k_slice.device)
             self._persistent.append_slice(layer_idx, k_slice, v_slice, slot_t)
