@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
 import gc
 import os
 import queue
@@ -353,11 +354,18 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def shutdown(self):
+        logger.info("DIAGNOSTIC: EngineCore.shutdown() starting")
+        logger.info("DIAGNOSTIC: Clearing structured output backend")
         self.structured_output_manager.clear_backend()
         if self.model_executor:
+            logger.info("DIAGNOSTIC: Shutting down model executor")
             self.model_executor.shutdown()
+            logger.info("DIAGNOSTIC: Model executor shutdown complete")
         if self.scheduler:
+            logger.info("DIAGNOSTIC: Shutting down scheduler")
             self.scheduler.shutdown()
+            logger.info("DIAGNOSTIC: Scheduler shutdown complete")
+        logger.info("DIAGNOSTIC: EngineCore.shutdown() complete")
 
     def profile(self, is_start: bool = True):
         self.model_executor.profile(is_start)
@@ -535,6 +543,9 @@ class EngineCoreProc(EngineCore):
 
         # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
+
+        # DIAGNOSTIC: Register atexit handler to track process exit
+        atexit.register(lambda: logger.info("DIAGNOSTIC: EngineCore process exiting via atexit"))
 
     @contextmanager
     def _perform_handshakes(
@@ -993,9 +1004,14 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
 
     def shutdown(self):
+        logger.info("DIAGNOSTIC: EngineCoreProc.shutdown() starting")
         super().shutdown()
+        logger.info("DIAGNOSTIC: EngineCoreProc super shutdown complete")
         if dp_group := getattr(self, "dp_group", None):
+            logger.info("DIAGNOSTIC: Destroying torch distributed process group")
             stateless_destroy_torch_distributed_process_group(dp_group)
+            logger.info("DIAGNOSTIC: Process group destroyed")
+        logger.info("DIAGNOSTIC: EngineCoreProc.shutdown() complete")
 
     def add_request(self, request: Request, request_wave: int = 0):
         if self.has_coordinator and request_wave != self.current_wave:
@@ -1228,12 +1244,16 @@ class DPEngineCoreActor(DPEngineCoreProc):
         Run the engine core busy loop.
         """
         try:
+            logger.info("DIAGNOSTIC: EngineCore entering busy loop")
             self.run_busy_loop()
         except SystemExit:
-            logger.debug("EngineCore exiting.")
+            logger.info("DIAGNOSTIC: EngineCore exiting via SystemExit")
             raise
-        except Exception:
+        except Exception as e:
+            logger.info(f"DIAGNOSTIC: EngineCore exception: {type(e).__name__}: {e}")
             logger.exception("EngineCore encountered a fatal error.")
             raise
         finally:
+            logger.info("DIAGNOSTIC: EngineCore entering clean shutdown (finally block)")
             self.shutdown()
+            logger.info("DIAGNOSTIC: EngineCore shutdown complete")

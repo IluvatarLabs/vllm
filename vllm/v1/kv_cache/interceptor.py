@@ -258,6 +258,15 @@ class StagingBuffer:
         logger.debug(f"Successfully committed {accepted_len} tokens across {len(self.layer_refs)} layers")
         return accepted_len  # All layers succeeded
 
+    def __del__(self):
+        """DIAGNOSTIC: Track buffer destruction."""
+        try:
+            logger.info(f"DIAGNOSTIC: StagingBuffer.__del__() called - stage_count={getattr(self, 'stage_count', 'unknown')}, "
+                       f"token_mask_sum={getattr(self, 'token_mask', torch.tensor([])).sum().item() if hasattr(self, 'token_mask') else 'unknown'}")
+        except Exception as e:
+            # Don't let __del__ errors propagate
+            logger.error(f"DIAGNOSTIC: Error in StagingBuffer.__del__(): {e}")
+
 
 class KVCacheInterceptor:
     """
@@ -351,7 +360,7 @@ class KVCacheInterceptor:
         if self.buffer is not None:
             self.buffer.reset()
         self.current_layer_idx = -1  # Reset layer counter for new window
-        logger.debug(f"NWOR: Staging enabled for {num_tokens} tokens")
+        logger.info(f"NWOR: Staging mode ENABLED for {num_tokens} tokens (buffer will be created on first write)")
         return True
 
     def write(self,
@@ -392,6 +401,7 @@ class KVCacheInterceptor:
             return
 
         if self.mode == "staging":
+            logger.debug(f"NWOR: write() in staging mode - token_idx={token_idx}, buffer_exists={self.buffer is not None}")
             # Lazy buffer creation: allocate on first real KV write
             if self.buffer is None:
                 logger.info(f"NWOR: Creating staging buffer with dtype={key.dtype}, device={key.device}")
@@ -466,6 +476,7 @@ class KVCacheInterceptor:
 
     def disable_staging(self):
         """Return to direct write mode."""
+        logger.info(f"NWOR: Disabling staging mode (was in mode={self.mode}, buffer={self.buffer is not None})")
         self.mode = "direct"
         if self.buffer:
             self.buffer.reset()
@@ -484,3 +495,13 @@ class KVCacheInterceptor:
             "nwor_unique_tokens": self.buffer.unique_tokens() if self.buffer else 0,
             "nwor_stage_operations": self.buffer.stage_count if self.buffer else 0
         }
+
+    def __del__(self):
+        """DIAGNOSTIC: Track interceptor destruction."""
+        try:
+            logger.info(f"DIAGNOSTIC: KVCacheInterceptor.__del__() called - mode={getattr(self, 'mode', 'unknown')}, "
+                       f"buffer={getattr(self, 'buffer', None) is not None}, "
+                       f"ready={getattr(self, 'ready', 'unknown')}")
+        except Exception as e:
+            # Don't let __del__ errors propagate
+            logger.error(f"DIAGNOSTIC: Error in KVCacheInterceptor.__del__(): {e}")

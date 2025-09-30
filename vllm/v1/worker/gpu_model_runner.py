@@ -2133,14 +2133,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # NWOR commit: flush accepted tokens to persistent KV cache
             interceptor = get_global_interceptor()
-            if interceptor is not None and interceptor.mode == "staging":
-                # Get true acceptance metrics from rejection sampler
-                # (accepted = draft tokens before first rejection, NOT including recovered/bonus)
-                accepted_len = self.rejection_sampler.last_accepted_count
-                proposed_len = self.rejection_sampler.last_proposed_count
+            if interceptor is not None:
+                logger.info(f"NWOR: Commit check - mode={interceptor.mode}, buffer={interceptor.buffer is not None}")
+                if interceptor.mode == "staging":
+                    # Get true acceptance metrics from rejection sampler
+                    # (accepted = draft tokens before first rejection, NOT including recovered/bonus)
+                    accepted_len = self.rejection_sampler.last_accepted_count
+                    proposed_len = self.rejection_sampler.last_proposed_count
+                    logger.info(f"NWOR: Committing - accepted={accepted_len}, proposed={proposed_len}")
 
-                # Commit staged KV writes (or discard if rejected)
-                interceptor.commit_window(accepted_len, proposed_len)
+                    # Commit staged KV writes (or discard if rejected)
+                    interceptor.commit_window(accepted_len, proposed_len)
 
         return sampler_output
 
@@ -2379,13 +2382,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # NWOR lifecycle: Enable staging once for speculative decode window
         interceptor = get_global_interceptor()
-        if interceptor and spec_decode_metadata is not None:
-            # Calculate total draft tokens across the batch
-            total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
-            if total_draft_tokens > 0:
-                # Enable staging once at runner level (not per-layer)
-                # Buffer created lazily on first write() with real KV dtype/device
-                interceptor.enable_staging(total_draft_tokens)
+        if interceptor:
+            if spec_decode_metadata is not None:
+                # Calculate total draft tokens across the batch
+                total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+                logger.info(f"NWOR: spec_decode_metadata present, total_draft_tokens={total_draft_tokens}, "
+                           f"batch_size={len(spec_decode_metadata.num_draft_tokens)}")
+                if total_draft_tokens > 0:
+                    # Enable staging once at runner level (not per-layer)
+                    # Buffer created lazily on first write() with real KV dtype/device
+                    logger.info(f"NWOR: Calling enable_staging with {total_draft_tokens} tokens")
+                    interceptor.enable_staging(total_draft_tokens)
+                else:
+                    logger.info(f"NWOR: No draft tokens to stage (total_draft_tokens=0)")
+            else:
+                logger.debug(f"NWOR: spec_decode_metadata is None (no speculation this batch)")
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
