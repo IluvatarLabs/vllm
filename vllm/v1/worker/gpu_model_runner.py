@@ -2381,7 +2381,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_input_tokens = ubatch_slices[0].num_tokens
 
         # NWOR lifecycle: Enable staging once for speculative decode window
+        # FIX Bug #3: Use try-finally to ensure staging is disabled on error
         interceptor = get_global_interceptor()
+        nwor_staging_enabled = False
         if interceptor:
             if spec_decode_metadata is not None:
                 # Calculate total draft tokens across the batch
@@ -2392,173 +2394,181 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # Enable staging once at runner level (not per-layer)
                     # Buffer created lazily on first write() with real KV dtype/device
                     logger.info(f"NWOR: Calling enable_staging with {total_draft_tokens} tokens")
-                    interceptor.enable_staging(total_draft_tokens)
+                    nwor_staging_enabled = interceptor.enable_staging(total_draft_tokens)
                 else:
                     logger.info(f"NWOR: No draft tokens to stage (total_draft_tokens=0)")
             else:
                 logger.debug(f"NWOR: spec_decode_metadata is None (no speculation this batch)")
 
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        with (set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
-        ), record_function_or_nullcontext("Forward"),
-              self.maybe_get_kv_connector_output(scheduler_output) as
-              kv_connector_output):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-
-        with record_function_or_nullcontext("Postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
-
-            if not self.broadcast_pp_output:
-                # Common case.
-                if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
-                    assert isinstance(hidden_states, IntermediateTensors)
-                    hidden_states.kv_connector_output = kv_connector_output
-                    return hidden_states
-
-                if self.is_pooling_model:
-                    # Return the pooling output.
-                    output = self._pool(hidden_states, num_scheduled_tokens,
-                                        num_scheduled_tokens_np)
-                    output.kv_connector_output = kv_connector_output
-                    return output
-
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
-            else:
-                # Rare case.
-                assert not self.is_pooling_model
-
-                if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual":
-                        not is_residual_scattered_for_sp(
-                            self.vllm_config, num_input_tokens)
-                    }
-                    get_pp_group().send_tensor_dict(
-                        hidden_states.tensors,
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors)
-                    logits = None
+        try:
+            # Run the model (wrapped in try-finally to ensure staging cleanup)
+            # Use persistent buffers for CUDA graphs.
+            with (set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_input_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_descriptor,
+                    ubatch_slices=ubatch_slices,
+                ), record_function_or_nullcontext("Forward"),
+                    self.maybe_get_kv_connector_output(scheduler_output) as
+                    kv_connector_output):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+    
+            with record_function_or_nullcontext("Postprocess"):
+                if self.use_aux_hidden_state_outputs:
+                    # True when EAGLE 3 is used.
+                    hidden_states, aux_hidden_states = model_output
                 else:
+                    # Common case.
+                    hidden_states = model_output
+                    aux_hidden_states = None
+    
+                if not self.broadcast_pp_output:
+                    # Common case.
+                    if not get_pp_group().is_last_rank:
+                        # Return the intermediate tensors.
+                        assert isinstance(hidden_states, IntermediateTensors)
+                        hidden_states.kv_connector_output = kv_connector_output
+                        return hidden_states
+    
+                    if self.is_pooling_model:
+                        # Return the pooling output.
+                        output = self._pool(hidden_states, num_scheduled_tokens,
+                                            num_scheduled_tokens_np)
+                        output.kv_connector_output = kv_connector_output
+                        return output
+    
                     sample_hidden_states = hidden_states[logits_indices]
                     logits = self.model.compute_logits(sample_hidden_states)
-
-                model_output_broadcast_data = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
-
-                model_output_broadcast_data = get_pp_group(
-                ).broadcast_tensor_dict(model_output_broadcast_data,
-                                        src=len(get_pp_group().ranks) - 1)
-                assert model_output_broadcast_data is not None
-                logits = model_output_broadcast_data["logits"]
-
-            # Apply structured output bitmasks if present
-            if scheduler_output.grammar_bitmask is not None:
-                apply_grammar_bitmask(scheduler_output, self.input_batch,
-                                      logits, self.device)
-
-        with record_function_or_nullcontext("Sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
-
-        def propose_draft_token_ids(sampled_token_ids):
-            assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("Draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                )
-
-        use_padded_batch_for_eagle = self.speculative_config and \
-            self.speculative_config.use_eagle() and \
-            not self.speculative_config.disable_padded_drafter_batch
-        effective_drafter_max_model_len = self.max_model_len
-        if effective_drafter_max_model_len is None:
-            effective_drafter_max_model_len = self.model_config.max_model_len
-        if (self.speculative_config
-                and self.speculative_config.draft_model_config is not None
-                and self.speculative_config.draft_model_config.max_model_len
-                is not None):
-            effective_drafter_max_model_len = (
-                self.speculative_config.draft_model_config.max_model_len)
-        input_fits_in_drafter = spec_decode_common_attn_metadata and (
-            spec_decode_common_attn_metadata.seq_lens.max() +
-            self.speculative_config.num_speculative_tokens
-            <= effective_drafter_max_model_len)
-        if use_padded_batch_for_eagle and input_fits_in_drafter:
-            # EAGLE speculative decoding can use the GPU sampled tokens
-            # as inputs, and does not need to wait for bookkeeping to finish.
-            propose_draft_token_ids(sampler_output.sampled_token_ids)
-
-        with record_function_or_nullcontext("Bookkeep"):
-            (
-                num_nans_in_logits,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
-            ) = self._bookkeeping_sync(scheduler_output, sampler_output,
-                                       logits, hidden_states,
-                                       num_scheduled_tokens)
-
-        if (self.speculative_config and not use_padded_batch_for_eagle
-                and input_fits_in_drafter):
-            # ngram and other speculative decoding methods use the sampled
-            # tokens on the CPU, so they are run after bookkeeping.
-            propose_draft_token_ids(valid_sampled_token_ids)
-
-        with record_function_or_nullcontext("EPLB"):
-            self.eplb_step()
-
-        output = ModelRunnerOutput(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=[],
-            kv_connector_output=kv_connector_output,
-            num_nans_in_logits=num_nans_in_logits,
-        )
-
-        if not self.use_async_scheduling:
-            return output
-
-        return AsyncGPUModelRunnerOutput(
-            model_runner_output=output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-        )
+                else:
+                    # Rare case.
+                    assert not self.is_pooling_model
+    
+                    if not get_pp_group().is_last_rank:
+                        all_gather_tensors = {
+                            "residual":
+                            not is_residual_scattered_for_sp(
+                                self.vllm_config, num_input_tokens)
+                        }
+                        get_pp_group().send_tensor_dict(
+                            hidden_states.tensors,
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors)
+                        logits = None
+                    else:
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = self.model.compute_logits(sample_hidden_states)
+    
+                    model_output_broadcast_data = {}
+                    if logits is not None:
+                        model_output_broadcast_data["logits"] = logits.contiguous()
+    
+                    model_output_broadcast_data = get_pp_group(
+                    ).broadcast_tensor_dict(model_output_broadcast_data,
+                                            src=len(get_pp_group().ranks) - 1)
+                    assert model_output_broadcast_data is not None
+                    logits = model_output_broadcast_data["logits"]
+    
+                # Apply structured output bitmasks if present
+                if scheduler_output.grammar_bitmask is not None:
+                    apply_grammar_bitmask(scheduler_output, self.input_batch,
+                                          logits, self.device)
+    
+            with record_function_or_nullcontext("Sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
+    
+            def propose_draft_token_ids(sampled_token_ids):
+                assert spec_decode_common_attn_metadata is not None
+                with record_function_or_nullcontext("Draft"):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                    )
+    
+            use_padded_batch_for_eagle = self.speculative_config and \
+                self.speculative_config.use_eagle() and \
+                not self.speculative_config.disable_padded_drafter_batch
+            effective_drafter_max_model_len = self.max_model_len
+            if effective_drafter_max_model_len is None:
+                effective_drafter_max_model_len = self.model_config.max_model_len
+            if (self.speculative_config
+                    and self.speculative_config.draft_model_config is not None
+                    and self.speculative_config.draft_model_config.max_model_len
+                    is not None):
+                effective_drafter_max_model_len = (
+                    self.speculative_config.draft_model_config.max_model_len)
+            input_fits_in_drafter = spec_decode_common_attn_metadata and (
+                spec_decode_common_attn_metadata.seq_lens.max() +
+                self.speculative_config.num_speculative_tokens
+                <= effective_drafter_max_model_len)
+            if use_padded_batch_for_eagle and input_fits_in_drafter:
+                # EAGLE speculative decoding can use the GPU sampled tokens
+                # as inputs, and does not need to wait for bookkeeping to finish.
+                propose_draft_token_ids(sampler_output.sampled_token_ids)
+    
+            with record_function_or_nullcontext("Bookkeep"):
+                (
+                    num_nans_in_logits,
+                    logprobs_lists,
+                    valid_sampled_token_ids,
+                    prompt_logprobs_dict,
+                    req_ids_output_copy,
+                    req_id_to_index_output_copy,
+                    invalid_req_indices,
+                ) = self._bookkeeping_sync(scheduler_output, sampler_output,
+                                           logits, hidden_states,
+                                           num_scheduled_tokens)
+    
+            if (self.speculative_config and not use_padded_batch_for_eagle
+                    and input_fits_in_drafter):
+                # ngram and other speculative decoding methods use the sampled
+                # tokens on the CPU, so they are run after bookkeeping.
+                propose_draft_token_ids(valid_sampled_token_ids)
+    
+            with record_function_or_nullcontext("EPLB"):
+                self.eplb_step()
+    
+            output = ModelRunnerOutput(
+                req_ids=req_ids_output_copy,
+                req_id_to_index=req_id_to_index_output_copy,
+                sampled_token_ids=valid_sampled_token_ids,
+                logprobs=logprobs_lists,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                kv_connector_output=kv_connector_output,
+                num_nans_in_logits=num_nans_in_logits,
+            )
+    
+            if not self.use_async_scheduling:
+                return output
+    
+            return AsyncGPUModelRunnerOutput(
+                model_runner_output=output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+            )
+        finally:
+            # FIX Bug #3: Ensure staging mode is disabled even if error occurs
+            # If commit_window() was called, it already disabled staging
+            # If error occurred before commit, we need to disable here
+            if nwor_staging_enabled and interceptor and interceptor.mode == "staging":
+                logger.warning("NWOR: Disabling staging due to error before commit")
+                interceptor.disable_staging()
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
@@ -4116,6 +4126,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     " the softmax lse for decode, but the impl "
                     f"{layer.impl.__class__.__name__} "
                     "does not return the softmax lse for decode.")
+
+        # FIX Bug #1: Initialize NWOR interceptor after KV cache allocation
+        # At this point, all KV cache tensors are real (not fake/warmup tensors)
+        interceptor = get_global_interceptor()
+        if interceptor:
+            # Use representative cache tensor to check if ready
+            if self.kv_caches:
+                key_cache, value_cache = self.kv_caches[0].unbind(0)
+                interceptor.ensure_ready(key_cache, value_cache)
+
+            if not interceptor.ready:
+                logger.warning(
+                    "NWOR Interceptor failed to become ready after "
+                    "KV cache initialization. NWOR will be disabled.")
+            else:
+                logger.info("NWOR Interceptor ready after KV cache initialization")
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """
