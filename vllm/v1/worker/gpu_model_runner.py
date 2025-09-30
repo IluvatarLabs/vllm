@@ -74,6 +74,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 # yapf conflicts with isort for this block
 # yapf: disable
+from vllm.v1.kv_cache.interceptor import get_global_interceptor
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         ChunkedLocalAttentionSpec,
                                         CrossAttentionSpec,
@@ -2130,22 +2131,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampler_output.sampled_token_ids = output_token_ids
             self._update_states_after_model_execute(output_token_ids)
 
-            # TODO: CRITICAL - Add NWOR commit call here (Bug #2)
-            # This is where accepted_len is known from rejection sampler.
-            # Need to:
-            # 1. Get interceptor: interceptor = get_global_interceptor()
-            # 2. Get accepted length: accepted_len = len(output_token_ids)
-            # 3. Import fa_utils: from vllm.attention.utils import fa_utils
-            # 4. Get kv_cache_dtype (need to store during staging or get from config)
-            # 5. Call: interceptor.commit(accepted_len, fa_utils, kv_cache_dtype)
-            #
-            # Note: Cache refs are already stored in interceptor during staging,
-            # so we don't need to pass them explicitly.
-            #
-            # Blocker: Need kv_cache_dtype value. Options:
-            #   - Store in interceptor during first write
-            #   - Get from model config
-            #   - Pass through spec_decode_metadata
+            # NWOR commit: flush accepted tokens to persistent KV cache
+            interceptor = get_global_interceptor()
+            if interceptor is not None and interceptor.mode == "staging":
+                # Calculate total proposed tokens across batch
+                proposed_len = sum(spec_decode_metadata.num_draft_tokens)
+
+                # Count accepted tokens (non-placeholder tokens in output)
+                # output_token_ids shape: [batch_size, max_spec_len + 1]
+                # PLACEHOLDER_TOKEN_ID = -1 from rejection_sampler.py
+                PLACEHOLDER_TOKEN_ID = -1
+                accepted_len = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item()
+
+                # Commit staged KV writes (or discard if rejected)
+                interceptor.commit_window(accepted_len, proposed_len)
 
         return sampler_output
 
