@@ -206,8 +206,8 @@ class ShadowKV:
 
         # Skip staging entirely if KV slices are still fake (e.g. during torch.compile capture).
         if not (_tensor_has_storage(k_slice) and _tensor_has_storage(v_slice)):
-            logger.debug("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
-                         layer_idx, t)
+            logger.info("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
+                        layer_idx, t)
             return
 
         # Copy KV to staging buffer now that the slices are confirmed real
