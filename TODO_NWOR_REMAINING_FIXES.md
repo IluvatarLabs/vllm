@@ -1,11 +1,13 @@
 # NWOR Remaining Fixes - TODO
 
-## Status: Partially Fixed
+## Status: Mostly Fixed
 
-### ✅ Fixed (Bugs #1, #4, #9)
-1. **Config introspection** - Now uses vLLM helpers (TP-aware)
-2. **UnboundLocalError** - is_speculation defined before conditional
-3. **Buffer reset logic** - No longer clears token_mask between layers
+### ✅ Fixed (Bugs #1, #3, #4, #5, #6, #9)
+1. **Config introspection** (Bug #9) - Now uses vLLM helpers (TP-aware)
+2. **UnboundLocalError** (Bug #1) - is_speculation defined before conditional
+3. **Buffer reset logic** (Bug #6) - No longer clears token_mask between layers
+4. **Layer index tracking** (Bug #3) - Auto-detects layer from token_idx pattern
+5. **Per-layer cache handling** (Bug #5) - Stores and uses correct cache per layer
 
 ### ❌ Remaining Critical Issues
 
@@ -48,69 +50,6 @@ if interceptor and interceptor.mode == "staging":
 3. **Add callback** mechanism from sampler to attention backend
 
 **Recommended**: Solution #1 (store cache refs during staging) is simplest for now.
-
----
-
-## Bug #3: layer_idx Always 0 (CRITICAL)
-
-**Location**: `flash_attn.py:543`
-
-**Problem**: All layers write to buffer index 0, overwriting each other.
-
-**Current code**:
-```python
-layer_idx = getattr(layer, 'layer_idx', 0)  # Always returns 0!
-```
-
-**Solutions**:
-1. **During backend construction**: Iterate through `layer_names`, store mapping
-   ```python
-   # In FlashAttentionMetadataBuilder.__init__
-   self.layer_name_to_idx = {name: idx for idx, name in enumerate(layer_names)}
-   ```
-
-2. **Global counter in interceptor**: Track which layer is currently executing
-   ```python
-   # In interceptor
-   self.current_layer_idx = 0
-
-   def next_layer(self):
-       idx = self.current_layer_idx
-       self.current_layer_idx = (self.current_layer_idx + 1) % self.n_layers
-       return idx
-   ```
-
-3. **Add layer_idx to Attention modules**: Modify vLLM's Attention class to include index
-
-**Recommended**: Solution #2 (global counter) is least invasive.
-
----
-
-## Bug #5: Commit Uses Same Cache for All Layers (CRITICAL)
-
-**Location**: `interceptor.py:196-211`
-
-**Problem**: commit() loops over all layers but uses the same key_cache/value_cache for each.
-
-**Current code**:
-```python
-for layer_idx in range(self.n_layers):
-    kv_cache_ops.reshape_and_cache_flash(
-        k_accepted, v_accepted,
-        key_cache, value_cache,  # SAME for all layers!
-        slots, ...
-    )
-```
-
-**Solution**: Pass entire kv_cache structure and index into it:
-```python
-def commit(self, accepted_len: int, kv_cache_ops, kv_caches_all_layers, ...):
-    for layer_idx in range(self.n_layers):
-        key_cache, value_cache = kv_caches_all_layers[layer_idx].unbind(0)
-        kv_cache_ops.reshape_and_cache_flash(...)
-```
-
-**Challenge**: Need to capture kv_caches for all layers during forward().
 
 ---
 
@@ -169,14 +108,16 @@ Need hooks in scheduler/model runner:
 
 ## Implementation Priority
 
-1. **Layer index tracking** (Bug #3) - Enables proper staging
-2. **Store cache refs** - Enables commit to work
-3. **Add commit call** (Bug #2) - Core functionality
-4. **Fix per-layer caches** (Bug #5) - Correctness
-5. **Speculation detection** (Bug #7) - Prevents false activation
-6. **Full scheduler integration** (Bug #8) - Proper lifecycle
+✅ ~~**Layer index tracking** (Bug #3)~~ - FIXED
+✅ ~~**Store cache refs** (Bug #5)~~ - FIXED
+1. **Add commit call** (Bug #2) - Core functionality (NEXT)
+2. **Speculation detection** (Bug #7) - Prevents false activation
+3. **Full scheduler integration** (Bug #8) - Proper lifecycle
 
-**Estimated effort**: 4-6 hours for items 1-4, 2-3 days for item 6 (full integration).
+**Estimated effort**:
+- Bug #2: 2-3 hours (need to find where accepted_len is available)
+- Bug #7: 30 min (change detection logic)
+- Bug #8: 2-3 days (full integration with scheduler)
 
 ---
 
