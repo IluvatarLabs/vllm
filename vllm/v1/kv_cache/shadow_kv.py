@@ -236,12 +236,13 @@ class ShadowKV:
         if t + 1 > self._len:
             self._len = t + 1
 
-        self._total_staged += 1
-        self._debug_stage_calls += 1
-        if self._debug_stage_calls == 1:
-            print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
-                  file=sys.stderr, flush=True)
-            logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
+        if layer_idx == 0:
+            self._total_staged += 1
+            self._debug_stage_calls += 1
+            if self._debug_stage_calls == 1:
+                print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
+                      file=sys.stderr, flush=True)
+                logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
 
     @torch.no_grad()
     def commit_to(self, persistent_writer, accepted_len: int):
