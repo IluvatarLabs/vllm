@@ -30,6 +30,8 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               CommonAttentionMetadata,
                                               get_kv_cache_layout)
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache.interceptor import (KVCacheInterceptor, has_real_storage,
+                                           get_global_interceptor, set_global_interceptor)
 
 logger = init_logger(__name__)
 
@@ -180,6 +182,12 @@ class FlashAttentionMetadataBuilder(
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
+
+        # Initialize NWOR interceptor (singleton for all attention layers)
+        if get_global_interceptor() is None:
+            interceptor = KVCacheInterceptor(vllm_config)
+            set_global_interceptor(interceptor)
+            logger.info("FlashAttentionMetadataBuilder: NWOR interceptor initialized")
 
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config)
@@ -494,16 +502,63 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+
+            # NWOR interception point
+            interceptor = get_global_interceptor()
+            if interceptor and interceptor.nwor_enabled:
+                # Ensure KV cache has real storage (post-warmup check)
+                interceptor.ensure_ready(key_cache, value_cache)
+
+                # Detect speculation phase
+                # TODO: Add proper speculation detection logic here
+                # For now, we'll check if we have multiple tokens (speculation window)
+                num_tokens = attn_metadata.slot_mapping.shape[0]
+                is_speculation = num_tokens > 1  # Simple heuristic for now
+
+                if is_speculation:
+                    # Try to enable staging for this speculation window
+                    device = key.device
+                    dtype = key.dtype
+                    if interceptor.enable_staging(num_tokens, str(device), dtype):
+                        # Import the module that has reshape_and_cache_flash
+                        from vllm.attention.utils import fa_utils
+
+                        # Route through interceptor for staging
+                        for token_idx in range(num_tokens):
+                            slot = attn_metadata.slot_mapping[token_idx:token_idx+1]
+                            # TODO: Get actual layer index from layer object
+                            layer_idx = getattr(layer, 'layer_idx', 0)
+                            interceptor.write(
+                                layer_idx, token_idx,
+                                key[token_idx:token_idx+1],
+                                value[token_idx:token_idx+1],
+                                slot,
+                                fa_utils,  # Module with reshape_and_cache_flash
+                                key_cache, value_cache,
+                                self.kv_cache_dtype,
+                                layer._k_scale, layer._v_scale
+                            )
+                    else:
+                        # Staging not enabled, fall through to direct write
+                        pass
+                else:
+                    # Not speculation, fall through to direct write
+                    pass
+
+            # Check if we already handled via interceptor
+            if not (interceptor and interceptor.nwor_enabled and is_speculation
+                    and interceptor.mode == "staging"):
+                # Default path: direct KV cache write
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
