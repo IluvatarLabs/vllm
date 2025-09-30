@@ -165,8 +165,9 @@ class StagingBuffer:
         self.token_mask[token_idx] = True
         self.stage_count += 1
 
-    def commit(self, accepted_len: int, kv_cache_ops, key_cache: Tensor,
-               value_cache: Tensor, kv_cache_dtype: str,
+    def commit(self, accepted_len: int, kv_cache_ops,
+               layer_caches: dict[int, tuple[Tensor, Tensor]],
+               kv_cache_dtype: str,
                k_scale: Optional[float] = None,
                v_scale: Optional[float] = None) -> int:
         """
@@ -175,8 +176,7 @@ class StagingBuffer:
         Args:
             accepted_len: Number of accepted tokens
             kv_cache_ops: Module with reshape_and_cache_flash function
-            key_cache: Real key cache tensor
-            value_cache: Real value cache tensor
+            layer_caches: Dict mapping layer_idx -> (key_cache, value_cache)
             kv_cache_dtype: Cache data type
             k_scale: Optional key quantization scale
             v_scale: Optional value quantization scale
@@ -194,6 +194,13 @@ class StagingBuffer:
 
         # All-or-nothing commit: try all layers, fail if any fails
         for layer_idx in range(self.n_layers):
+            # Get the correct cache for this layer
+            if layer_idx not in layer_caches:
+                logger.error(f"Missing cache reference for layer {layer_idx}")
+                return 0  # Reject if we don't have all layer caches
+
+            key_cache, value_cache = layer_caches[layer_idx]
+
             try:
                 k_accepted = self.k_buffer[layer_idx, :accepted_len].contiguous()
                 v_accepted = self.v_buffer[layer_idx, :accepted_len].contiguous()
@@ -262,6 +269,15 @@ class KVCacheInterceptor:
         self.total_rejected = 0
         self.fallback_count = 0
 
+        # Layer tracking for staging
+        # Incremented when token_idx==0 (new layer starting)
+        # Reset when starting new speculation window
+        self.current_layer_idx = -1
+
+        # Store per-layer KV cache references during staging
+        # Used during commit to write to correct caches
+        self._layer_caches: dict[int, tuple[Tensor, Tensor]] = {}
+
     def ensure_ready(self, key_cache: Tensor, value_cache: Tensor) -> None:
         """Check if KV cache has real storage (post-warmup)."""
         if self.ready or not self.nwor_enabled:
@@ -312,11 +328,13 @@ class KVCacheInterceptor:
         # Only reset when starting a NEW staging window
         self.mode = "staging"
         self.buffer.reset()
+        self.current_layer_idx = -1  # Reset layer counter for new window
+        self._layer_caches.clear()  # Clear cached layer references
         logger.debug(f"NWOR: Staging enabled for {num_tokens} tokens")
         return True
 
     def write(self,
-              layer_idx: int,
+              layer_idx: int,  # NOTE: Ignored, auto-determined from token_idx pattern
               token_idx: int,
               key: Tensor,
               value: Tensor,
@@ -331,7 +349,7 @@ class KVCacheInterceptor:
         Route KV write to staging buffer or direct to cache.
 
         Args:
-            layer_idx: Transformer layer index
+            layer_idx: Transformer layer index (IGNORED - auto-determined)
             token_idx: Token position in speculation window
             key: Key tensor
             value: Value tensor
@@ -353,8 +371,18 @@ class KVCacheInterceptor:
             return
 
         if self.mode == "staging" and self.buffer is not None:
+            # Auto-detect layer index: when token_idx resets to 0, we're starting a new layer
+            if token_idx == 0:
+                self.current_layer_idx += 1
+                # Store this layer's cache references for use during commit
+                self._layer_caches[self.current_layer_idx] = (key_cache, value_cache)
+                logger.debug(f"NWOR: Starting layer {self.current_layer_idx}")
+
+            # Use auto-detected layer index (ignore passed parameter)
+            actual_layer_idx = self.current_layer_idx
+
             try:
-                self.buffer.stage(layer_idx, token_idx, key, value, slot)
+                self.buffer.stage(actual_layer_idx, token_idx, key, value, slot)
                 self.total_staged += 1
             except Exception as e:
                 logger.warning(f"NWOR: Stage failed: {e}, falling back to direct write")
@@ -375,19 +403,17 @@ class KVCacheInterceptor:
     def commit(self,
                accepted_len: int,
                kv_cache_ops,
-               key_cache: Tensor,
-               value_cache: Tensor,
                kv_cache_dtype: str,
                k_scale: Optional[float] = None,
                v_scale: Optional[float] = None):
         """
         Commit accepted tokens to persistent cache.
 
+        Uses stored per-layer cache references collected during staging.
+
         Args:
             accepted_len: Number of accepted tokens
             kv_cache_ops: Module with reshape_and_cache_flash
-            key_cache: Real key cache
-            value_cache: Real value cache
             kv_cache_dtype: Cache data type
             k_scale: Optional key quantization scale
             v_scale: Optional value quantization scale
@@ -395,9 +421,16 @@ class KVCacheInterceptor:
         if self.mode != "staging" or self.buffer is None:
             return
 
+        # Use the per-layer caches we stored during staging
+        if not self._layer_caches:
+            logger.error("NWOR: No layer caches stored, cannot commit")
+            self.fallback_count += 1
+            self.disable_staging()
+            return
+
         try:
             committed = self.buffer.commit(
-                accepted_len, kv_cache_ops, key_cache, value_cache,
+                accepted_len, kv_cache_ops, self._layer_caches,
                 kv_cache_dtype, k_scale, v_scale
             )
             self.total_committed += committed

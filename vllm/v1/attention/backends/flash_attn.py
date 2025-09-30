@@ -532,17 +532,10 @@ class FlashAttentionImpl(AttentionImpl):
                         for token_idx in range(num_tokens):
                             slot = attn_metadata.slot_mapping[token_idx:token_idx+1]
 
-                            # TODO: CRITICAL - Get actual layer index from layer object
-                            # Current implementation defaults to 0 for ALL layers, causing
-                            # all layers to overwrite each other in the buffer.
-                            #
-                            # Solutions:
-                            # 1. Store layer_idx during backend/layer construction
-                            # 2. Track global layer counter in interceptor
-                            # 3. Add layer_idx attribute to Attention layer modules
-                            #
-                            # For now, this is a placeholder that will cause bugs.
-                            layer_idx = getattr(layer, 'layer_idx', 0)
+                            # NOTE: layer_idx is auto-determined by interceptor
+                            # based on token_idx pattern (when token_idx==0, new layer starts)
+                            # The value we pass here is ignored by the interceptor
+                            layer_idx = 0  # Placeholder, ignored by interceptor
                             interceptor.write(
                                 layer_idx, token_idx,
                                 key[token_idx:token_idx+1],
