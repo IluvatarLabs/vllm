@@ -514,8 +514,10 @@ class FlashAttentionImpl(AttentionImpl):
                 interceptor.ensure_ready(key_cache, value_cache)
 
                 # Detect speculation phase
-                # TODO: Add proper speculation detection logic here
-                # For now, we'll check if we have multiple tokens (speculation window)
+                # TODO: MAJOR - Add proper speculation detection logic
+                # Current heuristic (num_tokens > 1) incorrectly triggers on prefill.
+                # Should use attn_metadata.is_spec_decode or similar flag.
+                # False positives waste memory and cause unnecessary staging.
                 is_speculation = num_tokens > 1  # Simple heuristic for now
 
                 if is_speculation:
@@ -529,7 +531,17 @@ class FlashAttentionImpl(AttentionImpl):
                         # Route through interceptor for staging
                         for token_idx in range(num_tokens):
                             slot = attn_metadata.slot_mapping[token_idx:token_idx+1]
-                            # TODO: Get actual layer index from layer object
+
+                            # TODO: CRITICAL - Get actual layer index from layer object
+                            # Current implementation defaults to 0 for ALL layers, causing
+                            # all layers to overwrite each other in the buffer.
+                            #
+                            # Solutions:
+                            # 1. Store layer_idx during backend/layer construction
+                            # 2. Track global layer counter in interceptor
+                            # 3. Add layer_idx attribute to Attention layer modules
+                            #
+                            # For now, this is a placeholder that will cause bugs.
                             layer_idx = getattr(layer, 'layer_idx', 0)
                             interceptor.write(
                                 layer_idx, token_idx,

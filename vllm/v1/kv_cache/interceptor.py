@@ -287,6 +287,12 @@ class KVCacheInterceptor:
         if not self.ready or not self.nwor_enabled:
             return False
 
+        # If already in staging mode, don't reset (fixes bug where reset clears
+        # previous layers' data)
+        if self.mode == "staging":
+            logger.debug("NWOR: Already in staging mode, continuing")
+            return True
+
         if self.buffer is None:
             # Create buffer on first use
             self.buffer = StagingBuffer(
@@ -303,6 +309,7 @@ class KVCacheInterceptor:
             self.fallback_count += 1
             return False
 
+        # Only reset when starting a NEW staging window
         self.mode = "staging"
         self.buffer.reset()
         logger.debug(f"NWOR: Staging enabled for {num_tokens} tokens")
