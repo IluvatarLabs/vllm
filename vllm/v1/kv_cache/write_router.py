@@ -59,6 +59,21 @@ def _tensor_has_storage(tensor: torch.Tensor) -> bool:
         raise
 
 
+def _tensor_debug_status(tensor: torch.Tensor) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        return "<non-tensor>"
+    is_fake = _is_fake_tensor(tensor)
+    has_storage = False
+    try:
+        tensor.data_ptr()
+        has_storage = True
+    except Exception:
+        has_storage = False
+    return (f"type={tensor.__class__.__name__} fake={is_fake} "
+            f"has_storage={has_storage} device={getattr(tensor, 'device', 'na')} "
+            f"shape={tuple(tensor.shape) if hasattr(tensor, 'shape') else 'na'}")
+
+
 class PersistentKVWriter:
     """
     Adapter for vLLM v0.10.2 KV cache operations.
@@ -283,8 +298,26 @@ class PersistentKVWriter:
             and _tensor_has_storage(slot_mapping_flat)
         )
         if not tensors_ok:
-            logger.debug("PersistentKVWriter.append_run: skipping write with fake tensors on layer %d", layer_idx)
+            logger.info(
+                "PersistentKVWriter.append_run: skipping layer=%d because of fake tensors | key(%s) value(%s) K(%s) V(%s) slots(%s)",
+                layer_idx,
+                _tensor_debug_status(key_cache),
+                _tensor_debug_status(value_cache),
+                _tensor_debug_status(K_run),
+                _tensor_debug_status(V_run),
+                _tensor_debug_status(slot_mapping_flat)
+            )
             return
+
+        logger.info(
+            "PersistentKVWriter.append_run: storage status layer=%d | key(%s) value(%s) K(%s) V(%s) slots(%s)",
+            layer_idx,
+            _tensor_debug_status(key_cache),
+            _tensor_debug_status(value_cache),
+            _tensor_debug_status(K_run),
+            _tensor_debug_status(V_run),
+            _tensor_debug_status(slot_mapping_flat)
+        )
 
         # Bulk write using the same op
         ops.reshape_and_cache_flash(
@@ -320,6 +353,9 @@ class KVWriteRouter:
         self._mode = "immediate"  # or "defer"
         self._slot_mapping = None  # Stored during begin() for use in stage()
         self._state = KVWriteRouter.RouterState.WARMUP  # Start in warmup
+        # Materialization tracking: after warmup, force the first real shadow to
+        # zero-fill its buffers before staging.
+        self._needs_shadow_materialize = True
 
     @staticmethod
     def _in_restricted_context() -> bool:
@@ -362,6 +398,13 @@ class KVWriteRouter:
             return False
         self._mode = "defer"
         self._shadow = shadow
+
+        if self._needs_shadow_materialize:
+            try:
+                shadow.materialize()
+            finally:
+                self._needs_shadow_materialize = False
+
         return True
 
     def is_deferred(self) -> bool:
@@ -394,14 +437,8 @@ class KVWriteRouter:
         self._state = KVWriteRouter.RouterState.READY
         self.immediate()
 
-        # Materialize ShadowKV buffers now that we're outside graph capture.
-        try:
-            from vllm.v1.kv_cache.shadow_kv import get_local_shadow_kv
-            shadow = get_local_shadow_kv()
-            if shadow is not None:
-                shadow.materialize()
-        except ImportError:
-            pass
+        # Ensure the next deferred shadow zero-fills its buffers before use.
+        self._needs_shadow_materialize = True
 
     def disable(self) -> None:
         """Disable NWOR permanently (setup failed or feature not requested)."""

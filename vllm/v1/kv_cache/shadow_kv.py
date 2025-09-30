@@ -163,6 +163,8 @@ class ShadowKV:
             return
 
         shape = (self.max_chunk, self.n_heads, self.head_dim)
+        logger.info("ShadowKV: materializing %d layers (%s) with real tensors",
+                    self.n_layers, self.device)
         for idx in range(self.n_layers):
             self._K[idx] = torch.zeros(shape, device=self.device, dtype=self.dtype)
             self._V[idx] = torch.zeros(shape, device=self.device, dtype=self.dtype)
@@ -200,8 +202,8 @@ class ShadowKV:
 
         # Skip staging entirely if KV slices are still fake (e.g. during torch.compile capture).
         if not (_tensor_has_storage(k_slice) and _tensor_has_storage(v_slice)):
-            logger.debug("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
-                         layer_idx, t)
+            logger.info("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
+                        layer_idx, t)
             return
 
         # Copy KV to staging buffer now that the slices are confirmed real
@@ -211,7 +213,7 @@ class ShadowKV:
         # Normalize slot mapping to int64 on the staging device (matches cache op).
         # Force a real owning tensor (copy=True) so we never hold on to fake/meta views.
         try:
-            slot_gpu = slot_mapping_1t.to(dtype=torch.int64,
+            slot_gpu = slot_mapping_1t.to(dtype=torch.int32,
                                           device=self.device,
                                           copy=True).contiguous()
         except (RuntimeError, NotImplementedError) as exc:
@@ -250,6 +252,8 @@ class ShadowKV:
 
         staged_tokens = self._len
 
+        accepted_len = min(accepted_len, staged_tokens)
+
         # Short-circuit if nothing was staged
         if staged_tokens == 0:
             if accepted_len:
@@ -275,51 +279,44 @@ class ShadowKV:
 
         print(f"🔴 SHADOW: COMMITTING {accepted_len} OF {self._len} STAGED TOKENS",
               file=sys.stderr, flush=True)
-        # Commit accepted tokens to persistent storage
+
+        # Commit accepted tokens to persistent storage layer by layer
         for layer_idx in range(self.n_layers):
             # Get accepted KV slices - make them contiguous
             K_accepted = self._K[layer_idx][:accepted_len].contiguous()
             V_accepted = self._V[layer_idx][:accepted_len].contiguous()
 
-            # Build concatenated slot mapping for accepted tokens
             layer_slots = self._slot_mappings[layer_idx][:accepted_len]
 
-            # Skip layers that staged nothing
-            if not layer_slots:
+            if len(layer_slots) != accepted_len or not layer_slots or not all(s is not None for s in layer_slots):
+                logger.warning(
+                    "ShadowKV: Missing slot mappings for layer %d (have %d, expected %d); skipping",
+                    layer_idx, len(layer_slots), accepted_len)
                 continue
 
-            # Concatenate slot mappings for this layer's accepted tokens
-            if all(s is not None for s in layer_slots):
-                # Different builds may have different slot mapping shapes
-                # Handle both 1D and 2D cases
-                if layer_slots[0].dim() == 0:
-                    # Scalar slot indices - stack them
-                    slot_mapping_run = torch.stack(layer_slots)
-                elif layer_slots[0].dim() == 1:
-                    # Already 1D arrays - concatenate
-                    slot_mapping_run = torch.cat(layer_slots)
-                else:
-                    # 2D or higher - flatten and concatenate
-                    slot_mapping_run = torch.cat([s.flatten() for s in layer_slots])
+            if layer_slots[0].dim() == 0:
+                slot_mapping_run = torch.stack(layer_slots)
+            elif layer_slots[0].dim() == 1:
+                slot_mapping_run = torch.cat(layer_slots)
+            else:
+                slot_mapping_run = torch.cat([s.flatten() for s in layer_slots])
 
-                # Transfer slot mapping from CPU to GPU (non-blocking for performance)
-                slot_mapping_run = slot_mapping_run.to(
-                    device=self.device,
-                    dtype=torch.int64,
-                    non_blocking=True,
-                    copy=True).contiguous()
+            slot_mapping_run = slot_mapping_run.to(
+                device=self.device,
+                dtype=torch.int32,
+                non_blocking=False,
+                copy=True).contiguous()
 
+            try:
                 persistent_writer.append_run(
                     layer_idx,
                     K_accepted,
                     V_accepted,
                     slot_mapping_run
                 )
-            else:
-                logger.warning(
-                    "Missing slot mappings for layer %d, skipping commit",
-                    layer_idx
-                )
+            except RuntimeError as err:
+                logger.warning("ShadowKV: append_run failed on layer %d: %s", layer_idx, err)
+                continue
 
         # Update metrics
         rejected = max(0, staged_tokens - accepted_len)
