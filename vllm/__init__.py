@@ -2,28 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM: a high-throughput and memory-efficient inference engine for LLMs"""
 
-import multiprocessing
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
-# Set the multiprocessing start method to 'spawn' for CUDA compatibility.
-# This must be done before any CUDA context is created.
-# NOTE: This may have side effects for users of vLLM as a library who
-# also use multiprocessing and rely on the default 'fork' method.
-# See: https://docs.vllm.ai/en/latest/dev/troubleshooting.html#python-multiprocessing
-try:
-    # The 'fork' start method is not compatible with CUDA.
-    # We need to use 'spawn' to avoid deadlocks.
-    multiprocessing.set_start_method("spawn", force=True)
-except RuntimeError:
-    # If the start method is already set, we check if it is 'spawn'.
-    if multiprocessing.get_start_method(allow_none=True) != "spawn":
-        logger.warning(
-            "vLLM requires the 'spawn' start method for CUDA compatibility. "
-            "The start method has already been set to '%s'. This may "
-            "lead to deadlocks.", multiprocessing.get_start_method())
-
 # The version.py should be independent library, and we always import the
 # version library first.  Such assumption is critical for some customization.
 from .version import __version__, __version_tuple__  # isort:skip
