@@ -10,19 +10,50 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+# Import FakeTensor to detect fake tensors explicitly
+try:
+    from torch._subclasses.fake_tensor import FakeTensor
+except Exception:
+    FakeTensor = ()
+
+# Import PyTorch's internal FakeTensor detection (PyTorch >= 2.1)
+try:
+    from torch._C import _is_fake_tensor as _torch_is_fake_tensor
+except Exception:
+    _torch_is_fake_tensor = None
+
+
+def _is_fake_tensor(t: torch.Tensor) -> bool:
+    """Detect FakeTensors using multiple methods for robustness."""
+    # Direct isinstance check
+    if isinstance(t, FakeTensor) or t.__class__.__name__ == "FakeTensor":
+        return True
+    # Use PyTorch's internal function if available
+    if _torch_is_fake_tensor is not None:
+        try:
+            if _torch_is_fake_tensor(t):
+                return True
+        except TypeError:
+            pass
+    return False
+
 
 def _tensor_has_storage(tensor: torch.Tensor) -> bool:
     """Return False for fake/meta tensors that can't expose a data pointer."""
     if not isinstance(tensor, torch.Tensor):
         return False
+    # Check for FakeTensor using robust detection (KEY FIX: catches PyTorch 2.3 FakeTensors)
+    if _is_fake_tensor(tensor):
+        return False
+    # Check for meta tensors
     if tensor.is_meta:
         return False
     try:
         tensor.data_ptr()
         return True
-    except (RuntimeError, NotImplementedError) as exc:
+    except (RuntimeError, NotImplementedError, AssertionError) as exc:
         msg = str(exc)
-        if "doesn't have storage" in msg or "meta tensor" in msg:
+        if "doesn't have storage" in msg or "meta tensor" in msg or "FakeTensor" in msg:
             return False
         raise
 
