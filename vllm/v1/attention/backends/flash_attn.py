@@ -172,8 +172,16 @@ class FlashAttentionMetadataBuilder(
     # to FULL_AND_PIECEWISE.
     # TODO(luka, lucas): audit FA2 as part of:
     #  https://github.com/vllm-project/vllm/issues/22945
-    cudagraph_support = AttentionCGSupport.ALWAYS \
-        if get_flash_attn_version() == 3 else AttentionCGSupport.UNIFORM_BATCH
+
+    # Lazy evaluation to avoid CUDA initialization during module import
+    _cudagraph_support = None
+
+    @property
+    def cudagraph_support(self):
+        if self._cudagraph_support is None:
+            self._cudagraph_support = AttentionCGSupport.ALWAYS \
+                if get_flash_attn_version() == 3 else AttentionCGSupport.UNIFORM_BATCH
+        return self._cudagraph_support
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
