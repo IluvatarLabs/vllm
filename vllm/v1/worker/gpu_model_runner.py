@@ -2381,6 +2381,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
 
+        # NWOR lifecycle: Enable staging once for speculative decode window
+        interceptor = get_global_interceptor()
+        if interceptor and spec_decode_metadata is not None:
+            # Calculate total draft tokens across the batch
+            total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+            if total_draft_tokens > 0:
+                # Enable staging once at runner level (not per-layer)
+                device = str(input_ids.device)
+                dtype = input_ids.dtype
+                interceptor.enable_staging(total_draft_tokens, device, dtype)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (set_forward_context(

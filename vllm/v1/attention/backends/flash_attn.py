@@ -503,60 +503,35 @@ class FlashAttentionImpl(AttentionImpl):
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
 
-            # NWOR interception point
-            # Initialize variables before conditional to avoid UnboundLocalError
-            is_speculation = False
-            num_tokens = attn_metadata.slot_mapping.shape[0]
-
+            # NWOR interception point (orchestrated by runner, not per-layer)
             interceptor = get_global_interceptor()
-            if interceptor and interceptor.nwor_enabled:
-                # Ensure KV cache has real storage (post-warmup check)
+            if interceptor and interceptor.mode == "staging":
+                # Staging mode active: route KV writes through interceptor
+                # enable_staging() was already called once by GPUModelRunner
                 interceptor.ensure_ready(key_cache, value_cache)
 
-                # Detect speculation phase
-                # TODO: MAJOR - Add proper speculation detection logic
-                # Current heuristic (num_tokens > 1) incorrectly triggers on prefill.
-                # Should use attn_metadata.is_spec_decode or similar flag.
-                # False positives waste memory and cause unnecessary staging.
-                is_speculation = num_tokens > 1  # Simple heuristic for now
+                num_tokens = attn_metadata.slot_mapping.shape[0]
+                from vllm.attention.utils import fa_utils
 
-                if is_speculation:
-                    # Try to enable staging for this speculation window
-                    device = key.device
-                    dtype = key.dtype
-                    if interceptor.enable_staging(num_tokens, str(device), dtype):
-                        # Import the module that has reshape_and_cache_flash
-                        from vllm.attention.utils import fa_utils
+                # Stage each token's KV pair
+                for token_idx in range(num_tokens):
+                    slot = attn_metadata.slot_mapping[token_idx:token_idx+1]
 
-                        # Route through interceptor for staging
-                        for token_idx in range(num_tokens):
-                            slot = attn_metadata.slot_mapping[token_idx:token_idx+1]
-
-                            # NOTE: layer_idx is auto-determined by interceptor
-                            # based on token_idx pattern (when token_idx==0, new layer starts)
-                            # The value we pass here is ignored by the interceptor
-                            layer_idx = 0  # Placeholder, ignored by interceptor
-                            interceptor.write(
-                                layer_idx, token_idx,
-                                key[token_idx:token_idx+1],
-                                value[token_idx:token_idx+1],
-                                slot,
-                                fa_utils,  # Module with reshape_and_cache_flash
-                                key_cache, value_cache,
-                                self.kv_cache_dtype,
-                                layer._k_scale, layer._v_scale
-                            )
-                    else:
-                        # Staging not enabled, fall through to direct write
-                        pass
-                else:
-                    # Not speculation, fall through to direct write
-                    pass
-
-            # Check if we already handled via interceptor
-            if not (interceptor and interceptor.nwor_enabled and is_speculation
-                    and interceptor.mode == "staging"):
-                # Default path: direct KV cache write
+                    # NOTE: layer_idx is auto-determined by interceptor
+                    # based on token_idx pattern (when token_idx==0, new layer starts)
+                    layer_idx = 0  # Placeholder, ignored by interceptor
+                    interceptor.write(
+                        layer_idx, token_idx,
+                        key[token_idx:token_idx+1],
+                        value[token_idx:token_idx+1],
+                        slot,
+                        fa_utils,  # Module with reshape_and_cache_flash
+                        key_cache, value_cache,
+                        self.kv_cache_dtype,
+                        layer._k_scale, layer._v_scale
+                    )
+            else:
+                # Direct path: write KV cache immediately
                 reshape_and_cache_flash(
                     key,
                     value,
