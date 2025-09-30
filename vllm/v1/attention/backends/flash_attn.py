@@ -185,9 +185,16 @@ class FlashAttentionMetadataBuilder(
 
         # Initialize NWOR interceptor (singleton for all attention layers)
         if get_global_interceptor() is None:
-            interceptor = KVCacheInterceptor(vllm_config)
-            set_global_interceptor(interceptor)
-            logger.info("FlashAttentionMetadataBuilder: NWOR interceptor initialized")
+            # Only create an interceptor if speculative decoding is configured.
+            if vllm_config.speculative_config:
+                interceptor = KVCacheInterceptor(vllm_config)
+                set_global_interceptor(interceptor)
+                logger.info(
+                    "FlashAttentionMetadataBuilder: NWOR interceptor initialized"
+                )
+            else:
+                # Ensure the global interceptor is None if not used.
+                set_global_interceptor(None)
 
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config)
