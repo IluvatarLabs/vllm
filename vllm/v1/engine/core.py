@@ -16,6 +16,7 @@ from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec
+import torch.distributed
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -365,6 +366,13 @@ class EngineCore:
             logger.info("DIAGNOSTIC: Shutting down scheduler")
             self.scheduler.shutdown()
             logger.info("DIAGNOSTIC: Scheduler shutdown complete")
+
+        # Explicitly destroy the default process group before exiting.
+        if torch.distributed.is_initialized():
+            logger.info("DIAGNOSTIC: Destroying default process group.")
+            torch.distributed.destroy_process_group()
+            logger.info("DIAGNOSTIC: Default process group destroyed.")
+
         logger.info("DIAGNOSTIC: EngineCore.shutdown() complete")
 
     def profile(self, is_start: bool = True):
