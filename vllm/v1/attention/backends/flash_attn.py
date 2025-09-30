@@ -504,6 +504,10 @@ class FlashAttentionImpl(AttentionImpl):
             # actual tokens.
 
             # NWOR interception point
+            # Initialize variables before conditional to avoid UnboundLocalError
+            is_speculation = False
+            num_tokens = attn_metadata.slot_mapping.shape[0]
+
             interceptor = get_global_interceptor()
             if interceptor and interceptor.nwor_enabled:
                 # Ensure KV cache has real storage (post-warmup check)
@@ -512,7 +516,6 @@ class FlashAttentionImpl(AttentionImpl):
                 # Detect speculation phase
                 # TODO: Add proper speculation detection logic here
                 # For now, we'll check if we have multiple tokens (speculation window)
-                num_tokens = attn_metadata.slot_mapping.shape[0]
                 is_speculation = num_tokens > 1  # Simple heuristic for now
 
                 if is_speculation:
