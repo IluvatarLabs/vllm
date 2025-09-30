@@ -162,6 +162,10 @@ class ShadowKV:
         if self._materialized:
             return
 
+        if self._len > 0:
+            logger.warning("ShadowKV: materialize() called with %d staged tokens; skipping to preserve staged data", self._len)
+            return
+
         shape = (self.max_chunk, self.n_heads, self.head_dim)
         logger.info("ShadowKV: materializing %d layers (%s) with real tensors",
                     self.n_layers, self.device)
@@ -202,8 +206,8 @@ class ShadowKV:
 
         # Skip staging entirely if KV slices are still fake (e.g. during torch.compile capture).
         if not (_tensor_has_storage(k_slice) and _tensor_has_storage(v_slice)):
-            logger.info("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
-                        layer_idx, t)
+            logger.debug("ShadowKV: skipping staging for fake KV slice (layer=%d, t=%d)",
+                         layer_idx, t)
             return
 
         # Copy KV to staging buffer now that the slices are confirmed real
@@ -231,12 +235,13 @@ class ShadowKV:
 
         if t + 1 > self._len:
             self._len = t + 1
-            self._total_staged += 1
-            self._debug_stage_calls += 1
-            if self._debug_stage_calls == 1:
-                print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
-                      file=sys.stderr, flush=True)
-                logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
+
+        self._total_staged += 1
+        self._debug_stage_calls += 1
+        if self._debug_stage_calls == 1:
+            print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
+                  file=sys.stderr, flush=True)
+            logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
 
     @torch.no_grad()
     def commit_to(self, persistent_writer, accepted_len: int):
@@ -280,6 +285,8 @@ class ShadowKV:
         print(f"🔴 SHADOW: COMMITTING {accepted_len} OF {self._len} STAGED TOKENS",
               file=sys.stderr, flush=True)
 
+        successful_commits = 0
+
         # Commit accepted tokens to persistent storage layer by layer
         for layer_idx in range(self.n_layers):
             # Get accepted KV slices - make them contiguous
@@ -314,20 +321,22 @@ class ShadowKV:
                     V_accepted,
                     slot_mapping_run
                 )
+                successful_commits += 1
             except RuntimeError as err:
                 logger.warning("ShadowKV: append_run failed on layer %d: %s", layer_idx, err)
                 continue
 
-        # Update metrics
-        rejected = max(0, staged_tokens - accepted_len)
-        self._total_committed += accepted_len
-        if rejected:
+        # Update metrics based on successful layers
+        committed_tokens = accepted_len if successful_commits == self.n_layers else 0
+        rejected = staged_tokens - committed_tokens
+        self._total_committed += committed_tokens
+        if rejected > 0:
             self._total_rejected += rejected
         self._len = 0
 
         logger.info(
-            "ShadowKV: Committed %d tokens, rejected %d tokens",
-            accepted_len, rejected
+            "ShadowKV: Committed %d tokens, rejected %d tokens (layers ok=%d/%d)",
+            committed_tokens, rejected, successful_commits, self.n_layers
         )
 
     # REMOVED: memory_saved_mb property
