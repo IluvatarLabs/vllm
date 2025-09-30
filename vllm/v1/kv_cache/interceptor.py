@@ -283,7 +283,7 @@ class KVCacheInterceptor:
         # Get model dimensions (use vLLM helpers for compatibility)
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
-        self.n_layers = model_config.hf_config.num_hidden_layers
+        self.n_layers = model_config.get_num_layers(parallel_config)  # PP-aware!
         self.n_heads = model_config.get_num_kv_heads(parallel_config)  # TP-aware!
         self.head_dim = model_config.get_head_size()
 
