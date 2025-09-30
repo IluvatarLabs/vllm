@@ -236,13 +236,12 @@ class ShadowKV:
         if t + 1 > self._len:
             self._len = t + 1
 
-        if layer_idx == 0:
-            self._total_staged += 1
-            self._debug_stage_calls += 1
-            if self._debug_stage_calls == 1:
-                print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
-                      file=sys.stderr, flush=True)
-                logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
+        self._total_staged += 1
+        self._debug_stage_calls += 1
+        if self._debug_stage_calls == 1:
+            print(f"🔴 SHADOW: STAGING TOKENS (first call, layer={layer_idx}, t={t})",
+                  file=sys.stderr, flush=True)
+            logger.info("[NWOR DEBUG] First stage() call - NWOR is active!")
 
     @torch.no_grad()
     def commit_to(self, persistent_writer, accepted_len: int):
@@ -328,7 +327,7 @@ class ShadowKV:
                 continue
 
         # Update metrics based on successful layers
-        committed_tokens = accepted_len if successful_commits == self.n_layers else 0
+        committed_tokens = (accepted_len * successful_commits) // self.n_layers if successful_commits else 0
         rejected = staged_tokens - committed_tokens
         self._total_committed += committed_tokens
         if rejected > 0:
@@ -344,7 +343,6 @@ class ShadowKV:
     # This was a fake metric - actual memory bandwidth must be measured
     # with Nsight Compute using dram__bytes_write.sum in NVTX ranges
 
-    @property
     def acceptance_rate(self) -> float:
         """Calculate acceptance rate from staged tokens."""
         total = self._total_committed + self._total_rejected
@@ -358,7 +356,7 @@ class ShadowKV:
             "total_staged": self._total_staged,
             "total_committed": self._total_committed,
             "total_rejected": self._total_rejected,
-            "acceptance_rate": self.acceptance_rate,
+            "acceptance_rate": self.acceptance_rate(),
             # NOTE: memory_saved_mb removed - use Nsight Compute for real measurements
         }
 
@@ -372,5 +370,5 @@ class ShadowKV:
         return (
             f"ShadowKV(layers={self.n_layers}, heads={self.n_heads}, "
             f"dim={self.head_dim}, max_chunk={self.max_chunk}, "
-            f"acceptance={self.acceptance_rate:.1%})"
+            f"acceptance={self.acceptance_rate():.1%})"
         )
