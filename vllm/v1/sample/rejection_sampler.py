@@ -43,6 +43,12 @@ class RejectionSampler(nn.Module):
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
 
+    def __init__(self):
+        super().__init__()
+        # Metrics for last rejection sampling operation
+        self.last_accepted_count = 0
+        self.last_proposed_count = 0
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
@@ -102,6 +108,30 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             sampling_metadata,
         )
+
+        # Track acceptance metrics for NWOR
+        # Accepted count = position of first PLACEHOLDER (-1) per request
+        # (this is the draft prefix accepted before first rejection)
+        batch_size = len(metadata.num_draft_tokens)
+        total_accepted = 0
+        total_proposed = sum(metadata.num_draft_tokens)
+
+        for req_idx in range(batch_size):
+            row = output_token_ids[req_idx]
+            # Find first placeholder (rejection point)
+            placeholders = (row == PLACEHOLDER_TOKEN_ID).nonzero(as_tuple=True)[0]
+            if len(placeholders) > 0:
+                # Rejection happened at this position
+                accepted = placeholders[0].item()
+            else:
+                # All tokens accepted (draft + bonus)
+                # But for NWOR we only count the draft tokens (not bonus)
+                accepted = metadata.num_draft_tokens[req_idx]
+            total_accepted += accepted
+
+        self.last_accepted_count = total_accepted
+        self.last_proposed_count = total_proposed
+
         return output_token_ids
 
     @staticmethod

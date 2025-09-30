@@ -2134,14 +2134,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # NWOR commit: flush accepted tokens to persistent KV cache
             interceptor = get_global_interceptor()
             if interceptor is not None and interceptor.mode == "staging":
-                # Calculate total proposed tokens across batch
-                proposed_len = sum(spec_decode_metadata.num_draft_tokens)
-
-                # Count accepted tokens (non-placeholder tokens in output)
-                # output_token_ids shape: [batch_size, max_spec_len + 1]
-                # PLACEHOLDER_TOKEN_ID = -1 from rejection_sampler.py
-                PLACEHOLDER_TOKEN_ID = -1
-                accepted_len = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum().item()
+                # Get true acceptance metrics from rejection sampler
+                # (accepted = draft tokens before first rejection, NOT including recovered/bonus)
+                accepted_len = self.rejection_sampler.last_accepted_count
+                proposed_len = self.rejection_sampler.last_proposed_count
 
                 # Commit staged KV writes (or discard if rejected)
                 interceptor.commit_window(accepted_len, proposed_len)
@@ -2388,9 +2384,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
             if total_draft_tokens > 0:
                 # Enable staging once at runner level (not per-layer)
-                device = str(input_ids.device)
-                dtype = input_ids.dtype
-                interceptor.enable_staging(total_draft_tokens, device, dtype)
+                # Buffer created lazily on first write() with real KV dtype/device
+                interceptor.enable_staging(total_draft_tokens)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

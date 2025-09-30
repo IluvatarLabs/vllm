@@ -319,14 +319,14 @@ class KVCacheInterceptor:
             self.ready = True
             logger.info("NWOR: KV cache ready, staging enabled")
 
-    def enable_staging(self, num_tokens: int, device: str, dtype: torch.dtype) -> bool:
+    def enable_staging(self, num_tokens: int) -> bool:
         """
         Switch to staging mode for speculation.
 
+        Buffer is created lazily on first write() with real KV tensor dtype/device.
+
         Args:
             num_tokens: Number of speculative tokens
-            device: Device for buffers
-            dtype: Data type for KV tensors
 
         Returns:
             True if staging enabled, False if fallback to direct
@@ -340,25 +340,16 @@ class KVCacheInterceptor:
             logger.debug("NWOR: Already in staging mode, continuing")
             return True
 
-        if self.buffer is None:
-            # Create buffer on first use
-            self.buffer = StagingBuffer(
-                n_layers=self.n_layers,
-                max_tokens=self.max_spec_tokens,
-                n_heads=self.n_heads,
-                head_dim=self.head_dim,
-                device=device,
-                dtype=dtype
-            )
-
-        if self.buffer.is_busy():
+        # Check if existing buffer is busy (shouldn't happen with proper lifecycle)
+        if self.buffer is not None and self.buffer.is_busy():
             logger.warning("NWOR: Buffer busy, falling back to direct mode")
             self.fallback_count += 1
             return False
 
-        # Only reset when starting a NEW staging window
+        # Mark staging mode active; buffer will be created lazily on first write()
         self.mode = "staging"
-        self.buffer.reset()
+        if self.buffer is not None:
+            self.buffer.reset()
         self.current_layer_idx = -1  # Reset layer counter for new window
         logger.debug(f"NWOR: Staging enabled for {num_tokens} tokens")
         return True
@@ -400,7 +391,18 @@ class KVCacheInterceptor:
             # Direct write (skip completely for fake tensors during warmup)
             return
 
-        if self.mode == "staging" and self.buffer is not None:
+        if self.mode == "staging":
+            # Lazy buffer creation: allocate on first real KV write
+            if self.buffer is None:
+                logger.info(f"NWOR: Creating staging buffer with dtype={key.dtype}, device={key.device}")
+                self.buffer = StagingBuffer(
+                    n_layers=self.n_layers,
+                    max_tokens=self.max_spec_tokens,
+                    n_heads=self.n_heads,
+                    head_dim=self.head_dim,
+                    device=str(key.device),
+                    dtype=key.dtype,  # Use actual KV dtype (float16/bfloat16)
+                )
             # Auto-detect layer index: when token_idx resets to 0, we're starting a new layer
             if token_idx == 0:
                 self.current_layer_idx += 1
