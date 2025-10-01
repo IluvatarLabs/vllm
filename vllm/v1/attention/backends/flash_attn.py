@@ -497,6 +497,16 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
+        # DIAGNOSTIC: Check if key/value are None (prevents NWOR interception)
+        from vllm.v1.kv_cache.interceptor import get_global_interceptor
+        interceptor = get_global_interceptor()
+        if interceptor and interceptor.mode == "staging":
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"FLASH_ATTN_DIAGNOSTIC: key_is_none={key is None}, value_is_none={value is None}, "
+                       f"kv_sharing={self.kv_sharing_target_layer_name is not None}, "
+                       f"slot_mapping_shape={attn_metadata.slot_mapping.shape if attn_metadata.slot_mapping is not None else 'None'}")
+
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
         # in KV cache.
