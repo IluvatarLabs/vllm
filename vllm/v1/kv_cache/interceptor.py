@@ -107,7 +107,7 @@ class StagingBuffer:
         self.v_buffer = torch.empty(shape, device=device, dtype=dtype)
 
         # CRITICAL: Single slot buffer for ALL layers (not per-layer!)
-        self.slot_buffer = torch.empty(max_tokens, device=device, dtype=torch.int32)
+        self.slot_buffer = torch.empty(max_tokens, device=device, dtype=torch.long)
 
         # Track which positions have been staged
         self.token_mask = torch.zeros(max_tokens, device=device, dtype=torch.bool)
@@ -196,7 +196,7 @@ class StagingBuffer:
         if layer_idx == 0:
             if slot_tensor.dim() > 0:
                 slot_tensor = slot_tensor.squeeze()
-            self.slot_buffer[token_idx] = slot_tensor.to(torch.int32)
+            self.slot_buffer[token_idx] = slot_tensor
 
         # Mark position as staged
         self.token_mask[token_idx] = True
