@@ -313,6 +313,8 @@ class KVCacheInterceptor:
         self.total_committed = 0
         self.total_rejected = 0
         self.fallback_count = 0
+        self.last_token_idx = -1  # Track previous token index for layer boundary detection
+        self.min_token_idx = float('inf')  # Track smallest token index seen in current window
 
         # Layer tracking for staging
         # Incremented when token_idx==0 (new layer starting)
@@ -362,6 +364,7 @@ class KVCacheInterceptor:
             self.buffer.reset()
         self.current_layer_idx = -1  # Reset layer counter for new window
         self.last_token_idx = -1  # Reset token tracking for new window
+        self.min_token_idx = float('inf')
         logger.info(f"NWOR: Staging mode ENABLED for {num_tokens} tokens (buffer will be created on first write)")
         return True
 
@@ -409,16 +412,18 @@ class KVCacheInterceptor:
                 logger.info(f"NWOR: Creating staging buffer with dtype={key.dtype}, device={key.device}")
                 self.buffer = StagingBuffer(
                     n_layers=self.n_layers,
-                    max_tokens=self.max_spec_tokens,
+                    max_tokens=self.max_spec_tokens + 1,  # extra slot for verified token
                     n_heads=self.n_heads,
                     head_dim=self.head_dim,
                     device=str(key.device),
                     dtype=key.dtype,  # Use actual KV dtype (float16/bfloat16)
                 )
-            # Detect layer boundary via token index reset
-            if token_idx <= self.last_token_idx:
+            # Detect layer boundary via token index reset (handles true wrap-around only)
+            if token_idx < self.min_token_idx:
+                self.min_token_idx = token_idx
+            if token_idx <= self.last_token_idx and token_idx <= self.min_token_idx:
                 self.current_layer_idx += 1
-                logger.debug(f"NWOR: New layer {self.current_layer_idx} (token reset {self.last_token_idx}→{token_idx})")
+                logger.debug(f"NWOR: New layer {self.current_layer_idx} (token reset {self.last_token_idx}→{token_idx}, min={self.min_token_idx})")
 
             # Handle first real write (token_idx > 0, current_layer_idx still -1)
             if self.current_layer_idx < 0:
@@ -489,6 +494,7 @@ class KVCacheInterceptor:
         if self.buffer:
             self.buffer.reset()
         self.last_token_idx = -1  # Reset token tracking
+        self.min_token_idx = float('inf')
 
     def get_metrics(self) -> dict:
         """Get current metrics."""
