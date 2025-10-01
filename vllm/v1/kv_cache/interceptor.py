@@ -298,14 +298,14 @@ class KVCacheInterceptor:
 
         # Get speculation settings
         spec_config = vllm_config.speculative_config
-        if spec_config and spec_config.num_speculative_tokens:
+        if spec_config and spec_config.num_speculative_tokens and vllm_config.use_shadow_kv:
             self.max_spec_tokens = spec_config.num_speculative_tokens
             self.nwor_enabled = True
             logger.info(f"NWOR enabled with max {self.max_spec_tokens} speculative tokens")
         else:
             self.max_spec_tokens = 0
             self.nwor_enabled = False
-            logger.info("NWOR disabled (no speculative config)")
+            logger.info("NWOR disabled (no speculative config or use_shadow_kv=False)")
 
         # Metrics
         self.total_staged = 0

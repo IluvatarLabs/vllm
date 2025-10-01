@@ -107,6 +107,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    use_shadow_kv: bool = False
+    """Enable NWOR shadow KV cache optimization for speculative decoding."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
 
@@ -166,6 +168,7 @@ class VllmConfig:
             vllm_factors.append(self.speculative_config.compute_hash())
         else:
             vllm_factors.append("None")
+        vllm_factors.append(str(self.use_shadow_kv))
         if self.structured_outputs_config:
             vllm_factors.append(self.structured_outputs_config.compute_hash())
         else:

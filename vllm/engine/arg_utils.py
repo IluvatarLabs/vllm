@@ -436,6 +436,11 @@ class EngineArgs:
 
     speculative_config: Optional[Dict[str, Any]] = None
 
+    # NWOR/SCV optimization flags
+    use_shadow_kv: bool = False
+    scv_enabled: bool = False
+    enable_nvtx_ranges: bool = False
+
     show_hidden_metrics_for_version: Optional[str] = \
         ObservabilityConfig.show_hidden_metrics_for_version
     otlp_traces_endpoint: Optional[str] = \
@@ -1443,6 +1448,7 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            use_shadow_kv=self.use_shadow_kv,
         )
 
         return config
