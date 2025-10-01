@@ -530,8 +530,8 @@ class FlashAttentionImpl(AttentionImpl):
                 num_tokens = attn_metadata.slot_mapping.shape[0]
                 from vllm.attention.utils import fa_utils
 
-                # Stage each token's KV pair (skip first token - it's the verified prompt token)
-                for token_idx in range(1, num_tokens):
+                # Stage all tokens including verified prefix (token 0)
+                for token_idx in range(0, num_tokens):
                     slot = attn_metadata.slot_mapping[token_idx:token_idx+1]
 
                     # NOTE: layer_idx is auto-determined by interceptor
