@@ -418,6 +418,11 @@ class KVCacheInterceptor:
                 self.current_layer_idx += 1
                 logger.debug(f"NWOR: Starting layer {self.current_layer_idx}")
 
+            # Handle first real write (token_idx > 0, current_layer_idx still -1)
+            if self.current_layer_idx < 0:
+                self.current_layer_idx = 0
+                logger.debug("NWOR: First real write, initializing layer index to 0")
+
             # Use auto-detected layer index (ignore passed parameter)
             actual_layer_idx = self.current_layer_idx
 
