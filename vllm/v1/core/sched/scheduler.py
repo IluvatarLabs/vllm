@@ -900,8 +900,15 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
-                num_rejected = num_draft_tokens - num_accepted
+                # Guard against empty generated_token_ids in batched scenarios
+                # (can happen when requests finish early or produce no output)
+                if len(generated_token_ids) == 0:
+                    # No tokens generated - reject all drafts
+                    num_accepted = 0
+                    num_rejected = num_draft_tokens
+                else:
+                    num_accepted = len(generated_token_ids) - 1
+                    num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
