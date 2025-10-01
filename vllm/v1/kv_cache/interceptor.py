@@ -288,6 +288,7 @@ class KVCacheInterceptor:
         self.buffer: Optional[StagingBuffer] = None
         self.mode = "direct"
         self.ready = False
+        self.last_token_idx = -1  # Track previous token index for layer boundary detection
 
         # Get model dimensions (use vLLM helpers for compatibility)
         model_config = vllm_config.model_config
@@ -360,6 +361,7 @@ class KVCacheInterceptor:
         if self.buffer is not None:
             self.buffer.reset()
         self.current_layer_idx = -1  # Reset layer counter for new window
+        self.last_token_idx = -1  # Reset token tracking for new window
         logger.info(f"NWOR: Staging mode ENABLED for {num_tokens} tokens (buffer will be created on first write)")
         return True
 
@@ -413,10 +415,10 @@ class KVCacheInterceptor:
                     device=str(key.device),
                     dtype=key.dtype,  # Use actual KV dtype (float16/bfloat16)
                 )
-            # Auto-detect layer index: when token_idx resets to 0, we're starting a new layer
-            if token_idx == 0:
+            # Detect layer boundary via token index reset
+            if token_idx <= self.last_token_idx:
                 self.current_layer_idx += 1
-                logger.debug(f"NWOR: Starting layer {self.current_layer_idx}")
+                logger.debug(f"NWOR: New layer {self.current_layer_idx} (token reset {self.last_token_idx}→{token_idx})")
 
             # Handle first real write (token_idx > 0, current_layer_idx still -1)
             if self.current_layer_idx < 0:
@@ -434,6 +436,7 @@ class KVCacheInterceptor:
                     k_scale, v_scale
                 )
                 self.total_staged += 1
+                self.last_token_idx = token_idx  # Update for next iteration
             except Exception as e:
                 logger.warning(f"NWOR: Stage failed: {e}, falling back to direct write")
                 self.disable_staging()
@@ -485,6 +488,7 @@ class KVCacheInterceptor:
         self.mode = "direct"
         if self.buffer:
             self.buffer.reset()
+        self.last_token_idx = -1  # Reset token tracking
 
     def get_metrics(self) -> dict:
         """Get current metrics."""
