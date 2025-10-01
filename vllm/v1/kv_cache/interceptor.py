@@ -313,6 +313,8 @@ class KVCacheInterceptor:
         self.total_committed = 0
         self.total_rejected = 0
         self.fallback_count = 0
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 3  # Disable NWOR after 3 consecutive commit failures
         self.last_token_idx = -1  # Track previous token index for layer boundary detection
         self.min_token_idx = float('inf')  # Track smallest token index seen in current window
 
@@ -344,6 +346,12 @@ class KVCacheInterceptor:
             True if staging enabled, False if fallback to direct
         """
         if not self.ready or not self.nwor_enabled:
+            return False
+
+        # Circuit breaker: Disable NWOR after consecutive failures
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            logger.error(f"NWOR: {self.consecutive_failures} consecutive failures, permanently disabling NWOR")
+            self.nwor_enabled = False
             return False
 
         # If already in staging mode, don't reset (fixes bug where reset clears
@@ -476,6 +484,13 @@ class KVCacheInterceptor:
             self.total_committed += committed
             self.total_rejected += max(proposed_len - committed, 0)
 
+            # Reset consecutive failures on ANY successful commit
+            if committed > 0:
+                self.consecutive_failures = 0
+            else:
+                # Commit returned 0 (validation failed, incomplete staging, etc.)
+                self.consecutive_failures += 1
+
             if proposed_len > 0:
                 acceptance_rate = 100 * committed / proposed_len
                 logger.info(f"NWOR: Committed {committed}/{proposed_len} tokens "
@@ -484,6 +499,7 @@ class KVCacheInterceptor:
         except Exception as e:
             logger.error(f"NWOR: Commit failed: {e}")
             self.fallback_count += 1
+            self.consecutive_failures += 1
         finally:
             self.disable_staging()
 
