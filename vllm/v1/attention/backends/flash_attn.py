@@ -501,13 +501,13 @@ class FlashAttentionImpl(AttentionImpl):
         # DIAGNOSTIC: Check if key/value are None (prevents NWOR interception)
         from vllm.v1.kv_cache.interceptor import get_global_interceptor
         interceptor = get_global_interceptor()
-        if interceptor and interceptor.mode == "staging":
+        if interceptor:
             logger.info(
-                "FLASH_ATTN_DIAGNOSTIC: key_is_none=%s, value_is_none=%s, kv_sharing=%s, slot_mapping_shape=%s",
+                "NWOR_INTERCEPT: mode=%s, kv_sharing=%s, key_none=%s, value_none=%s",
+                interceptor.mode,
+                self.kv_sharing_target_layer_name is not None,
                 key is None,
                 value is None,
-                self.kv_sharing_target_layer_name is not None,
-                attn_metadata.slot_mapping.shape if attn_metadata.slot_mapping is not None else "None",
             )
 
         # key and value may be None in the case of cross attention. They are

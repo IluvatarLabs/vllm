@@ -353,6 +353,8 @@ class KVCacheInterceptor:
         # Incremented when token_idx==0 (new layer starting)
         # Reset when starting new speculation window
         self.current_layer_idx = -1
+        self._seen_real_writes = False  # Remains False until first real staging
+        self.warmup_skipped_commits = 0
 
     def ensure_ready(self, key_cache: Tensor, value_cache: Tensor) -> None:
         """Check if KV cache has real storage (post-warmup)."""
@@ -530,6 +532,9 @@ class KVCacheInterceptor:
                 )
                 self.total_staged += 1
                 self.last_token_idx = token_idx  # Update for next iteration
+                if not self._seen_real_writes:
+                    self._seen_real_writes = True
+                    logger.info("NWOR: First real tensor staged, warmup complete")
                 if self.pending_commit:
                     self._maybe_finalize_commit()
             except Exception as e:
@@ -562,9 +567,14 @@ class KVCacheInterceptor:
         self.pending_commit = (accepted_len, proposed_len)
         self._maybe_finalize_commit()
 
-    def disable_staging(self):
+    def disable_staging(self, reason: str = "normal") -> None:
         """Return to direct write mode."""
-        logger.info(f"NWOR: Disabling staging mode (was in mode={self.mode}, buffer={self.buffer is not None})")
+        logger.info(
+            "NWOR: Disabling staging mode (reason=%s, was in mode=%s, buffer=%s)",
+            reason,
+            self.mode,
+            self.buffer is not None,
+        )
         self.mode = "direct"
         if self.buffer:
             self.buffer.reset()
@@ -586,6 +596,12 @@ class KVCacheInterceptor:
 
         if self.buffer is None:
             accepted_len, proposed_len = self.pending_commit
+            if not self._seen_real_writes:
+                logger.debug("NWOR: Skipping commit during warmup (buffer not yet created)")
+                self.warmup_skipped_commits += 1
+                self.pending_commit = None
+                self.disable_staging(reason="warmup")
+                return
             self._handle_commit_failure("buffer missing", accepted_len, proposed_len)
             return
 
