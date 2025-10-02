@@ -2386,15 +2386,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         nwor_staging_enabled = False
         if interceptor:
             if spec_decode_metadata is not None:
-                # Calculate total draft tokens across the batch
-                total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+                # Pass per-request draft counts to interceptor for dynamic window sizing
+                num_draft_tokens = spec_decode_metadata.num_draft_tokens
+                total_draft_tokens = sum(num_draft_tokens)
+
                 logger.info(f"NWOR: spec_decode_metadata present, total_draft_tokens={total_draft_tokens}, "
-                           f"batch_size={len(spec_decode_metadata.num_draft_tokens)}")
+                           f"num_draft_tokens={num_draft_tokens}")
+
                 if total_draft_tokens > 0:
-                    # Enable staging once at runner level (not per-layer)
-                    # Buffer created lazily on first write() with real KV dtype/device
-                    logger.info(f"NWOR: Calling enable_staging with {total_draft_tokens} tokens")
-                    nwor_staging_enabled = interceptor.enable_staging(total_draft_tokens)
+                    # Enable staging with per-request draft counts
+                    # Interceptor will compute actual window size (sum of draft+1 per request)
+                    logger.info(f"NWOR: Calling enable_staging with per-request draft counts")
+                    nwor_staging_enabled = interceptor.enable_staging(num_draft_tokens)
                 else:
                     logger.info(f"NWOR: No draft tokens to stage (total_draft_tokens=0)")
             else:

@@ -527,26 +527,74 @@ class FlashAttentionImpl(AttentionImpl):
                 # enable_staging() was already called once by GPUModelRunner
                 interceptor.ensure_ready(key_cache, value_cache)
 
-                num_tokens = attn_metadata.slot_mapping.shape[0]
                 from vllm.attention.utils import fa_utils
+                import logging
+                logger = logging.getLogger(__name__)
 
-                # Stage all tokens including verified prefix (token 0)
-                for token_idx in range(0, num_tokens):
-                    slot = attn_metadata.slot_mapping[token_idx:token_idx+1]
+                # Get dynamic window size from interceptor
+                tokens_to_stage = min(interceptor.get_window_tokens(), key.shape[0])
 
-                    # NOTE: layer_idx is auto-determined by interceptor
-                    # based on token_idx pattern (when token_idx==0, new layer starts)
-                    layer_idx = 0  # Placeholder, ignored by interceptor
-                    interceptor.write(
-                        layer_idx, token_idx,
-                        key[token_idx:token_idx+1],
-                        value[token_idx:token_idx+1],
-                        slot,
-                        fa_utils,  # Module with reshape_and_cache_flash
-                        key_cache, value_cache,
+                # Safety check: window size vs actual batch
+                if tokens_to_stage > attn_metadata.slot_mapping.shape[0]:
+                    logger.error(f"NWOR: Window {tokens_to_stage} exceeds slot_mapping {attn_metadata.slot_mapping.shape[0]}, "
+                                f"clamping to slot_mapping size")
+                    tokens_to_stage = attn_metadata.slot_mapping.shape[0]
+
+                if tokens_to_stage == 0:
+                    # No tokens to stage, fall through to direct write
+                    reshape_and_cache_flash(
+                        key, value, key_cache, value_cache,
+                        attn_metadata.slot_mapping,
                         self.kv_cache_dtype,
                         layer._k_scale, layer._v_scale
                     )
+                else:
+                    prefix_len = key.shape[0] - tokens_to_stage
+
+                    # Safety check: prefix_len going negative
+                    if prefix_len < 0:
+                        logger.error(f"NWOR: prefix_len={prefix_len} < 0, key.shape={key.shape[0]}, "
+                                    f"tokens_to_stage={tokens_to_stage}, falling back to staging all")
+                        # Fall back to staging everything
+                        prefix_len = 0
+                        tokens_to_stage = key.shape[0]
+
+                    # Direct write prefix (non-speculative verified tokens)
+                    if prefix_len > 0:
+                        reshape_and_cache_flash(
+                            key[:prefix_len], value[:prefix_len],
+                            key_cache, value_cache,
+                            attn_metadata.slot_mapping[:prefix_len],
+                            self.kv_cache_dtype,
+                            layer._k_scale, layer._v_scale
+                        )
+
+                    # Clone spec window ONCE to release reference to full batch
+                    # Cost: ~4.6 MB vs 1 GB leak without clone
+                    spec_key = key[prefix_len:].contiguous().clone()
+                    spec_value = value[prefix_len:].contiguous().clone()
+
+                    # Stage tail tokens with sequential indexing
+                    for offset in range(tokens_to_stage):
+                        actual_idx_in_batch = prefix_len + offset
+                        slot = attn_metadata.slot_mapping[actual_idx_in_batch:actual_idx_in_batch + 1]
+
+                        # NOTE: layer_idx is auto-determined by interceptor
+                        # based on token_idx pattern (when token_idx==0, new layer starts)
+                        layer_idx = 0  # Placeholder, ignored by interceptor
+                        interceptor.write(
+                            layer_idx=layer_idx,
+                            token_idx=offset,  # Sequential: 0, 1, 2, ...
+                            key=spec_key[offset:offset + 1],      # View into small cloned tensor
+                            value=spec_value[offset:offset + 1],
+                            slot=slot,
+                            kv_cache_ops=fa_utils,
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            k_scale=layer._k_scale,
+                            v_scale=layer._v_scale,
+                        )
             else:
                 # Direct path: write KV cache immediately
                 reshape_and_cache_flash(
