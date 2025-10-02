@@ -10,12 +10,12 @@ logger = init_logger(__name__)
 
 if current_platform.is_cuda():
     from vllm import _custom_ops as ops
-    reshape_and_cache_flash = ops.reshape_and_cache_flash
+    _reshape_and_cache_flash_impl = ops.reshape_and_cache_flash
     from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                       get_scheduler_metadata)
 elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops as ops
-    reshape_and_cache_flash = ops.reshape_and_cache_flash
+    _reshape_and_cache_flash_impl = ops.reshape_and_cache_flash
     flash_attn_varlen_func = ops.flash_attn_varlen_func
     get_scheduler_metadata = ops.get_scheduler_metadata
 
@@ -66,6 +66,36 @@ def get_flash_attn_version(requires_alibi: bool = False) -> Optional[int]:
 def flash_attn_supports_fp8() -> bool:
     return get_flash_attn_version() == 3 and \
         current_platform.get_device_capability().major == 9
+
+
+def reshape_and_cache_flash(key, value, key_cache, value_cache,
+                            slot_mapping, kv_cache_dtype, k_scale, v_scale):
+    from vllm.v1.kv_cache.interceptor import get_global_interceptor
+
+    interceptor = get_global_interceptor()
+    if interceptor and interceptor.should_queue():
+        if interceptor.enqueue_write(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        ):
+            return
+
+    _reshape_and_cache_flash_impl(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
 
 
 def flash_attn_supports_mla():

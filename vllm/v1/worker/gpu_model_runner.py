@@ -2134,7 +2134,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # NWOR commit: flush accepted tokens to persistent KV cache
             interceptor = get_global_interceptor()
             if interceptor is not None:
-                logger.info(f"NWOR: Commit check - mode={interceptor.mode}, buffer={interceptor.buffer is not None}")
+                queue_depth = len(getattr(interceptor, "pending_writes", []))
+                logger.info(
+                    "NWOR: Commit check - mode=%s, queue_depth=%d",
+                    interceptor.mode,
+                    queue_depth,
+                )
                 if interceptor.mode == "staging":
                     # Get true acceptance metrics from rejection sampler
                     # (accepted = draft tokens before first rejection, NOT including recovered/bonus)
