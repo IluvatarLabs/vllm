@@ -386,6 +386,9 @@ class KVCacheInterceptor:
         # If already in staging mode, window size is now updated - just return
         if self.mode == "staging":
             logger.debug(f"NWOR: Already in staging mode, updated window to {self.active_window_tokens}")
+            # Reset layer tracking even on early return (for deferred commit scenarios)
+            self.current_layer_idx = -1
+            self.last_token_idx = -1
             return True
 
         # Check if existing buffer is busy (shouldn't happen with proper lifecycle)
