@@ -358,23 +358,14 @@ class KVCacheInterceptor:
             self.nwor_enabled = False
             return False
 
-        # If already in staging mode, don't reset (fixes bug where reset clears
-        # previous layers' data)
-        if self.mode == "staging":
-            logger.debug("NWOR: Already in staging mode, continuing")
-            return True
-
-        # Check if existing buffer is busy (shouldn't happen with proper lifecycle)
-        if self.buffer is not None and self.buffer.is_busy():
-            logger.warning("NWOR: Buffer busy, falling back to direct mode")
-            self.fallback_count += 1
-            return False
-
-        # Compute dynamic window size (tail-only staging uses draft tail + 1 verified)
+        # Compute dynamic window size FIRST (before any early returns)
+        # This ensures window size is always updated for new batch
         if isinstance(num_tokens, (list, tuple)):
             total_drafts = sum(int(d) for d in num_tokens)
             active_reqs = sum(1 for d in num_tokens if int(d) > 0)
-            self.active_window_tokens = total_drafts + active_reqs + 1
+            # Each active request has: 1 verified + N drafts
+            # Total = sum(drafts) + count(active_reqs with >0 drafts)
+            self.active_window_tokens = total_drafts + active_reqs
             logger.info(
                 "NWOR: Dynamic window size=%d (total_drafts=%d, active_reqs=%d)",
                 self.active_window_tokens, total_drafts, active_reqs,
@@ -390,6 +381,17 @@ class KVCacheInterceptor:
         if self.active_window_tokens <= 0:
             logger.debug("NWOR: enable_staging skipped (no speculative tokens)")
             self.active_window_tokens = 0
+            return False
+
+        # If already in staging mode, window size is now updated - just return
+        if self.mode == "staging":
+            logger.debug(f"NWOR: Already in staging mode, updated window to {self.active_window_tokens}")
+            return True
+
+        # Check if existing buffer is busy (shouldn't happen with proper lifecycle)
+        if self.buffer is not None and self.buffer.is_busy():
+            logger.warning("NWOR: Buffer busy, falling back to direct mode")
+            self.fallback_count += 1
             return False
 
         # Check if window exceeds current capacity; grow buffer if needed

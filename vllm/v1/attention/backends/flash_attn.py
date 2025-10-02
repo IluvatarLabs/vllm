@@ -21,6 +21,7 @@ if is_flash_attn_varlen_func_available():
     from vllm.attention.utils.fa_utils import (flash_attn_varlen_func,
                                                get_scheduler_metadata,
                                                reshape_and_cache_flash)
+    from vllm.attention.utils import fa_utils
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
@@ -526,10 +527,6 @@ class FlashAttentionImpl(AttentionImpl):
                 # Staging mode active: route KV writes through interceptor
                 # enable_staging() was already called once by GPUModelRunner
                 interceptor.ensure_ready(key_cache, value_cache)
-
-                from vllm.attention.utils import fa_utils
-                import logging
-                logger = logging.getLogger(__name__)
 
                 # Get dynamic window size from interceptor
                 tokens_to_stage = min(interceptor.get_window_tokens(), key.shape[0])
