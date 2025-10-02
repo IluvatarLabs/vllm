@@ -198,9 +198,13 @@ class StagingBuffer:
 
         # CRITICAL: Store slot only on first layer (shared across all layers!)
         if layer_idx == 0:
-            if slot_tensor.dim() > 0:
-                slot_tensor = slot_tensor.squeeze()
-            self.slot_buffer[token_idx] = slot_tensor
+            slot_flat = slot_tensor.reshape(-1)
+            if slot_flat.numel() != 1:
+                raise ValueError(
+                    f"Slot tensor must contain exactly one element, got shape {tuple(slot_tensor.shape)}"
+                )
+            slot_view = slot_flat.to(self.slot_buffer.dtype)
+            self.slot_buffer[token_idx:token_idx + 1].copy_(slot_view)
 
         # Mark position as staged
         self.token_mask[token_idx] = True
@@ -427,6 +431,8 @@ class KVCacheInterceptor:
                 self.current_layer_idx = -1
                 self.last_token_idx = -1
                 self.min_token_idx = float('inf')
+                self._seen_real_writes = False
+                self.warmup_skipped_commits = 0
                 return True
 
         # Check if existing buffer is busy (shouldn't happen with proper lifecycle)
@@ -451,6 +457,8 @@ class KVCacheInterceptor:
         self.current_layer_idx = -1  # Reset layer counter for new window
         self.last_token_idx = -1  # Reset token tracking for new window
         self.min_token_idx = float('inf')
+        self._seen_real_writes = False
+        self.warmup_skipped_commits = 0
         logger.info(f"NWOR: Staging mode ENABLED (buffer will be created on first write)")
         return True
 
