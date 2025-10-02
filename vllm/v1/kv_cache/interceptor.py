@@ -81,8 +81,6 @@ class KVCacheInterceptor:
         self.total_rejected = 0
         self.total_staged_tokens = 0
         self.fallback_count = 0
-        self.consecutive_failures = 0
-        self.max_consecutive_failures = 3
 
     # ------------------------------------------------------------------ lifecycle
     def ensure_ready(self, key_cache: Tensor, value_cache: Tensor) -> None:
@@ -97,13 +95,6 @@ class KVCacheInterceptor:
 
     def enable_staging(self, num_tokens: Union[int, Sequence[int]]) -> bool:
         if not self.ready or not self.nwor_enabled:
-            return False
-        if self.consecutive_failures >= self.max_consecutive_failures:
-            logger.error(
-                "NWOR: %d consecutive failures, permanently disabling NWOR",
-                self.consecutive_failures,
-            )
-            self.nwor_enabled = False
             return False
 
         if isinstance(num_tokens, Sequence) and not isinstance(num_tokens, (str, bytes)):
@@ -135,6 +126,23 @@ class KVCacheInterceptor:
         self.pending_writes.clear()
         self.num_draft_tokens = 0
 
+    def _fatal_error(self, reason: str, exc: Optional[Exception] = None) -> None:
+        """Hard fail for true NWOR violations."""
+        if exc is not None:
+            logger.error("NWOR fatal error: %s (%s)", reason, exc)
+        else:
+            logger.error("NWOR fatal error: %s", reason)
+
+        # Track once for diagnostics before aborting.
+        self.fallback_count += 1
+
+        # Ensure we leave staging mode to avoid leaking state while we crash.
+        self.disable_staging(reason)
+
+        if exc is not None:
+            raise RuntimeError(f"NWOR fatal error: {reason}") from exc
+        raise RuntimeError(f"NWOR fatal error: {reason}")
+
     # ------------------------------------------------------------------ staging queue
     def enqueue_write(
         self,
@@ -155,9 +163,7 @@ class KVCacheInterceptor:
             value_buf = value.detach().contiguous().clone()
             slot_buf = slot_mapping.detach().clone()
         except RuntimeError as exc:  # pragma: no cover - defensive
-            logger.error("NWOR: Failed to clone tensors for staging: %s", exc)
-            self._handle_queue_failure("clone failure")
-            return False
+            self._fatal_error("failed to clone staging tensors", exc)
 
         write = StagedWrite(
             key=key_buf,
@@ -187,32 +193,30 @@ class KVCacheInterceptor:
 
         if not self.pending_writes:
             if accepted > 0:
-                logger.error("NWOR: No staged writes available despite accepted=%d", accepted)
-                self._handle_queue_failure("missing staged writes")
-                return
-            self._finalize_commit(0, proposed_len)
+                self._fatal_error(
+                    f"missing staged writes for {accepted} accepted tokens"
+                )
+            self.total_rejected += max(proposed_len, 0)
+            self.disable_staging("missing staged writes")
             return
 
-        try:
-            from vllm.attention.utils import fa_utils  # local import to avoid cycles
+        from vllm.attention.utils import fa_utils  # local import to avoid cycles
 
-            for write in self.pending_writes:
-                total = write.key.shape[0]
-                if total < self.num_draft_tokens:
-                    logger.error(
-                        "NWOR: Staged tensor smaller than draft window (total=%d, drafts=%d)",
-                        total,
-                        self.num_draft_tokens,
-                    )
-                    self._handle_queue_failure("inconsistent staged tensor")
-                    return
-                draft_start = total - self.num_draft_tokens
-                tokens_to_write = draft_start + accepted
-                tokens_to_write = max(0, min(tokens_to_write, total))
+        for write in self.pending_writes:
+            total = write.key.shape[0]
+            if total < self.num_draft_tokens:
+                self._fatal_error(
+                    f"staged tensor smaller than draft window (total={total}, drafts={self.num_draft_tokens})"
+                )
 
-                if tokens_to_write == 0:
-                    continue
+            draft_start = total - self.num_draft_tokens
+            tokens_to_write = draft_start + accepted
+            tokens_to_write = max(0, min(tokens_to_write, total))
 
+            if tokens_to_write == 0:
+                continue
+
+            try:
                 fa_utils._reshape_and_cache_flash_impl(  # type: ignore[attr-defined]
                     write.key[:tokens_to_write],
                     write.value[:tokens_to_write],
@@ -223,35 +227,13 @@ class KVCacheInterceptor:
                     write.k_scale,
                     write.v_scale,
                 )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error("NWOR: Commit failed: %s", exc)
-            self._handle_queue_failure("commit failure")
-            return
+            except Exception as exc:  # pragma: no cover - defensive
+                self._fatal_error("commit failure", exc)
 
         self.total_staged_tokens += accepted
-        self._finalize_commit(accepted, proposed_len)
-
-    def _finalize_commit(self, committed: int, proposed_len: int) -> None:
-        self.total_committed += committed
-        self.total_rejected += max(proposed_len - committed, 0)
-
-        if committed > 0:
-            self.consecutive_failures = 0
-        elif proposed_len > 0:
-            self.consecutive_failures += 1
-            if self.consecutive_failures >= self.max_consecutive_failures:
-                logger.error(
-                    "NWOR: %d consecutive failures, permanently disabling NWOR",
-                    self.consecutive_failures,
-                )
-                self.nwor_enabled = False
-
+        self.total_committed += accepted
+        self.total_rejected += max(proposed_len - accepted, 0)
         self.disable_staging()
-
-    def _handle_queue_failure(self, reason: str) -> None:
-        self.fallback_count += 1
-        self.consecutive_failures += 1
-        self.disable_staging(reason)
 
     # ------------------------------------------------------------------ metrics
     def get_window_tokens(self) -> int:
