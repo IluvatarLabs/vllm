@@ -6,7 +6,7 @@ Stages KV writes during verification and commits only accepted tokens.
 """
 
 import logging
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, Sequence, Union
 
 import torch
 from torch import Tensor
@@ -308,6 +308,10 @@ class KVCacheInterceptor:
             self.nwor_enabled = False
             logger.info("NWOR disabled (no speculative config or use_shadow_kv=False)")
 
+        # Dynamic window sizing (updated at enable_staging time)
+        self.window_capacity = max(self.max_spec_tokens + 1, 0)
+        self.active_window_tokens = 0
+
         # Metrics
         self.total_staged = 0
         self.total_committed = 0
@@ -333,14 +337,14 @@ class KVCacheInterceptor:
             self.ready = True
             logger.info("NWOR: KV cache ready, staging enabled")
 
-    def enable_staging(self, num_tokens: int) -> bool:
+    def enable_staging(self, num_tokens: Union[int, Sequence[int]]) -> bool:
         """
-        Switch to staging mode for speculation.
+        Switch to staging mode for speculation with dynamic window sizing.
 
         Buffer is created lazily on first write() with real KV tensor dtype/device.
 
         Args:
-            num_tokens: Number of speculative tokens
+            num_tokens: Either int (legacy sum) or list of per-request draft counts
 
         Returns:
             True if staging enabled, False if fallback to direct
@@ -366,6 +370,37 @@ class KVCacheInterceptor:
             self.fallback_count += 1
             return False
 
+        # Compute dynamic window size (tail-only staging uses draft tail + 1 verified)
+        if isinstance(num_tokens, (list, tuple)):
+            total_drafts = sum(int(d) for d in num_tokens)
+            active_reqs = sum(1 for d in num_tokens if int(d) > 0)
+            self.active_window_tokens = total_drafts + active_reqs + 1
+            logger.info(
+                "NWOR: Dynamic window size=%d (total_drafts=%d, active_reqs=%d)",
+                self.active_window_tokens, total_drafts, active_reqs,
+            )
+        else:
+            total = int(num_tokens)
+            self.active_window_tokens = total + 1
+            logger.info(
+                "NWOR: Legacy window size=%d (num_draft_tokens=%d)",
+                self.active_window_tokens, total,
+            )
+
+        if self.active_window_tokens <= 0:
+            logger.debug("NWOR: enable_staging skipped (no speculative tokens)")
+            self.active_window_tokens = 0
+            return False
+
+        # Check if window exceeds current capacity; grow buffer if needed
+        if self.active_window_tokens > self.window_capacity:
+            logger.warning(f"NWOR: Window size {self.active_window_tokens} exceeds capacity "
+                          f"{self.window_capacity}, growing buffer")
+            self.window_capacity = self.active_window_tokens
+            # Force buffer recreation with new capacity
+            if self.buffer is not None:
+                self.buffer = None
+
         # Mark staging mode active; buffer will be created lazily on first write()
         self.mode = "staging"
         if self.buffer is not None:
@@ -373,8 +408,12 @@ class KVCacheInterceptor:
         self.current_layer_idx = -1  # Reset layer counter for new window
         self.last_token_idx = -1  # Reset token tracking for new window
         self.min_token_idx = float('inf')
-        logger.info(f"NWOR: Staging mode ENABLED for {num_tokens} tokens (buffer will be created on first write)")
+        logger.info(f"NWOR: Staging mode ENABLED (buffer will be created on first write)")
         return True
+
+    def get_window_tokens(self) -> int:
+        """Return the currently active staging window size."""
+        return self.active_window_tokens
 
     def write(self,
               layer_idx: int,  # NOTE: Ignored, auto-determined from token_idx pattern
@@ -420,7 +459,7 @@ class KVCacheInterceptor:
                 logger.info(f"NWOR: Creating staging buffer with dtype={key.dtype}, device={key.device}")
                 self.buffer = StagingBuffer(
                     n_layers=self.n_layers,
-                    max_tokens=self.max_spec_tokens + 1,  # extra slot for verified token
+                    max_tokens=max(self.window_capacity, 1),
                     n_heads=self.n_heads,
                     head_dim=self.head_dim,
                     device=str(key.device),
@@ -511,6 +550,7 @@ class KVCacheInterceptor:
             self.buffer.reset()
         self.last_token_idx = -1  # Reset token tracking
         self.min_token_idx = float('inf')
+        self.active_window_tokens = 0  # Clear window size for next window
 
     def get_metrics(self) -> dict:
         """Get current metrics."""
