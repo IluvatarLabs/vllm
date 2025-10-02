@@ -502,11 +502,13 @@ class FlashAttentionImpl(AttentionImpl):
         from vllm.v1.kv_cache.interceptor import get_global_interceptor
         interceptor = get_global_interceptor()
         if interceptor and interceptor.mode == "staging":
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(f"FLASH_ATTN_DIAGNOSTIC: key_is_none={key is None}, value_is_none={value is None}, "
-                       f"kv_sharing={self.kv_sharing_target_layer_name is not None}, "
-                       f"slot_mapping_shape={attn_metadata.slot_mapping.shape if attn_metadata.slot_mapping is not None else 'None'}")
+            logger.info(
+                "FLASH_ATTN_DIAGNOSTIC: key_is_none=%s, value_is_none=%s, kv_sharing=%s, slot_mapping_shape=%s",
+                key is None,
+                value is None,
+                self.kv_sharing_target_layer_name is not None,
+                attn_metadata.slot_mapping.shape if attn_metadata.slot_mapping is not None else "None",
+            )
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
@@ -529,7 +531,17 @@ class FlashAttentionImpl(AttentionImpl):
                 interceptor.ensure_ready(key_cache, value_cache)
 
                 # Get dynamic window size from interceptor
-                tokens_to_stage = min(interceptor.get_window_tokens(), key.shape[0])
+                window_tokens = interceptor.get_window_tokens()
+                tokens_to_stage = min(window_tokens, key.shape[0])
+                prefix_len_initial = key.shape[0] - tokens_to_stage
+                logger.info(
+                    "NWOR: tokens_to_stage=%d, window=%d, key_shape=%d, prefix_len=%d, slot_mapping=%d",
+                    tokens_to_stage,
+                    window_tokens,
+                    key.shape[0],
+                    prefix_len_initial,
+                    attn_metadata.slot_mapping.shape[0] if attn_metadata.slot_mapping is not None else -1,
+                )
 
                 # Safety check: window size vs actual batch
                 if tokens_to_stage > attn_metadata.slot_mapping.shape[0]:

@@ -6,7 +6,7 @@ Stages KV writes during verification and commits only accepted tokens.
 """
 
 import logging
-from typing import Any, NamedTuple, Optional, Sequence, Union
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -109,11 +109,11 @@ class StagingBuffer:
         # CRITICAL: Single slot buffer for ALL layers (not per-layer!)
         self.slot_buffer = torch.empty(max_tokens, device=device, dtype=torch.long)
 
-        # Track which positions have been staged
+        # Track which positions have been staged globally and per-layer
         self.token_mask = torch.zeros(max_tokens, device=device, dtype=torch.bool)
-
-        # Track per-layer staging progress (prevents reading uninitialized tensors)
-        self.layer_stage_count = torch.zeros(n_layers, device=device, dtype=torch.long)
+        self.layer_mask = torch.zeros((n_layers, max_tokens),
+                                      device=device,
+                                      dtype=torch.bool)
 
         # Per-layer cache references (stored during staging, used during commit)
         self.layer_refs: dict[int, LayerRef] = {}
@@ -127,7 +127,7 @@ class StagingBuffer:
     def reset(self):
         """Clear buffer for new speculation round."""
         self.token_mask.zero_()
-        self.layer_stage_count.zero_()
+        self.layer_mask.zero_()
         self.layer_refs.clear()
         self.stage_count = 0
 
@@ -204,10 +204,30 @@ class StagingBuffer:
 
         # Mark position as staged
         self.token_mask[token_idx] = True
+        self.layer_mask[layer_idx, token_idx] = True
         self.stage_count += 1
 
-        # Track per-layer staging progress (highest token index staged for this layer)
-        self.layer_stage_count[layer_idx] = max(self.layer_stage_count[layer_idx].item(), token_idx + 1)
+    def ready_for_commit(self, accepted_len: int) -> Tuple[bool, Dict[int, int]]:
+        """Return whether all staged layers have at least accepted_len tokens."""
+        if accepted_len <= 0:
+            return True, {}
+        if accepted_len > self.max_tokens:
+            return False, {}
+
+        if not self.layer_refs:
+            return False, {}
+
+        per_layer_counts: Dict[int, int] = {}
+        for layer_idx in self.layer_refs.keys():
+            prefix_mask = self.layer_mask[layer_idx, :accepted_len]
+            per_layer_counts[layer_idx] = int(prefix_mask.sum().item())
+            if per_layer_counts[layer_idx] < accepted_len:
+                return False, per_layer_counts
+
+        if not self.token_mask[:accepted_len].all():
+            return False, per_layer_counts
+
+        return True, per_layer_counts
 
     def commit(self, accepted_len: int) -> int:
         """
@@ -226,24 +246,14 @@ class StagingBuffer:
             logger.debug("No tokens accepted, skipping commit")
             return 0
 
-        # Validate complete staging for accepted range
-        if not self.token_mask[:accepted_len].all():
-            logger.warning(f"Incomplete staging for tokens [0:{accepted_len}], rejecting all")
+        ready, per_layer = self.ready_for_commit(accepted_len)
+        if not ready:
+            logger.warning(
+                "Incomplete staging for accepted_len=%d (per_layer=%s)",
+                accepted_len,
+                per_layer,
+            )
             return 0
-
-        # Validate we have all layer references
-        if not self.layer_refs:
-            logger.error("No layer references stored, cannot commit")
-            return 0
-
-        # Validate EVERY layer has staged enough tokens (prevents reading uninitialized tensors)
-        if len(self.layer_refs) > 0:
-            # Get min tokens staged across only the layers that were written to
-            active_layers = list(self.layer_refs.keys())
-            min_staged = self.layer_stage_count[active_layers].min().item()
-            if min_staged < accepted_len:
-                logger.error(f"Incomplete layer staging: min_staged={min_staged} across layers, need {accepted_len}")
-                return 0
 
         # Get shared slot mapping for all layers
         slots = self.slot_buffer[:accepted_len].contiguous()
@@ -327,6 +337,7 @@ class KVCacheInterceptor:
         # Dynamic window sizing (updated at enable_staging time)
         self.window_capacity = max(self.max_spec_tokens + 1, 0)
         self.active_window_tokens = 0
+        self.pending_commit: Optional[Tuple[int, int]] = None
 
         # Metrics
         self.total_staged = 0
@@ -370,21 +381,23 @@ class KVCacheInterceptor:
 
         # Circuit breaker: Disable NWOR after consecutive failures
         if self.consecutive_failures >= self.max_consecutive_failures:
-            logger.error(f"NWOR: {self.consecutive_failures} consecutive failures, permanently disabling NWOR")
-            self.nwor_enabled = False
-            return False
+            msg = ("NWOR: {} consecutive commit failures encountered; "
+                   "aborting run to avoid silent fallback")
+            formatted = msg.format(self.consecutive_failures)
+            logger.error(formatted)
+            raise RuntimeError(formatted)
 
         # Compute dynamic window size FIRST (before any early returns)
         # This ensures window size is always updated for new batch
         if isinstance(num_tokens, (list, tuple)):
             total_drafts = sum(int(d) for d in num_tokens)
             active_reqs = sum(1 for d in num_tokens if int(d) > 0)
-            # Each active request has: 1 verified + N drafts
-            # Total = sum(drafts) + count(active_reqs with >0 drafts)
-            self.active_window_tokens = total_drafts + active_reqs
+            # Each active request contributes its speculative tail plus one verified token.
+            # Add a global safety slot to ensure we can stage the verifier token.
+            self.active_window_tokens = total_drafts + active_reqs + 1
             logger.info(
-                "NWOR: Dynamic window size=%d (total_drafts=%d, active_reqs=%d)",
-                self.active_window_tokens, total_drafts, active_reqs,
+                "NWOR: Dynamic window size=%d (total_drafts=%d, active_reqs=%d, drafts_per_req=%s)",
+                self.active_window_tokens, total_drafts, active_reqs, list(num_tokens),
             )
         else:
             total = int(num_tokens)
@@ -401,11 +414,18 @@ class KVCacheInterceptor:
 
         # If already in staging mode, window size is now updated - just return
         if self.mode == "staging":
-            logger.debug(f"NWOR: Already in staging mode, updated window to {self.active_window_tokens}")
-            # Reset layer tracking even on early return (for deferred commit scenarios)
-            self.current_layer_idx = -1
-            self.last_token_idx = -1
-            return True
+            if self.pending_commit:
+                logger.warning("NWOR: Pending commit detected during enable_staging; forcing finalize")
+                self._maybe_finalize_commit(force=True)
+            if self.mode != "staging":
+                # Force finalize disabled staging; fall through to fresh enable.
+                pass
+            else:
+                logger.debug(f"NWOR: Already in staging mode, updated window to {self.active_window_tokens}")
+                self.current_layer_idx = -1
+                self.last_token_idx = -1
+                self.min_token_idx = float('inf')
+                return True
 
         # Check if existing buffer is busy (shouldn't happen with proper lifecycle)
         if self.buffer is not None and self.buffer.is_busy():
@@ -510,6 +530,8 @@ class KVCacheInterceptor:
                 )
                 self.total_staged += 1
                 self.last_token_idx = token_idx  # Update for next iteration
+                if self.pending_commit:
+                    self._maybe_finalize_commit()
             except Exception as e:
                 logger.warning(f"NWOR: Stage failed: {e}, falling back to direct write")
                 self.disable_staging()
@@ -534,37 +556,11 @@ class KVCacheInterceptor:
             accepted_len: Number of accepted tokens
             proposed_len: Number of proposed/draft tokens
         """
-        if self.mode != "staging" or self.buffer is None:
+        if self.mode != "staging":
             return
 
-        try:
-            # Buffer.commit() now handles everything internally using stored LayerRefs
-            committed = self.buffer.commit(accepted_len)
-
-            self.total_committed += committed
-            self.total_rejected += max(proposed_len - committed, 0)
-
-            # Reset consecutive failures on ANY successful commit
-            if committed > 0:
-                self.consecutive_failures = 0
-            elif accepted_len > 0:
-                # We expected to commit tokens but got 0 back - REAL FAILURE
-                # (validation failed, incomplete staging, etc.)
-                self.consecutive_failures += 1
-            # else: accepted_len==0 and committed==0 - legitimate zero-acceptance
-            # by verifier, NOT a failure of NWOR staging/commit logic
-
-            if proposed_len > 0:
-                acceptance_rate = 100 * committed / proposed_len
-                logger.info(f"NWOR: Committed {committed}/{proposed_len} tokens "
-                           f"(acceptance={acceptance_rate:.1f}%)")
-
-        except Exception as e:
-            logger.error(f"NWOR: Commit failed: {e}")
-            self.fallback_count += 1
-            self.consecutive_failures += 1
-        finally:
-            self.disable_staging()
+        self.pending_commit = (accepted_len, proposed_len)
+        self._maybe_finalize_commit()
 
     def disable_staging(self):
         """Return to direct write mode."""
@@ -575,6 +571,100 @@ class KVCacheInterceptor:
         self.last_token_idx = -1  # Reset token tracking
         self.min_token_idx = float('inf')
         self.active_window_tokens = 0  # Clear window size for next window
+        self.pending_commit = None
+
+    def _maybe_finalize_commit(self, force: bool = False) -> None:
+        """Finalize outstanding commit when the buffer is ready."""
+        if self.pending_commit is None:
+            return
+
+        if self.mode != "staging":
+            accepted_len, proposed_len = self.pending_commit
+            logger.warning("NWOR: Pending commit but mode=%s; abandoning", self.mode)
+            self._handle_commit_failure("mode switch", accepted_len, proposed_len)
+            return
+
+        if self.buffer is None:
+            accepted_len, proposed_len = self.pending_commit
+            self._handle_commit_failure("buffer missing", accepted_len, proposed_len)
+            return
+
+        accepted_len, proposed_len = self.pending_commit
+
+        if accepted_len <= 0:
+            self._finalize_zero_accept(proposed_len)
+            return
+
+        ready, per_layer = self.buffer.ready_for_commit(accepted_len)
+        if not ready:
+            if force:
+                logger.error(
+                    "NWOR: Forcing commit abort (accepted=%d, per_layer=%s)",
+                    accepted_len, per_layer)
+                self._handle_commit_failure("incomplete staging",
+                                             accepted_len,
+                                             proposed_len,
+                                             per_layer)
+            else:
+                logger.debug(
+                    "NWOR: Waiting for staging (accepted=%d, per_layer=%s)",
+                    accepted_len, per_layer)
+            return
+
+        try:
+            committed = self.buffer.commit(accepted_len)
+        except Exception as exc:
+            logger.error("NWOR: Commit raised exception: %s", exc)
+            self._handle_commit_failure("exception", accepted_len, proposed_len)
+            return
+
+        self.total_committed += committed
+        self.total_rejected += max(proposed_len - committed, 0)
+
+        if committed > 0:
+            self.consecutive_failures = 0
+        else:
+            self.consecutive_failures += 1
+
+        if proposed_len > 0:
+            acceptance_rate = 100 * committed / proposed_len
+            logger.info(
+                "NWOR: Committed %d/%d tokens (acceptance=%.1f%%)",
+                committed,
+                proposed_len,
+                acceptance_rate,
+            )
+
+        self.pending_commit = None
+        self.disable_staging()
+
+    def _finalize_zero_accept(self, proposed_len: int) -> None:
+        """Handle the case where verifier rejected all speculative tokens."""
+        if proposed_len > 0:
+            self.total_rejected += proposed_len
+            logger.info("NWOR: All %d speculative tokens rejected", proposed_len)
+        self.consecutive_failures = 0
+        self.pending_commit = None
+        self.disable_staging()
+
+    def _handle_commit_failure(self,
+                               reason: str,
+                               accepted_len: int,
+                               proposed_len: int,
+                               per_layer: Optional[Dict[int, int]] = None) -> None:
+        """Record metrics and tear down staging after a commit failure."""
+        self.fallback_count += 1
+        if accepted_len > 0:
+            self.consecutive_failures += 1
+        logger.error(
+            "NWOR: Commit failure (%s) accepted=%d proposed=%d per_layer=%s",
+            reason,
+            accepted_len,
+            proposed_len,
+            per_layer,
+        )
+        self.pending_commit = None
+        self.disable_staging()
 
     def get_metrics(self) -> dict:
         """Get current metrics."""
