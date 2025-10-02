@@ -112,6 +112,9 @@ class StagingBuffer:
         # Track which positions have been staged
         self.token_mask = torch.zeros(max_tokens, device=device, dtype=torch.bool)
 
+        # Track per-layer staging progress (prevents reading uninitialized tensors)
+        self.layer_stage_count = torch.zeros(n_layers, device=device, dtype=torch.long)
+
         # Per-layer cache references (stored during staging, used during commit)
         self.layer_refs: dict[int, LayerRef] = {}
 
@@ -124,6 +127,7 @@ class StagingBuffer:
     def reset(self):
         """Clear buffer for new speculation round."""
         self.token_mask.zero_()
+        self.layer_stage_count.zero_()
         self.layer_refs.clear()
         self.stage_count = 0
 
@@ -202,6 +206,9 @@ class StagingBuffer:
         self.token_mask[token_idx] = True
         self.stage_count += 1
 
+        # Track per-layer staging progress (highest token index staged for this layer)
+        self.layer_stage_count[layer_idx] = max(self.layer_stage_count[layer_idx].item(), token_idx + 1)
+
     def commit(self, accepted_len: int) -> int:
         """
         Commit accepted prefix to real KV cache (all-or-nothing).
@@ -228,6 +235,15 @@ class StagingBuffer:
         if not self.layer_refs:
             logger.error("No layer references stored, cannot commit")
             return 0
+
+        # Validate EVERY layer has staged enough tokens (prevents reading uninitialized tensors)
+        if len(self.layer_refs) > 0:
+            # Get min tokens staged across only the layers that were written to
+            active_layers = list(self.layer_refs.keys())
+            min_staged = self.layer_stage_count[active_layers].min().item()
+            if min_staged < accepted_len:
+                logger.error(f"Incomplete layer staging: min_staged={min_staged} across layers, need {accepted_len}")
+                return 0
 
         # Get shared slot mapping for all layers
         slots = self.slot_buffer[:accepted_len].contiguous()
@@ -531,9 +547,12 @@ class KVCacheInterceptor:
             # Reset consecutive failures on ANY successful commit
             if committed > 0:
                 self.consecutive_failures = 0
-            else:
-                # Commit returned 0 (validation failed, incomplete staging, etc.)
+            elif accepted_len > 0:
+                # We expected to commit tokens but got 0 back - REAL FAILURE
+                # (validation failed, incomplete staging, etc.)
                 self.consecutive_failures += 1
+            # else: accepted_len==0 and committed==0 - legitimate zero-acceptance
+            # by verifier, NOT a failure of NWOR staging/commit logic
 
             if proposed_len > 0:
                 acceptance_rate = 100 * committed / proposed_len
