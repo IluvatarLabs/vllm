@@ -69,6 +69,10 @@ class CudagraphDispatcher:
                 self.add_cudagraph_key(
                     cudagraph_mode.mixed_mode(),
                     BatchDescriptor(num_tokens=bs, uniform_decode=False))
+                self.add_cudagraph_key(
+                    cudagraph_mode.mixed_mode(),
+                    BatchDescriptor(num_tokens=bs, uniform_decode=False,
+                                    nwor_staging=True))
 
         # if decode cudagraph mode is FULL, and we don't already have mixed
         # mode full cudagraphs then add them here.
@@ -84,6 +88,10 @@ class CudagraphDispatcher:
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     BatchDescriptor(num_tokens=bs, uniform_decode=True))
+                self.add_cudagraph_key(
+                    CUDAGraphMode.FULL,
+                    BatchDescriptor(num_tokens=bs, uniform_decode=True,
+                                    nwor_staging=True))
         self.keys_initialized = True
 
     def dispatch(

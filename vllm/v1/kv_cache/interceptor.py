@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NWOR (No-Write-On-Reject) interceptor with centralized staging queue."""
+"""NWOR (No-Write-On-Reject) interceptor with device-side staging."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
 import torch
 from torch import Tensor
+
+from .staging import StagingBuffers
 
 logger = logging.getLogger(__name__)
 
@@ -41,17 +42,6 @@ def has_real_storage(tensor: Tensor) -> bool:
     except (RuntimeError, NotImplementedError):
         return False
 
-@dataclass
-class StagedWrite:
-    key: Tensor
-    value: Tensor
-    key_cache: Tensor
-    value_cache: Tensor
-    slot_mapping: Tensor
-    kv_dtype: str
-    k_scale: Optional[Tensor]
-    v_scale: Optional[Tensor]
-
 class KVCacheInterceptor:
     """Queues verifier KV writes and replays accepted prefix atomically."""
 
@@ -74,13 +64,19 @@ class KVCacheInterceptor:
             logger.info("NWOR disabled (missing speculative config or use_shadow_kv=False)")
 
         self.mode = "direct"
-        self.pending_writes: list[StagedWrite] = []
         self.num_draft_tokens = 0
 
         self.total_committed = 0
         self.total_rejected = 0
         self.total_staged_tokens = 0
         self.fallback_count = 0
+
+        # Device-side staging buffers & layer cache mapping (populated by worker)
+        self.staging_buffers: Optional[StagingBuffers] = None
+        self.layer_key_caches: list[Tensor] = []
+        self.layer_value_caches: list[Tensor] = []
+        self.cache_ptr_to_layer: dict[int, int] = {}
+        self.requires_eager_warmup: bool = False
 
     # ------------------------------------------------------------------ lifecycle
     def ensure_ready(self, key_cache: Tensor, value_cache: Tensor) -> None:
@@ -90,11 +86,52 @@ class KVCacheInterceptor:
             self.ready = True
             logger.info("NWOR: KV cache ready, staging available")
 
-    def should_queue(self) -> bool:
-        return self.mode == "staging" and self.ready and self.nwor_enabled
+    # Device staging buffers -------------------------------------------------
+
+    def set_staging_buffers(self, buffers: Optional[StagingBuffers]) -> None:
+        """Register device staging buffers allocated by the worker."""
+        self.staging_buffers = buffers
+        if buffers is not None:
+            logger.info(
+                "NWOR: Device staging buffers registered (capacity=%d)",
+                buffers.capacity,
+            )
+            self.requires_eager_warmup = True
+        else:
+            self.requires_eager_warmup = False
+            self.layer_key_caches = []
+            self.layer_value_caches = []
+            self.cache_ptr_to_layer = {}
+
+    def needs_eager_warmup(self) -> bool:
+        return self.requires_eager_warmup
+
+    def register_layer_caches(
+        self, key_caches: Sequence[Tensor], value_caches: Sequence[Tensor]
+    ) -> None:
+        if self.staging_buffers is not None and \
+                len(key_caches) != len(self.staging_buffers.keys):
+            self._fatal_error(
+                "Layer cache count does not match staging buffers")
+        self.layer_key_caches = list(key_caches)
+        self.layer_value_caches = list(value_caches)
+        self.cache_ptr_to_layer = {
+            key.data_ptr(): idx for idx, key in enumerate(self.layer_key_caches)
+        }
+
+    def _layer_index_for_cache(self, key_cache: Tensor) -> int:
+        ptr = key_cache.data_ptr()
+        layer_idx = self.cache_ptr_to_layer.get(ptr)
+        if layer_idx is None:
+            self._fatal_error("Unknown key cache pointer in staging path")
+        return layer_idx
 
     def enable_staging(self, num_tokens: Union[int, Sequence[int]]) -> bool:
         if not self.ready or not self.nwor_enabled:
+            return False
+
+        if self.staging_buffers is None:
+            logger.warning("NWOR: Staging buffers unavailable; cannot enable staging")
             return False
 
         if isinstance(num_tokens, Sequence) and not isinstance(num_tokens, (str, bytes)):
@@ -110,21 +147,35 @@ class KVCacheInterceptor:
             logger.warning("NWOR: Cannot enable staging during CUDA graph capture")
             return False
 
+        capacity = self.staging_buffers.capacity
+        if draft_total > capacity:
+            self._fatal_error(
+                f"staging capacity {capacity} insufficient for draft window {draft_total}"
+            )
+
         self.mode = "staging"
-        self.pending_writes.clear()
         self.num_draft_tokens = draft_total
-        logger.debug("NWOR: Staging enabled for %d draft tokens", draft_total)
+        current_stream = torch.cuda.current_stream(self.staging_buffers.device)
+        self.staging_buffers.reset(stream=current_stream)
+        logger.debug(
+            "NWOR: Staging enabled for %d draft tokens (capacity=%d)",
+            draft_total,
+            capacity,
+        )
         return True
 
     def disable_staging(self, reason: str = "normal") -> None:
         logger.debug(
-            "NWOR: Disabling staging (reason=%s, pending_writes=%d)",
+            "NWOR: Disabling staging (reason=%s)",
             reason,
-            len(self.pending_writes),
         )
         self.mode = "direct"
-        self.pending_writes.clear()
         self.num_draft_tokens = 0
+        if self.staging_buffers is not None:
+            current_stream = torch.cuda.current_stream(self.staging_buffers.device)
+            self.staging_buffers.reset(stream=current_stream)
+        if reason != "normal":
+            self.requires_eager_warmup = True
 
     def _fatal_error(self, reason: str, exc: Optional[Exception] = None) -> None:
         """Hard fail for true NWOR violations."""
@@ -143,39 +194,35 @@ class KVCacheInterceptor:
             raise RuntimeError(f"NWOR fatal error: {reason}") from exc
         raise RuntimeError(f"NWOR fatal error: {reason}")
 
-    # ------------------------------------------------------------------ staging queue
-    def enqueue_write(
+    def stage_layer_writes(
         self,
         key: Tensor,
         value: Tensor,
         key_cache: Tensor,
-        value_cache: Tensor,
         slot_mapping: Tensor,
         kv_cache_dtype: str,
-        k_scale: Optional[float],
-        v_scale: Optional[float],
+        k_scale: Optional[Tensor],
+        v_scale: Optional[Tensor],
     ) -> bool:
-        if not self.should_queue():
+        if self.mode != "staging" or self.staging_buffers is None:
             return False
 
-        try:
-            key_buf = key.detach().contiguous().clone()
-            value_buf = value.detach().contiguous().clone()
-            slot_buf = slot_mapping.detach().clone()
-        except RuntimeError as exc:  # pragma: no cover - defensive
-            self._fatal_error("failed to clone staging tensors", exc)
+        layer_idx = self._layer_index_for_cache(key_cache)
+        layer_bufs = self.staging_buffers.layer_buffers(layer_idx)
+        metadata = self.staging_buffers.metadata[layer_idx]
 
-        write = StagedWrite(
-            key=key_buf,
-            value=value_buf,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            slot_mapping=slot_buf,
-            kv_dtype=kv_cache_dtype,
-            k_scale=k_scale,
-            v_scale=v_scale,
+        torch.ops._C_cache_ops.stage_kv_cache(
+            key,
+            value,
+            slot_mapping,
+            layer_bufs.key,
+            layer_bufs.value,
+            layer_bufs.slots,
+            metadata,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
         )
-        self.pending_writes.append(write)
         return True
 
     # ------------------------------------------------------------------ commit
@@ -191,48 +238,42 @@ class KVCacheInterceptor:
                 self.num_draft_tokens,
             )
 
-        if not self.pending_writes:
-            if accepted > 0:
+        if self.staging_buffers is None:
+            self._fatal_error("staging buffers not initialized")
+
+        for layer_idx, (key_cache, value_cache) in enumerate(
+                zip(self.layer_key_caches, self.layer_value_caches)):
+            metadata = self.staging_buffers.metadata[layer_idx]
+            staged_count = int(metadata[0].item())
+            error_flag = int(metadata[1].item())
+            if error_flag:
                 self._fatal_error(
-                    f"missing staged writes for {accepted} accepted tokens"
-                )
+                    f"staging overflow detected for layer {layer_idx}")
+            if accepted > staged_count:
+                self._fatal_error(
+                    f"staged tokens {staged_count} < accepted {accepted} for layer {layer_idx}")
+
+        if accepted == 0:
             self.total_rejected += max(proposed_len, 0)
-            self.disable_staging("missing staged writes")
+            self.disable_staging()
             return
 
-        from vllm.attention.utils import fa_utils  # local import to avoid cycles
-
-        for write in self.pending_writes:
-            total = write.key.shape[0]
-            if total < self.num_draft_tokens:
-                self._fatal_error(
-                    f"staged tensor smaller than draft window (total={total}, drafts={self.num_draft_tokens})"
-                )
-
-            draft_start = total - self.num_draft_tokens
-            tokens_to_write = draft_start + accepted
-            tokens_to_write = max(0, min(tokens_to_write, total))
-
-            if tokens_to_write == 0:
-                continue
-
-            try:
-                fa_utils._reshape_and_cache_flash_impl(  # type: ignore[attr-defined]
-                    write.key[:tokens_to_write],
-                    write.value[:tokens_to_write],
-                    write.key_cache,
-                    write.value_cache,
-                    write.slot_mapping[:tokens_to_write],
-                    write.kv_dtype,
-                    write.k_scale,
-                    write.v_scale,
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                self._fatal_error("commit failure", exc)
+        for layer_idx, (key_cache, value_cache) in enumerate(
+                zip(self.layer_key_caches, self.layer_value_caches)):
+            torch.ops._C_cache_ops.commit_staged_kv_cache(
+                self.staging_buffers.keys[layer_idx],
+                self.staging_buffers.values[layer_idx],
+                self.staging_buffers.slots[layer_idx],
+                self.staging_buffers.metadata[layer_idx],
+                key_cache,
+                value_cache,
+                accepted,
+            )
 
         self.total_staged_tokens += accepted
         self.total_committed += accepted
         self.total_rejected += max(proposed_len - accepted, 0)
+        self.requires_eager_warmup = False
         self.disable_staging()
 
     # ------------------------------------------------------------------ metrics
@@ -248,16 +289,17 @@ class KVCacheInterceptor:
             "nwor_acceptance_rate": acceptance_rate,
             "nwor_total_staged_tokens": self.total_staged_tokens,
             "nwor_fallback_count": self.fallback_count,
-            "nwor_current_queue_depth": len(self.pending_writes),
+            "nwor_current_staged": int(
+                self.staging_buffers.metadata[:, 0].sum().item()
+            ) if self.staging_buffers is not None else 0,
         }
 
     def __del__(self):  # pragma: no cover - diagnostic only
         try:
             logger.info(
-                "KVCacheInterceptor.__del__(): mode=%s, enabled=%s, pending=%d",
+                "KVCacheInterceptor.__del__(): mode=%s, enabled=%s",
                 getattr(self, "mode", "unknown"),
                 getattr(self, "nwor_enabled", "unknown"),
-                len(getattr(self, "pending_writes", [])),
             )
         except Exception:
             pass

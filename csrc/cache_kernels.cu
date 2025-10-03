@@ -496,6 +496,226 @@ void reshape_and_cache_flash(
                              CALL_RESHAPE_AND_CACHE_FLASH);
 }
 
+namespace vllm {
+
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void stage_kv_flash_kernel(
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    cache_t* __restrict__ staging_key,
+    cache_t* __restrict__ staging_value,
+    int32_t* __restrict__ staging_slots,
+    int32_t* __restrict__ metadata,  // [count, error_flag]
+    const int64_t* __restrict__ slot_mapping,
+    const int num_tokens,
+    const int num_heads,
+    const int head_size,
+    const int64_t key_stride,
+    const int64_t value_stride,
+    const int64_t staging_token_stride,
+    const int stage_capacity,
+    const float* k_scale,
+    const float* v_scale) {
+  const int token_idx = blockIdx.x;
+  if (token_idx >= num_tokens) {
+    return;
+  }
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+
+  int write_index = atomicAdd(metadata + 0, 1);
+  if (write_index >= stage_capacity) {
+    metadata[1] = 1;
+    return;
+  }
+
+  cache_t* __restrict__ key_dst =
+      staging_key + static_cast<int64_t>(write_index) * staging_token_stride;
+  cache_t* __restrict__ value_dst =
+      staging_value + static_cast<int64_t>(write_index) * staging_token_stride;
+  staging_slots[write_index] = static_cast<int32_t>(slot_idx);
+
+  const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
+  const scalar_t* __restrict__ value_src = value + token_idx * value_stride;
+
+  const int n_elems = num_heads * head_size;
+  float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale;
+  float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale;
+  CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+  CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+  constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
+
+  vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
+                                     blockDim.x, k_op);
+  vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems, threadIdx.x,
+                                     blockDim.x, v_op);
+}
+
+template <typename cache_t>
+__global__ void commit_staged_kv_flash_kernel(
+    const cache_t* __restrict__ staging_key,
+    const cache_t* __restrict__ staging_value,
+    const int32_t* __restrict__ staging_slots,
+    int32_t* __restrict__ metadata,
+    cache_t* __restrict__ key_cache,
+    cache_t* __restrict__ value_cache,
+    const int accepted_len,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int num_heads,
+    const int head_size,
+    const int block_size,
+    const int64_t staging_token_stride) {
+  const int token_idx = blockIdx.x;
+  if (token_idx >= accepted_len) {
+    return;
+  }
+
+  const int32_t slot_idx = staging_slots[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+
+  const cache_t* __restrict__ key_src =
+      staging_key + static_cast<int64_t>(token_idx) * staging_token_stride;
+  const cache_t* __restrict__ value_src =
+      staging_value + static_cast<int64_t>(token_idx) * staging_token_stride;
+
+  cache_t* __restrict__ key_dst =
+      key_cache + block_idx * block_stride + block_offset * page_stride;
+  cache_t* __restrict__ value_dst =
+      value_cache + block_idx * block_stride + block_offset * page_stride;
+
+  const int n_elems = num_heads * head_size;
+  for (int idx = threadIdx.x; idx < n_elems; idx += blockDim.x) {
+    key_dst[idx] = key_src[idx];
+  }
+  for (int idx = threadIdx.x; idx < n_elems; idx += blockDim.x) {
+    value_dst[idx] = value_src[idx];
+  }
+
+  if (token_idx == 0 && threadIdx.x == 0) {
+    metadata[0] = 0;
+    metadata[1] = 0;
+  }
+}
+
+}  // namespace vllm
+
+#define CALL_STAGE_KV_FLASH(KV_T, CACHE_T, KV_DTYPE)                      \
+  vllm::stage_kv_flash_kernel<KV_T, CACHE_T, KV_DTYPE>                    \
+      <<<grid, block, 0, stream>>>(                                       \
+          reinterpret_cast<KV_T*>(key.data_ptr()),                        \
+          reinterpret_cast<KV_T*>(value.data_ptr()),                      \
+          reinterpret_cast<CACHE_T*>(staging_key.data_ptr()),             \
+          reinterpret_cast<CACHE_T*>(staging_value.data_ptr()),           \
+          staging_slots.data_ptr<int32_t>(),                              \
+          staging_metadata.data_ptr<int32_t>(),                           \
+          slot_mapping.data_ptr<int64_t>(),                               \
+          num_tokens,                                                     \
+          num_heads,                                                      \
+          head_size,                                                      \
+          key_stride,                                                     \
+          value_stride,                                                   \
+          staging_token_stride,                                           \
+          stage_capacity,                                                 \
+          reinterpret_cast<const float*>(k_scale.data_ptr()),             \
+          reinterpret_cast<const float*>(v_scale.data_ptr()))
+
+#define CALL_COMMIT_STAGED_KV_FLASH(CACHE_T)                              \
+  vllm::commit_staged_kv_flash_kernel<CACHE_T>                            \
+      <<<grid, block, 0, stream>>>(                                       \
+          reinterpret_cast<const CACHE_T*>(staging_key.data_ptr()),       \
+          reinterpret_cast<const CACHE_T*>(staging_value.data_ptr()),     \
+          staging_slots.data_ptr<int32_t>(),                              \
+          staging_metadata.data_ptr<int32_t>(),                           \
+          reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),               \
+          reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),             \
+          accepted_len,                                                   \
+          block_stride,                                                   \
+          page_stride,                                                    \
+          head_stride,                                                    \
+          num_heads,                                                      \
+          head_size,                                                      \
+          block_size,                                                     \
+          staging_token_stride)
+
+void stage_kv_cache_flash(
+    torch::Tensor& key,
+    torch::Tensor& value,
+    torch::Tensor& slot_mapping,
+    torch::Tensor& staging_key,
+    torch::Tensor& staging_value,
+    torch::Tensor& staging_slots,
+    torch::Tensor& staging_metadata,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale) {
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int stage_capacity = staging_key.size(0);
+
+  TORCH_CHECK(staging_metadata.numel() == 2,
+              "staging metadata must have shape [2]");
+
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t staging_token_stride = staging_key.stride(0);
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
+                             CALL_STAGE_KV_FLASH);
+}
+
+void commit_staged_kv_cache_flash(
+    torch::Tensor& staging_key,
+    torch::Tensor& staging_value,
+    torch::Tensor& staging_slots,
+    torch::Tensor& staging_metadata,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    const int accepted_len) {
+  TORCH_CHECK(staging_metadata.numel() == 2,
+              "staging metadata must have shape [2]");
+
+  int staged_count = staging_metadata[0].item<int>();
+  int error_flag = staging_metadata[1].item<int>();
+  TORCH_CHECK(error_flag == 0, "staging buffer overflow detected before commit");
+  TORCH_CHECK(accepted_len <= staged_count,
+              "accepted tokens exceed staged tokens");
+
+  int num_heads = staging_key.size(1);
+  int head_size = staging_key.size(2);
+  int block_size = key_cache.size(1);
+
+  int64_t staging_token_stride = staging_key.stride(0);
+  int64_t block_stride = key_cache.stride(0);
+  int64_t page_stride = key_cache.stride(1);
+  int64_t head_stride = key_cache.stride(2);
+
+  dim3 grid(accepted_len);
+  dim3 block(std::min(num_heads * head_size, 512));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(staging_key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(
+      staging_key.scalar_type(), "commit_staged_kv_flash_kernel", ([&] {
+        CALL_COMMIT_STAGED_KV_FLASH(scalar_t);
+      }));
+}
+
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.

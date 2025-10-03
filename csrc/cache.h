@@ -31,6 +31,27 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
                              const std::string& kv_cache_dtype,
                              torch::Tensor& k_scale, torch::Tensor& v_scale);
 
+void stage_kv_cache_flash(
+    torch::Tensor& key,
+    torch::Tensor& value,
+    torch::Tensor& slot_mapping,
+    torch::Tensor& staging_key,
+    torch::Tensor& staging_value,
+    torch::Tensor& staging_slots,
+    torch::Tensor& staging_metadata,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale);
+
+void commit_staged_kv_cache_flash(
+    torch::Tensor& staging_key,
+    torch::Tensor& staging_value,
+    torch::Tensor& staging_slots,
+    torch::Tensor& staging_metadata,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    const int accepted_len);
+
 void concat_and_cache_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,
                           const std::string& kv_cache_dtype,

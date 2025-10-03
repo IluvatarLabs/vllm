@@ -524,18 +524,29 @@ class FlashAttentionImpl(AttentionImpl):
             # actual tokens.
 
             interceptor = get_global_interceptor()
-            if interceptor and interceptor.mode == "staging":
+            staged = False
+            if interceptor:
                 interceptor.ensure_ready(key_cache, value_cache)
-            reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+                staged = interceptor.stage_layer_writes(
+                    key,
+                    value,
+                    key_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            if not staged:
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer

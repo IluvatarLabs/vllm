@@ -75,6 +75,7 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.v1.kv_cache.interceptor import get_global_interceptor
+from vllm.v1.kv_cache.staging import StagingBuffers
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         ChunkedLocalAttentionSpec,
                                         CrossAttentionSpec,
@@ -2134,11 +2135,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # NWOR commit: flush accepted tokens to persistent KV cache
             interceptor = get_global_interceptor()
             if interceptor is not None:
-                queue_depth = len(getattr(interceptor, "pending_writes", []))
+                staged_tokens = 0
+                if interceptor.staging_buffers is not None:
+                    staged_tokens = int(
+                        interceptor.staging_buffers.metadata[:, 0].sum().item())
                 logger.info(
-                    "NWOR: Commit check - mode=%s, queue_depth=%d",
+                    "NWOR: Commit check - mode=%s, staged_tokens=%d",
                     interceptor.mode,
-                    queue_depth,
+                    staged_tokens,
                 )
                 if interceptor.mode == "staging":
                     # Get true acceptance metrics from rejection sampler
@@ -2365,8 +2369,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                               == self.uniform_decode_query_len) and (
                                   num_scheduled_tokens
                                   == self.input_batch.num_reqs * max_query_len)
+            staging_active = interceptor is not None and \
+                interceptor.mode == "staging"
             batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
-                                               uniform_decode=uniform_decode)
+                                               uniform_decode=uniform_decode,
+                                               nwor_staging=staging_active)
             cudagraph_runtime_mode, batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(batch_descriptor,
                                                    use_cascade_attn)
@@ -2403,6 +2410,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # Interceptor will compute actual window size (sum of draft+1 per request)
                     logger.info(f"NWOR: Calling enable_staging with per-request draft counts")
                     nwor_staging_enabled = interceptor.enable_staging(num_draft_tokens)
+                    if nwor_staging_enabled and interceptor.needs_eager_warmup():
+                        logger.info(
+                            "NWOR: Staging warmup required; running this iteration without CUDA graph replay"
+                        )
+                        cudagraph_runtime_mode = CUDAGraphMode.NONE
                 else:
                     logger.info(f"NWOR: No draft tokens to stage (total_draft_tokens=0)")
             else:
@@ -3248,9 +3260,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     num_tokens, None, False)
 
             # filter out the valid batch descriptor
+            staging_active = False
+            interceptor = get_global_interceptor()
+            if interceptor is not None and interceptor.mode == "staging":
+                staging_active = True
             _cg_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
                 BatchDescriptor(num_tokens=num_tokens,
-                                uniform_decode=uniform_decode)) \
+                                uniform_decode=uniform_decode,
+                                nwor_staging=staging_active)) \
                 if not is_profile else (CUDAGraphMode.NONE, None)
             if cudagraph_runtime_mode is not None:
                 # we allow forcing NONE when the dispatcher disagrees to support
@@ -4150,6 +4167,39 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "KV cache initialization. NWOR will be disabled.")
             else:
                 logger.info("NWOR Interceptor ready after KV cache initialization")
+
+            # Allocate device-side staging buffers when speculation is enabled.
+            staging_capacity = 0
+            if (self.speculative_config is not None
+                    and self.speculative_config.num_speculative_tokens is not None
+                    and self.speculative_config.num_speculative_tokens > 0
+                    and self.vllm_config.use_shadow_kv):
+                staging_capacity = int(self.speculative_config.num_speculative_tokens) + 1
+
+            if staging_capacity > 0:
+                layer_shapes: list[tuple[int, int]] = []
+                key_tensors: list[torch.Tensor] = []
+                value_tensors: list[torch.Tensor] = []
+                dtype = key_cache.dtype
+                device = key_cache.device
+                for layer_cache in self.kv_caches:
+                    layer_key, layer_value = layer_cache.unbind(0)
+                    num_kv_heads = layer_key.shape[-2]
+                    head_dim = layer_key.shape[-1]
+                    layer_shapes.append((int(num_kv_heads), int(head_dim)))
+                    key_tensors.append(layer_key)
+                    value_tensors.append(layer_value)
+                staging_buffers = StagingBuffers.allocate(
+                    layer_shapes=layer_shapes,
+                    capacity=staging_capacity,
+                    dtype=dtype,
+                    device=device,
+                )
+                interceptor.set_staging_buffers(staging_buffers)
+                interceptor.register_layer_caches(key_tensors, value_tensors)
+            else:
+                interceptor.set_staging_buffers(None)
+                interceptor.register_layer_caches([], [])
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

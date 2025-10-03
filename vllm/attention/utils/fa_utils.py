@@ -73,17 +73,16 @@ def reshape_and_cache_flash(key, value, key_cache, value_cache,
     from vllm.v1.kv_cache.interceptor import get_global_interceptor
 
     interceptor = get_global_interceptor()
-    if interceptor and interceptor.should_queue():
-        if interceptor.enqueue_write(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-        ):
+    if interceptor is not None:
+        interceptor.ensure_ready(key_cache, value_cache)
+        if interceptor.stage_layer_writes(
+                key,
+                value,
+                key_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+                v_scale):
             return
 
     _reshape_and_cache_flash_impl(
