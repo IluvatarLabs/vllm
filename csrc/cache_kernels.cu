@@ -601,10 +601,9 @@ __global__ void commit_staged_kv_flash_kernel(
     value_dst[idx] = value_src[idx];
   }
 
-  if (token_idx == 0 && threadIdx.x == 0) {
-    metadata[0] = 0;
-    metadata[1] = 0;
-  }
+  // NOTE: Metadata reset is handled by Python host code after commit completes.
+  // Resetting here creates a race condition where some threads may still be
+  // reading metadata while it's being zeroed.
 }
 
 }  // namespace vllm

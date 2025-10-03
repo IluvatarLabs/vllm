@@ -2330,6 +2330,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        interceptor = get_global_interceptor()
+
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -2394,7 +2396,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # NWOR lifecycle: Enable staging once for speculative decode window
         # FIX Bug #3: Use try-finally to ensure staging is disabled on error
-        interceptor = get_global_interceptor()
         nwor_staging_enabled = False
         if interceptor:
             if spec_decode_metadata is not None:
@@ -2588,7 +2589,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # If error occurred before commit, we need to disable here
             if nwor_staging_enabled and interceptor and interceptor.mode == "staging":
                 logger.warning("NWOR: Disabling staging due to error before commit")
-                interceptor.disable_staging()
+                interceptor.disable_staging(reason="error")
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
@@ -4174,7 +4175,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     and self.speculative_config.num_speculative_tokens is not None
                     and self.speculative_config.num_speculative_tokens > 0
                     and self.vllm_config.use_shadow_kv):
-                staging_capacity = int(self.speculative_config.num_speculative_tokens) + 1
+                window_per_request = (int(self.speculative_config.num_speculative_tokens)
+                                      + 1)
+                max_reqs = self.vllm_config.scheduler_config.max_num_seqs
+                staging_capacity = window_per_request * int(max_reqs)
 
             if staging_capacity > 0:
                 layer_shapes: list[tuple[int, int]] = []
