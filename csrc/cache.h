@@ -50,7 +50,7 @@ void commit_staged_kv_cache_flash(
     torch::Tensor& staging_metadata,
     torch::Tensor& key_cache,
     torch::Tensor& value_cache,
-    const int accepted_len);
+    const int64_t accepted_len);
 
 void concat_and_cache_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,

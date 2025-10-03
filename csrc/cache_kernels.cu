@@ -685,7 +685,7 @@ void commit_staged_kv_cache_flash(
     torch::Tensor& staging_metadata,
     torch::Tensor& key_cache,
     torch::Tensor& value_cache,
-    const int accepted_len) {
+    const int64_t accepted_len) {
   TORCH_CHECK(staging_metadata.numel() == 2,
               "staging metadata must have shape [2]");
 
