@@ -646,7 +646,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif
 }
 
-TORCH_LIBRARY(_C_cache_ops, cache_ops) {
+TORCH_LIBRARY(cache_ops, cache_ops) {
   // Cache ops
   // Swap in (out) the cache blocks from src to dst.
   cache_ops.def(
