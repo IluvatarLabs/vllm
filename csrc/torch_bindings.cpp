@@ -646,7 +646,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif
 }
 
-TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
+TORCH_LIBRARY_EXPAND(_C_cache_ops, cache_ops) {
   // Cache ops
   // Swap in (out) the cache blocks from src to dst.
   cache_ops.def(
@@ -732,7 +732,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("cp_gather_cache", torch::kCUDA, &cp_gather_cache);
 }
 
-TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
+TORCH_LIBRARY_EXPAND(_C_cuda_utils, cuda_utils) {
   // Cuda utils
 
   // Gets the specified device attribute.
@@ -746,7 +746,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
                   &get_max_shared_memory_per_block_device_attribute);
 }
 
-TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
+TORCH_LIBRARY_EXPAND(_C_custom_ar, custom_ar) {
   // Custom all-reduce kernels
   custom_ar.def(
       "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
