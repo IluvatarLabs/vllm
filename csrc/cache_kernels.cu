@@ -526,9 +526,18 @@ __global__ void stage_kv_flash_kernel(
     return;
   }
 
-  int write_index = atomicAdd(metadata + 0, 1);
+  // Only thread 0 in each block allocates a staging slot
+  __shared__ int write_index;
+  if (threadIdx.x == 0) {
+    write_index = atomicAdd(metadata + 0, 1);
+    if (write_index >= stage_capacity) {
+      metadata[1] = 1;
+    }
+  }
+  __syncthreads();
+
+  // Check if overflow occurred
   if (write_index >= stage_capacity) {
-    metadata[1] = 1;
     return;
   }
 
@@ -536,7 +545,11 @@ __global__ void stage_kv_flash_kernel(
       staging_key + static_cast<int64_t>(write_index) * staging_token_stride;
   cache_t* __restrict__ value_dst =
       staging_value + static_cast<int64_t>(write_index) * staging_token_stride;
-  staging_slots[write_index] = static_cast<int32_t>(slot_idx);
+
+  // Only thread 0 writes the slot mapping
+  if (threadIdx.x == 0) {
+    staging_slots[write_index] = static_cast<int32_t>(slot_idx);
+  }
 
   const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
   const scalar_t* __restrict__ value_src = value + token_idx * value_stride;
