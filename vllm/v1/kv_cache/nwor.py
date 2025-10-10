@@ -145,9 +145,46 @@ class NWORController:
             self.abort_window()
             return False
 
-        key_chunk = key[:chunk_len].contiguous()
-        value_chunk = value[:chunk_len].contiguous()
-        slot_chunk = slot_mapping[:chunk_len].contiguous()
+        # Fast path: single chunk covers entire window and no accumulator active.
+        if self._current_accumulator is None and chunk_len == self._total_tokens:
+            slot_view = slot_mapping[:chunk_len]
+            if self._shared_slot_mapping is None:
+                slot_full = slot_view if slot_view.is_contiguous() else slot_view.contiguous()
+                self._shared_slot_mapping = slot_full
+            else:
+                expected = self._shared_slot_mapping
+                if (slot_view.device != expected.device
+                        or slot_view.shape != expected.shape
+                        or not torch.equal(slot_view, expected)):
+                    self._fallback("slot mapping values differ across layers")
+                    self._write_pending_fallback()
+                    self.abort_window()
+                    return False
+                slot_full = expected
+
+            key_full_view = key[:chunk_len]
+            value_full_view = value[:chunk_len]
+            key_full = key_full_view if key_full_view.is_contiguous() else key_full_view.contiguous()
+            value_full = value_full_view if value_full_view.is_contiguous() else value_full_view.contiguous()
+
+            self._pending_layers.append(
+                _PendingLayer(
+                    layer_name=layer_name,
+                    key=key_full,
+                    value=value_full,
+                    slot_mapping=slot_full,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    kv_cache_dtype=kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    staged_tokens=chunk_len,
+                ))
+            return True
+
+        key_chunk = key[:chunk_len]
+        value_chunk = value[:chunk_len]
+        slot_chunk = slot_mapping[:chunk_len]
 
         acc = self._current_accumulator
         if acc is None or acc.layer_name != layer_name:
@@ -258,6 +295,13 @@ class NWORController:
         full_value = torch.cat(acc.value_chunks, dim=0)
         full_slot = torch.cat(acc.slot_chunks, dim=0)
 
+        if not full_key.is_contiguous():
+            full_key = full_key.contiguous()
+        if not full_value.is_contiguous():
+            full_value = full_value.contiguous()
+        if not full_slot.is_contiguous():
+            full_slot = full_slot.contiguous()
+
         if self._shared_slot_mapping is None:
             self._shared_slot_mapping = full_slot
         else:
@@ -316,12 +360,15 @@ class NWORController:
             acc = self._current_accumulator
             for key_chunk, value_chunk, slot_chunk in zip(
                     acc.key_chunks, acc.value_chunks, acc.slot_chunks):
+                key_local = key_chunk if key_chunk.is_contiguous() else key_chunk.contiguous()
+                value_local = value_chunk if value_chunk.is_contiguous() else value_chunk.contiguous()
+                slot_local = slot_chunk if slot_chunk.is_contiguous() else slot_chunk.contiguous()
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key_chunk,
-                    value_chunk,
+                    key_local,
+                    value_local,
                     acc.key_cache,
                     acc.value_cache,
-                    slot_chunk,
+                    slot_local,
                     acc.kv_cache_dtype,
                     acc.k_scale,
                     acc.v_scale,
