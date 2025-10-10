@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -64,6 +65,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         is_pin_memory_available,
                         length_from_prompt_token_ids_or_embeds, round_up,
                         supports_dynamo)
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.jsontree import json_map_leaves
 from vllm.v1.attention.backends.flash_attn import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -2409,8 +2411,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if total_draft_tokens > 0:
                     # Enable staging with per-request draft counts
                     # Interceptor will compute actual window size (sum of draft+1 per request)
-                    logger.info(f"NWOR: Calling enable_staging with per-request draft counts")
+                    logger.info("NWOR: Calling enable_staging with per-request draft counts")
                     nwor_staging_enabled = interceptor.enable_staging(num_draft_tokens)
+                    logger.info("NWOR: enable_staging returned %s", nwor_staging_enabled)
                     if nwor_staging_enabled and interceptor.needs_eager_warmup():
                         logger.info(
                             "NWOR: Staging warmup required; running this iteration without CUDA graph replay"
@@ -4181,29 +4184,69 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 staging_capacity = window_per_request * int(max_reqs)
 
             if staging_capacity > 0:
+                drafter_layer_names: set[str] = set()
+                if getattr(self, "drafter", None) is not None and \
+                        hasattr(self.drafter, "attn_layer_names"):
+                    drafter_layer_names = set(self.drafter.attn_layer_names)
+
+                num_attn_module = (2 if self.model_config.hf_config.model_type
+                                   == "longcat_flash" else 1)
+                ordered_layer_names = sorted(
+                    kv_caches.keys(),
+                    key=lambda name: extract_layer_index(name, num_attn_module),
+                )
+
                 layer_shapes: list[tuple[int, int]] = []
                 key_tensors: list[torch.Tensor] = []
                 value_tensors: list[torch.Tensor] = []
-                dtype = key_cache.dtype
-                device = key_cache.device
-                for layer_cache in self.kv_caches:
+                verifier_layer_names: list[str] = []
+                ignored_key_caches: list[torch.Tensor] = []
+
+                for layer_name in ordered_layer_names:
+                    layer_cache = kv_caches[layer_name]
                     layer_key, layer_value = layer_cache.unbind(0)
+                    if layer_name in drafter_layer_names:
+                        ignored_key_caches.append(layer_key)
+                        continue
+
                     num_kv_heads = layer_key.shape[-2]
                     head_dim = layer_key.shape[-1]
                     layer_shapes.append((int(num_kv_heads), int(head_dim)))
                     key_tensors.append(layer_key)
                     value_tensors.append(layer_value)
-                staging_buffers = StagingBuffers.allocate(
-                    layer_shapes=layer_shapes,
-                    capacity=staging_capacity,
-                    dtype=dtype,
-                    device=device,
-                )
-                interceptor.set_staging_buffers(staging_buffers)
-                interceptor.register_layer_caches(key_tensors, value_tensors)
+                    verifier_layer_names.append(layer_name)
+
+                if not key_tensors:
+                    logger.warning(
+                        "NWOR: No verifier layers available for staging; disabling NWOR")
+                    interceptor.set_staging_buffers(None)
+                    interceptor.register_layer_caches([], [], [])
+                    interceptor.register_ignored_cache_ptrs([])
+                else:
+                    logger.info(
+                        "NWOR: staging verifier_layers=%s ignored_layers=%s",
+                        verifier_layer_names,
+                        list(drafter_layer_names),
+                    )
+                    dtype = key_tensors[0].dtype
+                    device = key_tensors[0].device
+                    staging_buffers = StagingBuffers.allocate(
+                        layer_shapes=layer_shapes,
+                        capacity=staging_capacity,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    interceptor.set_staging_buffers(staging_buffers)
+                    interceptor.register_layer_caches(
+                        key_tensors,
+                        value_tensors,
+                        verifier_layer_names,
+                    )
+                    interceptor.register_ignored_cache_ptrs(ignored_key_caches)
             else:
                 interceptor.set_staging_buffers(None)
-                interceptor.register_layer_caches([], [])
+                interceptor.register_layer_caches([], [], [])
+                interceptor.register_ignored_cache_ptrs([])
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

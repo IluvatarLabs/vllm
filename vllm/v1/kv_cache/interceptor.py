@@ -75,7 +75,9 @@ class KVCacheInterceptor:
         self.staging_buffers: Optional[StagingBuffers] = None
         self.layer_key_caches: list[Tensor] = []
         self.layer_value_caches: list[Tensor] = []
+        self.layer_names: list[str] = []
         self.cache_ptr_to_layer: dict[int, int] = {}
+        self.ignored_cache_ptrs: set[int] = set()
         self.requires_eager_warmup: bool = False
 
     # ------------------------------------------------------------------ lifecycle
@@ -101,13 +103,18 @@ class KVCacheInterceptor:
             self.requires_eager_warmup = False
             self.layer_key_caches = []
             self.layer_value_caches = []
+            self.layer_names = []
             self.cache_ptr_to_layer = {}
+            self.ignored_cache_ptrs.clear()
 
     def needs_eager_warmup(self) -> bool:
         return self.requires_eager_warmup
 
     def register_layer_caches(
-        self, key_caches: Sequence[Tensor], value_caches: Sequence[Tensor]
+        self,
+        key_caches: Sequence[Tensor],
+        value_caches: Sequence[Tensor],
+        layer_names: Optional[Sequence[str]] = None,
     ) -> None:
         if self.staging_buffers is not None and \
                 len(key_caches) != len(self.staging_buffers.keys):
@@ -115,16 +122,35 @@ class KVCacheInterceptor:
                 "Layer cache count does not match staging buffers")
         self.layer_key_caches = list(key_caches)
         self.layer_value_caches = list(value_caches)
+        self.layer_names = list(layer_names) if layer_names is not None else []
         self.cache_ptr_to_layer = {
             key.data_ptr(): idx for idx, key in enumerate(self.layer_key_caches)
         }
+        self.ignored_cache_ptrs.clear()
+        for idx, key in enumerate(self.layer_key_caches):
+            layer_name = (
+                self.layer_names[idx] if idx < len(self.layer_names) else str(idx)
+            )
+            logger.info(
+                "NWOR: register verifier layer=%s ptr=%d",
+                layer_name,
+                key.data_ptr(),
+            )
 
-    def _layer_index_for_cache(self, key_cache: Tensor) -> int:
+    def register_ignored_cache_ptrs(self, caches: Sequence[Tensor]) -> None:
+        self.ignored_cache_ptrs = {cache.data_ptr() for cache in caches}
+        for cache in caches:
+            logger.info("NWOR: register ignored cache ptr=%d", cache.data_ptr())
+
+    def _layer_index_for_cache(self, key_cache: Tensor) -> Optional[int]:
         ptr = key_cache.data_ptr()
         layer_idx = self.cache_ptr_to_layer.get(ptr)
-        if layer_idx is None:
-            self._fatal_error("Unknown key cache pointer in staging path")
-        return layer_idx
+        if layer_idx is not None:
+            return layer_idx
+        if ptr in self.ignored_cache_ptrs:
+            logger.info("NWOR: Ignoring drafter cache pointer=%d", ptr)
+            return None
+        self._fatal_error("Unknown key cache pointer in staging path")
 
     def enable_staging(self, num_tokens: Union[int, Sequence[int]]) -> bool:
         if not self.ready or not self.nwor_enabled:
@@ -208,8 +234,19 @@ class KVCacheInterceptor:
             return False
 
         layer_idx = self._layer_index_for_cache(key_cache)
+        if layer_idx is None:
+            return False
+
         layer_bufs = self.staging_buffers.layer_buffers(layer_idx)
         metadata = self.staging_buffers.metadata[layer_idx]
+        layer_name = (
+            self.layer_names[layer_idx]
+            if layer_idx < len(self.layer_names)
+            else str(layer_idx)
+        )
+        logger.info(
+            "NWOR: staging call layer=%s ptr=%d", layer_name, key_cache.data_ptr()
+        )
 
         torch.ops._C_cache_ops.stage_kv_cache(
             key,
@@ -226,11 +263,27 @@ class KVCacheInterceptor:
         return True
 
     # ------------------------------------------------------------------ commit
-    def commit_window(self, accepted_len: int, proposed_len: int) -> None:
+    def commit_window(
+        self,
+        accepted_per_request: Union[int, Sequence[int]],
+        proposed_per_request: Union[int, Sequence[int]],
+    ) -> None:
         if self.mode != "staging":
             return
 
-        accepted = max(0, min(int(accepted_len), self.num_draft_tokens))
+        if isinstance(accepted_per_request, Sequence) and \
+                not isinstance(accepted_per_request, (str, bytes)):
+            accepted_len = sum(int(x) for x in accepted_per_request)
+        else:
+            accepted_len = int(accepted_per_request)
+
+        if isinstance(proposed_per_request, Sequence) and \
+                not isinstance(proposed_per_request, (str, bytes)):
+            proposed_len = sum(int(x) for x in proposed_per_request)
+        else:
+            proposed_len = int(proposed_per_request)
+
+        accepted = max(0, min(accepted_len, self.num_draft_tokens))
         if accepted_len > self.num_draft_tokens:
             logger.warning(
                 "NWOR: accepted_len (%d) exceeds draft tokens (%d), clamping",
@@ -246,12 +299,32 @@ class KVCacheInterceptor:
             metadata = self.staging_buffers.metadata[layer_idx]
             staged_count = int(metadata[0].item())
             error_flag = int(metadata[1].item())
+            if logger.isEnabledFor(logging.INFO):
+                layer_name = (
+                    self.layer_names[layer_idx]
+                    if layer_idx < len(self.layer_names)
+                    else str(layer_idx)
+                )
+                logger.info(
+                    "NWOR: pre-commit layer=%s staged_count=%d accepted=%d",
+                    layer_name,
+                    staged_count,
+                    accepted,
+                )
             if error_flag:
                 self._fatal_error(
                     f"staging overflow detected for layer {layer_idx}")
             if accepted > staged_count:
-                self._fatal_error(
-                    f"staged tokens {staged_count} < accepted {accepted} for layer {layer_idx}")
+                logger.warning(
+                    "NWOR: staged tokens %d < accepted %d for layer %s; falling back",
+                    staged_count,
+                    accepted,
+                    layer_name,
+                )
+                self.total_rejected += max(proposed_len, 0)
+                self.disable_staging(reason="insufficient_staged")
+                self.fallback_count += 1
+                return
 
         if accepted == 0:
             self.total_rejected += max(proposed_len, 0)

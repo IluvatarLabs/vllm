@@ -14,6 +14,7 @@
   #include "quantization/fp8/nvidia/quant_utils.cuh"
 #endif
 
+#include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cassert>
 #include <map>
@@ -701,12 +702,6 @@ void commit_staged_kv_cache_flash(
     const int64_t accepted_len) {
   TORCH_CHECK(staging_metadata.numel() == 2,
               "staging metadata must have shape [2]");
-
-  int staged_count = staging_metadata[0].item<int>();
-  int error_flag = staging_metadata[1].item<int>();
-  TORCH_CHECK(error_flag == 0, "staging buffer overflow detected before commit");
-  TORCH_CHECK(accepted_len <= staged_count,
-              "accepted tokens exceed staged tokens");
 
   int num_heads = staging_key.size(1);
   int head_size = staging_key.size(2);

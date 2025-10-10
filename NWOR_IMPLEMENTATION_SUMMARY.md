@@ -32,6 +32,21 @@
 - **Speculation detection**: Simple heuristic (>1 token)
 - **Seamless integration**: Falls back to direct writes when not speculating
 
+### Phase 4: Device-Side Staging Kernels ✅
+**Files**:
+- `csrc/cache_kernels.cu` (lines 649-733) - CUDA kernel implementations
+- `csrc/torch_bindings.cpp` (lines 649-733) - PyTorch operator registration
+- `csrc/cache.h` (lines 45-64) - Function declarations
+
+**Operators** (registered in `torch.ops._C_cache_ops`):
+- `stage_kv_cache(key, value, slot_mapping, staging_key, staging_value, staging_slots, staging_metadata, kv_cache_dtype, k_scale, v_scale)`
+  - Stages KV writes to GPU-side staging buffers
+  - Avoids host-device synchronization for draft tokens
+
+- `commit_staged_kv_cache(staging_key, staging_value, staging_slots, staging_metadata, key_cache, value_cache, accepted_len)`
+  - Commits accepted staged tokens to main KV cache
+  - Single atomic operation for all accepted tokens
+
 ## The Critical Insights
 
 ### 1. Shared Slot Mapping (THE Bug Fix)
@@ -93,26 +108,61 @@ When running with speculative decoding:
 
 ## How to Test
 
+### Device-Side Staging Operators
+
+**✅ CRITICAL FIX: Operators register in `torch.ops._C_cache_ops`, not `torch.ops.cache_ops`!**
+
+The week-long debugging issue was simply looking in the wrong namespace. Operators have been working all along.
+
 ```bash
-# 1. Run with speculative decoding enabled
+# 0. Spawn a development shell inside the CUDA image (mounts repo, disables wheels)
+tools/docker_dev_shell.sh -it
+
+# 1. Incrementally rebuild the CUDA extension when kernels change
+#    (requires that the initial `pip install -e .` or equivalent CMake
+#    configure has already produced build/build.ninja)
+tools/rebuild_nwor_extension.sh
+
+# 2. Test operators are registered (CRITICAL: Must set VLLM_USE_PRECOMPILED=0)
+VLLM_USE_PRECOMPILED=0 python3 - <<'PY'
+import torch, vllm._C
+print("✓ Has stage_kv_cache:", hasattr(torch.ops._C_cache_ops, 'stage_kv_cache'))
+print("✓ Has commit_staged_kv_cache:", hasattr(torch.ops._C_cache_ops, 'commit_staged_kv_cache'))
+PY
+
+# 3. Run with speculative decoding enabled
 python bench_vllm.py --mode nwor --batch-size 1 --num-speculative-tokens 48
 
-# 2. Check logs for NWOR messages
+# 4. Check logs for NWOR messages
 grep "NWOR" output.log
 
-# 3. Verify metrics
+# 5. Verify metrics
 # Should see:
 # - "NWOR: Committed X/Y tokens (acceptance=Z%)"
 # - nwor_total_staged > 0
 # - nwor_acceptance_rate > 0
 ```
 
+**Environment Variables:**
+- `VLLM_USE_PRECOMPILED=0` - Forces use of locally built extension instead of precompiled wheel
+- `LD_LIBRARY_PATH` - May need to include torch library path if not in default location
+
 ## Key Files
 
+**Python Implementation:**
 - `/vllm/v1/kv_cache/interceptor.py` - Core implementation (431 lines)
 - `/vllm/v1/attention/backends/flash_attn.py` - Integration point (~60 lines added)
 - `/tests/unit/test_nwor_buffer.py` - Unit tests
+
+**CUDA/C++ Implementation:**
+- `/csrc/cache_kernels.cu` (lines 649-733) - Device-side staging kernels
+- `/csrc/torch_bindings.cpp` (lines 649-733) - Operator registration
+- `/csrc/cache.h` (lines 45-64) - Function declarations
+- `/tools/rebuild_nwor_extension.sh` - Incremental build script
+
+**Documentation:**
 - `/docs/nwor_scv_final_design.md` - Full design document
+- `/NWOR_IMPLEMENTATION_SUMMARY.md` - This file
 
 ## Success Criteria
 

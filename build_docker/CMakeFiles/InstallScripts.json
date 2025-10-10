@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"/workspace/vllm/build_docker/cmake_install.cmake",
+		"/workspace/vllm/build_docker/_deps/cutlass-build/cmake_install.cmake",
+		"/workspace/vllm/build_docker/_deps/cutlass-build/tools/cmake_install.cmake",
+		"/workspace/vllm/build_docker/_deps/cutlass-build/tools/util/cmake_install.cmake",
+		"/workspace/vllm/build_docker/vllm-flash-attn/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

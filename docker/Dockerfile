@@ -174,6 +174,14 @@ ENV UV_LINK_MODE=copy
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements/build.txt \
     --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+RUN python3 -m pip install --no-cache-dir diskcache nvidia-ml-py
+
+# Additional runtime utilities required by NWOR / fastserve tests.
+#  * diskcache: used by bench_vllm_real.py when running the NWOR suite
+#  * nvidia-ml-py: exposes pynvml so vLLM can auto-detect CUDA devices
+RUN python3 -m pip install --no-cache-dir \
+        "diskcache>=5.6.3" \
+        nvidia-ml-py
 
 COPY . .
 ARG GIT_REPO_CHECK=0

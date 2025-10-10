@@ -48,6 +48,8 @@ class RejectionSampler(nn.Module):
         # Metrics for last rejection sampling operation
         self.last_accepted_count = 0
         self.last_proposed_count = 0
+        self.last_accepted_per_request: list[int] = []
+        self.last_proposed_per_request: list[int] = []
 
     def forward(
         self,
@@ -113,24 +115,32 @@ class RejectionSampler(nn.Module):
         # Accepted count = position of first PLACEHOLDER (-1) per request
         # (this is the draft prefix accepted before first rejection)
         batch_size = len(metadata.num_draft_tokens)
+        accepted_per_request: list[int] = []
+        proposed_per_request: list[int] = list(metadata.num_draft_tokens)
         total_accepted = 0
-        total_proposed = sum(metadata.num_draft_tokens)
 
         for req_idx in range(batch_size):
-            row = output_token_ids[req_idx]
-            # Find first placeholder (rejection point)
-            placeholders = (row == PLACEHOLDER_TOKEN_ID).nonzero(as_tuple=True)[0]
-            if len(placeholders) > 0:
-                # Rejection happened at this position
-                accepted = placeholders[0].item()
+            if metadata.num_draft_tokens[req_idx] == 0:
+                accepted = 0
             else:
-                # All tokens accepted (draft + bonus)
-                # But for NWOR we only count the draft tokens (not bonus)
-                accepted = metadata.num_draft_tokens[req_idx]
+                row = output_token_ids[req_idx]
+                # Find first placeholder (rejection point)
+                placeholders = (row == PLACEHOLDER_TOKEN_ID).nonzero(
+                    as_tuple=True)[0]
+                if len(placeholders) > 0:
+                    # Rejection happened at this position
+                    accepted = placeholders[0].item()
+                else:
+                    # All tokens accepted (draft + bonus)
+                    # But for NWOR we only count the draft tokens (not bonus)
+                    accepted = metadata.num_draft_tokens[req_idx]
+            accepted_per_request.append(accepted)
             total_accepted += accepted
 
+        self.last_accepted_per_request = accepted_per_request
+        self.last_proposed_per_request = proposed_per_request
         self.last_accepted_count = total_accepted
-        self.last_proposed_count = total_proposed
+        self.last_proposed_count = sum(proposed_per_request)
 
         return output_token_ids
 

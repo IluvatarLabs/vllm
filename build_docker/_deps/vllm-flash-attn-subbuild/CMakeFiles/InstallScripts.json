@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
