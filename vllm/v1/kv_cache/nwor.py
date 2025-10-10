@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -203,11 +204,19 @@ class NWORController:
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("NWOR chunk layer=%s chunk_len=%d acc=%d/%d",
+                             layer_name, chunk_len, chunk_len,
+                             self._total_tokens)
         else:
             acc.key_chunks.append(key_chunk)
             acc.value_chunks.append(value_chunk)
             acc.slot_chunks.append(slot_chunk)
             acc.tokens_accumulated += chunk_len
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("NWOR chunk layer=%s chunk_len=%d acc=%d/%d",
+                             layer_name, chunk_len, acc.tokens_accumulated,
+                             self._total_tokens)
 
         acc = self._current_accumulator
         assert acc is not None
@@ -329,6 +338,10 @@ class NWORController:
                 v_scale=acc.v_scale,
                 staged_tokens=self._total_tokens,
             ))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("NWOR finalize layer=%s tokens=%d expected=%d",
+                         acc.layer_name, self._total_tokens,
+                         self._total_tokens)
         self._current_accumulator = None
         return True
 
