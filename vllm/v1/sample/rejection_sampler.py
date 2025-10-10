@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,10 @@ class RejectionSampler(nn.Module):
         Tokens are finally generated with the rejection sampler.
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_accepted_per_request: Optional[list[int]] = None
 
     def forward(
         self,
@@ -102,7 +106,30 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             sampling_metadata,
         )
+        self.last_accepted_per_request = self._compute_accepted_per_request(
+            output_token_ids,
+            metadata.num_draft_tokens,
+        )
         return output_token_ids
+
+    @staticmethod
+    def _compute_accepted_per_request(
+        output_token_ids: torch.Tensor,
+        num_draft_tokens: Sequence[int],
+    ) -> list[int]:
+        accepted: list[int] = []
+        for batch_idx, drafted in enumerate(num_draft_tokens):
+            if drafted <= 0:
+                accepted.append(0)
+                continue
+            row = output_token_ids[batch_idx, :drafted]
+            placeholders = row.eq(PLACEHOLDER_TOKEN_ID)
+            if placeholders.any():
+                first_reject = int(placeholders.nonzero(as_tuple=False)[0].item())
+                accepted.append(first_reject)
+            else:
+                accepted.append(drafted)
+        return accepted
 
     @staticmethod
     def parse_output(

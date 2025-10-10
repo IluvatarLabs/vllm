@@ -41,6 +41,7 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               split_decodes_and_prefills)
 # yapf: enable
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache.nwor import record_or_write_kv_cache
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 
@@ -835,15 +836,16 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                kv_cache[:, 0],
-                kv_cache[:, 1],
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
+            record_or_write_kv_cache(
+                layer_name=layer.layer_name,
+                key=key,
+                value=value,
+                key_cache=kv_cache[:, 0],
+                value_cache=kv_cache[:, 1],
+                slot_mapping=attn_metadata.slot_mapping,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
             )
 
             # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2

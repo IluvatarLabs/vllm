@@ -31,8 +31,8 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
-    get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
-    prepare_communication_buffer_for_model)
+    get_dp_group, get_pp_group, get_tp_group, graph_capture,
+    is_global_first_rank, prepare_communication_buffer_for_model)
 from vllm.forward_context import (BatchDescriptor, DPMetadata,
                                   set_forward_context)
 from vllm.logger import init_logger
@@ -74,6 +74,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 # yapf conflicts with isort for this block
 # yapf: disable
+from vllm.v1.kv_cache.nwor import NWORController, set_global_nwor_controller
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         ChunkedLocalAttentionSpec,
                                         CrossAttentionSpec,
@@ -294,6 +295,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
             self.rejection_sampler = RejectionSampler()
+        else:
+            self.rejection_sampler = None
+
+        self.nwor_controller: Optional[NWORController] = None
+        self._init_nwor_controller()
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -2243,6 +2249,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
+        self._maybe_commit_nwor(spec_decode_metadata)
+
         return (
             num_nans_in_logits,
             logprobs_lists,
@@ -2300,12 +2308,108 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             **model_kwargs,
         )
 
+    # ------------------------------------------------------------------ NWOR
+    def _init_nwor_controller(self) -> None:
+        controller: Optional[NWORController] = None
+        if (envs.VLLM_ENABLE_NWOR and self.speculative_config
+                and get_pp_group().is_last_rank):
+            if torch.distributed.is_initialized():
+                try:
+                    dp_group = get_dp_group()
+                except AssertionError:
+                    dp_group = None
+                if dp_group is not None and dp_group.world_size > 1:
+                    logger.info(
+                        "NWOR disabled because data parallel size is %d",
+                        dp_group.world_size,
+                    )
+                    set_global_nwor_controller(None)
+                    self.nwor_controller = None
+                    return
+            decode_mode = self.compilation_config.cudagraph_mode.decode_mode()
+            if decode_mode == CUDAGraphMode.NONE:
+                controller = NWORController(enabled=True)
+            else:
+                logger.info(
+                    "NWOR disabled because CUDA graph decode mode is %s",
+                    decode_mode,
+                )
+        self.nwor_controller = controller
+        set_global_nwor_controller(controller)
+
+    def _maybe_enable_nwor_window(
+        self,
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
+    ) -> None:
+        controller = self.nwor_controller
+        if controller is None:
+            return
+        if spec_decode_metadata is None:
+            controller.commit_all_pending()
+            return
+        if not controller.begin_window(spec_decode_metadata.num_draft_tokens):
+            controller.commit_all_pending()
+            return
+
+    def _maybe_commit_nwor(
+        self,
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
+    ) -> None:
+        controller = self.nwor_controller
+        if controller is None:
+            return
+        if spec_decode_metadata is None or self.rejection_sampler is None:
+            controller.commit_all_pending()
+            return
+
+        accepted: Optional[list[int]] = None
+        if self.rejection_sampler is not None:
+            accepted = self.rejection_sampler.last_accepted_per_request
+            self.rejection_sampler.last_accepted_per_request = None
+
+        if torch.distributed.is_initialized():
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tp_rank = tp_group.rank_in_group
+                has_data = torch.zeros(1,
+                                       device=self.device,
+                                       dtype=torch.int32)
+                if tp_rank == 0 and accepted is not None:
+                    has_data.fill_(1)
+                tp_group.broadcast(has_data, src=0)
+                if has_data.item() == 0:
+                    controller.commit_all_pending()
+                    return
+                batch_size = len(spec_decode_metadata.num_draft_tokens)
+                if tp_rank == 0:
+                    assert accepted is not None
+                    accepted_tensor = torch.tensor(accepted,
+                                                   device=self.device,
+                                                   dtype=torch.int32)
+                else:
+                    accepted_tensor = torch.empty(batch_size,
+                                                   device=self.device,
+                                                   dtype=torch.int32)
+                tp_group.broadcast(accepted_tensor, src=0)
+                accepted = accepted_tensor.tolist()
+
+        if accepted is None:
+            controller.commit_all_pending()
+            return
+
+        try:
+            controller.commit_window(accepted)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("NWOR commit failed; reverting to baseline: %s", exc)
+            controller.commit_all_pending()
+
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        set_global_nwor_controller(self.nwor_controller)
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -2340,6 +2444,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(scheduler_output, intermediate_tensors,
                                  ubatch_slices, num_tokens_after_padding)
+
+            self._maybe_enable_nwor_window(spec_decode_metadata)
 
             uniform_decode = (max_query_len
                               == self.uniform_decode_query_len) and (
