@@ -55,6 +55,8 @@ class NWORController:
         self._window_active = False
         self._pending_layers: list[_PendingLayer] = []
         self._num_draft_tokens: list[int] = []
+        self._verifier_tokens: list[int] = []
+        self._draft_total: int = 0
         self._total_tokens: int = 0
         self._fallback_reason: Optional[str] = None
         self._shared_slot_mapping: Optional[torch.Tensor] = None
@@ -95,7 +97,10 @@ class NWORController:
         self._window_active = True
         self._pending_layers = []
         self._num_draft_tokens = counts
-        self._total_tokens = total
+        self._draft_total = total
+        self._verifier_tokens = [1 if count > 0 else 0 for count in counts]
+        self._total_tokens = sum(
+            count + verify for count, verify in zip(counts, self._verifier_tokens))
         self._shared_slot_mapping = None
         self._current_accumulator = None
         self._total_windows += 1
@@ -107,6 +112,8 @@ class NWORController:
         self._window_active = False
         self._pending_layers = []
         self._num_draft_tokens = []
+        self._draft_total = 0
+        self._verifier_tokens = []
         self._total_tokens = 0
         self._shared_slot_mapping = None
         self._current_accumulator = None
@@ -226,7 +233,7 @@ class NWORController:
                 self._fallback("commit failure")
                 self._write_pending_fallback()
             else:
-                rejected_total = max(self._total_tokens - accepted_total, 0)
+                rejected_total = max(self._draft_total - accepted_total, 0)
                 self._metrics["windows_committed"] += 1
                 self._metrics["tokens_committed"] += accepted_total
                 self._metrics["tokens_rejected"] += rejected_total
@@ -240,6 +247,7 @@ class NWORController:
             return True
 
         if acc.tokens_accumulated != self._total_tokens:
+            self._current_accumulator = None
             self._fallback(
                 f"Layer {acc.layer_name} incomplete: {acc.tokens_accumulated} != {self._total_tokens}")
             self._write_pending_fallback()
@@ -257,6 +265,7 @@ class NWORController:
             if (full_slot.device != expected.device
                     or full_slot.shape != expected.shape
                     or not torch.equal(full_slot, expected)):
+                self._current_accumulator = None
                 self._fallback("slot mapping values differ across layers")
                 self._write_pending_fallback()
                 self.abort_window()
@@ -343,7 +352,9 @@ class NWORController:
         device = self._pending_layers[0].slot_mapping.device
         mask_cpu = torch.zeros(self._total_tokens, dtype=torch.bool)
         cursor = 0
-        for count, accepted in zip(self._num_draft_tokens, accepted_prefix):
+        for count, verifier, accepted in zip(self._num_draft_tokens,
+                                             self._verifier_tokens,
+                                             accepted_prefix):
             accepted_int = max(0, int(accepted))
             if accepted_int > count:
                 raise ValueError(
@@ -353,7 +364,7 @@ class NWORController:
                 return None
             if end > cursor:
                 mask_cpu[cursor:end] = True
-            cursor += count
+            cursor += count + verifier
         return mask_cpu.to(device, non_blocking=True)
 
     def _commit_layer(self, pending: _PendingLayer,
