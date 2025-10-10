@@ -72,6 +72,7 @@ class NWORController:
             "tokens_rejected": 0,
             "fallbacks": 0,
         }
+        self._layer_staged_tokens: dict[str, int] = {}
 
     # ------------------------------------------------------------------ flags
     @property
@@ -107,6 +108,7 @@ class NWORController:
         )
         self._shared_slot_mapping = None
         self._current_accumulator = None
+        self._layer_staged_tokens = {}
         self._total_windows += 1
         self._metrics["windows_attempted"] += 1
         self._metrics["tokens_deferred"] += total
@@ -120,6 +122,7 @@ class NWORController:
         self._total_tokens = 0
         self._shared_slot_mapping = None
         self._current_accumulator = None
+        self._layer_staged_tokens = {}
 
     # ------------------------------------------------------------------ staging
     def record_layer(
@@ -154,20 +157,63 @@ class NWORController:
                 return False
             acc = self._current_accumulator
 
-        acc_tokens = acc.tokens_accumulated if acc is not None else 0
-        remaining = max(self._total_tokens - acc_tokens, 0)
+        staged_total = self._layer_staged_tokens.get(layer_name, 0)
+        remaining = max(self._total_tokens - staged_total, 0)
         stage_len = min(chunk_len, remaining)
         verifier_len = chunk_len - stage_len
 
         logger.info(
-            "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d acc=%d/%d",
+            "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d staged_total=%d/%d",
             layer_name,
             chunk_len,
             stage_len,
             verifier_len,
-            acc_tokens,
+            staged_total,
             self._total_tokens,
         )
+
+        if (self._current_accumulator is None and staged_total == 0
+                and stage_len == self._total_tokens and verifier_len == 0):
+            slot_view = slot_mapping[:stage_len]
+            if self._shared_slot_mapping is None:
+                slot_full = (slot_view if slot_view.is_contiguous() else
+                             slot_view.contiguous())
+                self._shared_slot_mapping = slot_full
+            else:
+                expected = self._shared_slot_mapping
+                if (slot_view.device != expected.device
+                        or slot_view.shape != expected.shape
+                        or not torch.equal(slot_view, expected)):
+                    self._fallback("slot mapping values differ across layers")
+                    self._write_pending_fallback()
+                    self.abort_window()
+                    return False
+                slot_full = expected
+
+            key_view = key[:stage_len]
+            value_view = value[:stage_len]
+            key_full = key_view if key_view.is_contiguous() else key_view.contiguous()
+            value_full = (value_view if value_view.is_contiguous() else
+                          value_view.contiguous())
+            self._pending_layers.append(
+                _PendingLayer(
+                    layer_name=layer_name,
+                    key=key_full,
+                    value=value_full,
+                    slot_mapping=slot_full,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    kv_cache_dtype=kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    staged_tokens=stage_len,
+                ))
+            self._layer_staged_tokens[layer_name] = self._total_tokens
+            logger.info("[NWOR] layer=%s staged=%d/%d", layer_name,
+                        self._total_tokens, self._total_tokens)
+            logger.info("[NWOR] finalize layer=%s total=%d expected=%d",
+                        layer_name, stage_len, self._total_tokens)
+            return True
 
         stage_success = True
         if stage_len > 0:
@@ -205,14 +251,16 @@ class NWORController:
                                  self._total_tokens)
 
             assert acc is not None
+            staged_total = self._layer_staged_tokens.get(layer_name, 0) + stage_len
+            self._layer_staged_tokens[layer_name] = staged_total
             logger.info("[NWOR] layer=%s staged=%d/%d", acc.layer_name,
-                        acc.tokens_accumulated, self._total_tokens)
+                        staged_total, self._total_tokens)
 
-            if acc.tokens_accumulated == self._total_tokens:
+            if staged_total == self._total_tokens:
                 stage_success = self._finalize_current_layer()
-            elif acc.tokens_accumulated > self._total_tokens:
+            elif staged_total > self._total_tokens:
                 self._fallback(
-                    f"Layer {acc.layer_name} over-accumulated: {acc.tokens_accumulated} > {self._total_tokens}")
+                    f"Layer {acc.layer_name} over-accumulated: {staged_total} > {self._total_tokens}")
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
@@ -229,7 +277,7 @@ class NWORController:
             return False
 
         if verifier_len > 0:
-            if self._current_accumulator is not None:
+            if self._layer_staged_tokens.get(layer_name, 0) < self._total_tokens:
                 self._fallback(
                     f"Layer {layer_name} received verifier tokens before staging completed")
                 self._write_pending_fallback()
@@ -374,6 +422,7 @@ class NWORController:
             ))
         logger.info("[NWOR] finalize layer=%s total=%d expected=%d",
                     acc.layer_name, self._total_tokens, self._total_tokens)
+        self._layer_staged_tokens[acc.layer_name] = self._total_tokens
         self._current_accumulator = None
         return True
 
