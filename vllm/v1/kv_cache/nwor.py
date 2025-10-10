@@ -73,7 +73,6 @@ class NWORController:
             "fallbacks": 0,
         }
         self._layer_staged_tokens: dict[str, int] = {}
-        self._layer_verifier_written: dict[str, bool] = {}
 
     # ------------------------------------------------------------------ flags
     @property
@@ -110,7 +109,6 @@ class NWORController:
         self._shared_slot_mapping = None
         self._current_accumulator = None
         self._layer_staged_tokens = {}
-        self._layer_verifier_written = {}
         self._total_windows += 1
         self._metrics["windows_attempted"] += 1
         self._metrics["tokens_deferred"] += total
@@ -125,7 +123,6 @@ class NWORController:
         self._shared_slot_mapping = None
         self._current_accumulator = None
         self._layer_staged_tokens = {}
-        self._layer_verifier_written = {}
 
     # ------------------------------------------------------------------ staging
     def record_layer(
@@ -165,16 +162,15 @@ class NWORController:
         stage_len = min(chunk_len, remaining)
         verifier_len = chunk_len - stage_len
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d staged_total=%d/%d",
-                layer_name,
-                chunk_len,
-                stage_len,
-                verifier_len,
-                staged_total,
-                self._total_tokens,
-            )
+        logger.info(
+            "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d staged_total=%d/%d",
+            layer_name,
+            chunk_len,
+            stage_len,
+            verifier_len,
+            staged_total,
+            self._total_tokens,
+        )
 
         if (self._current_accumulator is None and staged_total == 0
                 and stage_len == self._total_tokens and verifier_len == 0):
@@ -213,12 +209,10 @@ class NWORController:
                     staged_tokens=stage_len,
                 ))
             self._layer_staged_tokens[layer_name] = self._total_tokens
-            self._layer_verifier_written[layer_name] = True
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[NWOR] layer=%s staged=%d/%d", layer_name,
-                              self._total_tokens, self._total_tokens)
-            logger.info("NWOR window summary: layer=%s staged=%d verifier=%d",
-                        layer_name, self._total_tokens, 0)
+            logger.info("[NWOR] layer=%s staged=%d/%d", layer_name,
+                        self._total_tokens, self._total_tokens)
+            logger.info("[NWOR] finalize layer=%s total=%d expected=%d",
+                        layer_name, stage_len, self._total_tokens)
             return True
 
         stage_success = True
@@ -259,9 +253,8 @@ class NWORController:
             assert acc is not None
             staged_total = self._layer_staged_tokens.get(layer_name, 0) + stage_len
             self._layer_staged_tokens[layer_name] = staged_total
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[NWOR] layer=%s staged=%d/%d", acc.layer_name,
-                              staged_total, self._total_tokens)
+            logger.info("[NWOR] layer=%s staged=%d/%d", acc.layer_name,
+                        staged_total, self._total_tokens)
 
             if staged_total == self._total_tokens:
                 stage_success = self._finalize_current_layer()
@@ -290,35 +283,23 @@ class NWORController:
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
-            verifier_done = self._layer_verifier_written.get(layer_name, False)
-            if verifier_done:
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("[NWOR] layer=%s ignoring duplicate verifier tail=%d",
-                                  layer_name, verifier_len)
-            else:
-                start = stage_len
-                verifier_key = key[start:]
-                verifier_value = value[start:]
-                verifier_slots = slot_mapping[start:]
-                if not verifier_key.is_contiguous():
-                    verifier_key = verifier_key.contiguous()
-                if not verifier_value.is_contiguous():
-                    verifier_value = verifier_value.contiguous()
-                if not verifier_slots.is_contiguous():
-                    verifier_slots = verifier_slots.contiguous()
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    verifier_key,
-                    verifier_value,
-                    key_cache,
-                    value_cache,
-                    verifier_slots,
-                    kv_cache_dtype,
-                    k_scale,
-                    v_scale,
-                )
-                self._layer_verifier_written[layer_name] = True
-                logger.info("NWOR window summary: layer=%s staged=%d verifier=%d",
-                            layer_name, self._total_tokens, verifier_len)
+
+            start = stage_len
+            verifier_key = key[start:]
+            verifier_value = value[start:]
+            verifier_slots = slot_mapping[start:]
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                verifier_key.contiguous(),
+                verifier_value.contiguous(),
+                key_cache,
+                value_cache,
+                verifier_slots.contiguous(),
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+            logger.info("[NWOR] layer=%s wrote verifier tail=%d", layer_name,
+                        verifier_len)
 
         return stage_success
 
@@ -439,15 +420,9 @@ class NWORController:
                 v_scale=acc.v_scale,
                 staged_tokens=self._total_tokens,
             ))
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[NWOR] finalize layer=%s total=%d expected=%d",
-                         acc.layer_name, self._total_tokens, self._total_tokens)
+        logger.info("[NWOR] finalize layer=%s total=%d expected=%d",
+                    acc.layer_name, self._total_tokens, self._total_tokens)
         self._layer_staged_tokens[acc.layer_name] = self._total_tokens
-        verifier_logged = self._layer_verifier_written.get(acc.layer_name, False)
-        if not verifier_logged:
-            logger.info("NWOR window summary: layer=%s staged=%d verifier=%d",
-                        acc.layer_name, self._total_tokens, 0)
-        self._layer_verifier_written[acc.layer_name] = False
         self._current_accumulator = None
         return True
 
