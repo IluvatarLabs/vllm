@@ -2141,7 +2141,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _bookkeeping_sync(
         self, scheduler_output: "SchedulerOutput",
         sampler_output: SamplerOutput, logits: Optional[torch.Tensor],
-        hidden_states: torch.Tensor, num_scheduled_tokens: int
+        hidden_states: torch.Tensor, num_scheduled_tokens: int,
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
     ) -> tuple[
             dict[str, int],
             Optional[LogprobsLists],
@@ -2601,7 +2602,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 invalid_req_indices,
             ) = self._bookkeeping_sync(scheduler_output, sampler_output,
                                        logits, hidden_states,
-                                       num_scheduled_tokens)
+                                       num_scheduled_tokens,
+                                       spec_decode_metadata)
 
         if (self.speculative_config and not use_padded_batch_for_eagle
                 and input_fits_in_drafter):
