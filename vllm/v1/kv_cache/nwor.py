@@ -30,6 +30,21 @@ class _PendingLayer:
     kv_cache_dtype: str
     k_scale: torch.Tensor
     v_scale: torch.Tensor
+    staged_tokens: int = 0
+
+
+@dataclass
+class _LayerAccumulator:
+    layer_name: str
+    key_chunks: list[torch.Tensor]
+    value_chunks: list[torch.Tensor]
+    slot_chunks: list[torch.Tensor]
+    tokens_accumulated: int
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
+    kv_cache_dtype: str
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
 
 
 class NWORController:
@@ -43,6 +58,7 @@ class NWORController:
         self._total_tokens: int = 0
         self._fallback_reason: Optional[str] = None
         self._shared_slot_mapping: Optional[torch.Tensor] = None
+        self._current_accumulator: Optional[_LayerAccumulator] = None
         self._fallback_count: int = 0
         self._total_windows: int = 0
         self._max_fallbacks: int = 10
@@ -81,6 +97,7 @@ class NWORController:
         self._num_draft_tokens = counts
         self._total_tokens = total
         self._shared_slot_mapping = None
+        self._current_accumulator = None
         self._total_windows += 1
         self._metrics["windows_attempted"] += 1
         self._metrics["tokens_deferred"] += total
@@ -92,6 +109,7 @@ class NWORController:
         self._num_draft_tokens = []
         self._total_tokens = 0
         self._shared_slot_mapping = None
+        self._current_accumulator = None
 
     # ------------------------------------------------------------------ staging
     def record_layer(
@@ -110,46 +128,54 @@ class NWORController:
         if not self.can_stage:
             return False
 
-        if slot_mapping.numel() < self._total_tokens:
-            self._fallback(
-                f"slot mapping shorter than window: {slot_mapping.numel()} < {self._total_tokens}")
+        chunk_len = int(slot_mapping.numel())
+        if chunk_len == 0:
+            return True
+
+        if key.size(0) < chunk_len or value.size(0) < chunk_len:
+            self._fallback("key/value tensors shorter than chunk")
             self._write_pending_fallback()
             self.abort_window()
             return False
 
-        if key.size(0) < self._total_tokens or value.size(0) < self._total_tokens:
-            self._fallback("key/value tensors shorter than expected window")
-            self._write_pending_fallback()
-            self.abort_window()
-            return False
+        key_chunk = key[:chunk_len].contiguous()
+        value_chunk = value[:chunk_len].contiguous()
+        slot_chunk = slot_mapping[:chunk_len].contiguous()
 
-        if self._shared_slot_mapping is None:
-            slot_mapping = slot_mapping.contiguous()
-            self._shared_slot_mapping = slot_mapping
-        else:
-            expected = self._shared_slot_mapping
-            if (slot_mapping.device != expected.device
-                    or slot_mapping.shape != expected.shape
-                    or not torch.equal(slot_mapping[:self._total_tokens],
-                                       expected[:self._total_tokens])):
-                self._fallback("slot mapping values differ across layers")
-                self._write_pending_fallback()
-                self.abort_window()
-                return False
-            slot_mapping = expected
-
-        self._pending_layers.append(
-            _PendingLayer(
+        acc = self._current_accumulator
+        if acc is None or acc.layer_name != layer_name:
+            if acc is not None:
+                if not self._finalize_current_layer():
+                    return False
+            self._current_accumulator = _LayerAccumulator(
                 layer_name=layer_name,
-                key=key,
-                value=value,
-                slot_mapping=slot_mapping,
+                key_chunks=[key_chunk],
+                value_chunks=[value_chunk],
+                slot_chunks=[slot_chunk],
+                tokens_accumulated=chunk_len,
                 key_cache=key_cache,
                 value_cache=value_cache,
                 kv_cache_dtype=kv_cache_dtype,
                 k_scale=k_scale,
                 v_scale=v_scale,
-            ))
+            )
+        else:
+            acc.key_chunks.append(key_chunk)
+            acc.value_chunks.append(value_chunk)
+            acc.slot_chunks.append(slot_chunk)
+            acc.tokens_accumulated += chunk_len
+
+        acc = self._current_accumulator
+        assert acc is not None
+        if acc.tokens_accumulated == self._total_tokens:
+            return self._finalize_current_layer()
+        if acc.tokens_accumulated > self._total_tokens:
+            self._fallback(
+                f"Layer {acc.layer_name} over-accumulated: {acc.tokens_accumulated} > {self._total_tokens}")
+            self._write_pending_fallback()
+            self.abort_window()
+            return False
+
         return True
 
     # ------------------------------------------------------------------ commit
@@ -161,6 +187,10 @@ class NWORController:
             self._fallback("accepted_prefix length mismatch")
             self.abort_window()
             return
+
+        if self._current_accumulator is not None:
+            if not self._finalize_current_layer():
+                return
 
         accepted_total = sum(max(0, int(x)) for x in accepted_prefix)
 
@@ -204,6 +234,51 @@ class NWORController:
             self.abort_window()
 
     # ------------------------------------------------------------------ helpers
+    def _finalize_current_layer(self) -> bool:
+        acc = self._current_accumulator
+        if acc is None:
+            return True
+
+        if acc.tokens_accumulated != self._total_tokens:
+            self._fallback(
+                f"Layer {acc.layer_name} incomplete: {acc.tokens_accumulated} != {self._total_tokens}")
+            self._write_pending_fallback()
+            self.abort_window()
+            return False
+
+        full_key = torch.cat(acc.key_chunks, dim=0)
+        full_value = torch.cat(acc.value_chunks, dim=0)
+        full_slot = torch.cat(acc.slot_chunks, dim=0)
+
+        if self._shared_slot_mapping is None:
+            self._shared_slot_mapping = full_slot
+        else:
+            expected = self._shared_slot_mapping
+            if (full_slot.device != expected.device
+                    or full_slot.shape != expected.shape
+                    or not torch.equal(full_slot, expected)):
+                self._fallback("slot mapping values differ across layers")
+                self._write_pending_fallback()
+                self.abort_window()
+                return False
+            full_slot = expected
+
+        self._pending_layers.append(
+            _PendingLayer(
+                layer_name=acc.layer_name,
+                key=full_key,
+                value=full_value,
+                slot_mapping=full_slot,
+                key_cache=acc.key_cache,
+                value_cache=acc.value_cache,
+                kv_cache_dtype=acc.kv_cache_dtype,
+                k_scale=acc.k_scale,
+                v_scale=acc.v_scale,
+                staged_tokens=self._total_tokens,
+            ))
+        self._current_accumulator = None
+        return True
+
     def _fallback(self, reason: str) -> None:
         self._fallback_count += 1
         self._metrics["fallbacks"] += 1
@@ -228,16 +303,33 @@ class NWORController:
             logger.debug("NWOR fallback after disable: %s", reason)
 
     def _write_pending_fallback(self) -> None:
+        if self._current_accumulator is not None:
+            acc = self._current_accumulator
+            for key_chunk, value_chunk, slot_chunk in zip(
+                    acc.key_chunks, acc.value_chunks, acc.slot_chunks):
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key_chunk,
+                    value_chunk,
+                    acc.key_cache,
+                    acc.value_cache,
+                    slot_chunk,
+                    acc.kv_cache_dtype,
+                    acc.k_scale,
+                    acc.v_scale,
+                )
+            self._current_accumulator = None
+
         if not self._pending_layers:
             return
         try:
             for pending in self._pending_layers:
+                staged = pending.staged_tokens or pending.key.shape[0]
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    pending.key,
-                    pending.value,
+                    pending.key[:staged],
+                    pending.value[:staged],
                     pending.key_cache,
                     pending.value_cache,
-                    pending.slot_mapping,
+                    pending.slot_mapping[:staged],
                     pending.kv_cache_dtype,
                     pending.k_scale,
                     pending.v_scale,
