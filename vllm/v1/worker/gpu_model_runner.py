@@ -2320,21 +2320,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 except AssertionError:
                     dp_group = None
                 if dp_group is not None and dp_group.world_size > 1:
-                    logger.info(
-                        "NWOR disabled because data parallel size is %d",
-                        dp_group.world_size,
-                    )
-                    set_global_nwor_controller(None)
-                    self.nwor_controller = None
-                    return
+                    raise RuntimeError(
+                        "NWOR requires data_parallel_size == 1 while in development. "
+                        "Disable NWOR or rerun without data parallelism.")
             decode_mode = self.compilation_config.cudagraph_mode.decode_mode()
             if decode_mode == CUDAGraphMode.NONE:
                 controller = NWORController(enabled=True)
             else:
-                logger.info(
-                    "NWOR disabled because CUDA graph decode mode is %s",
-                    decode_mode,
-                )
+                raise RuntimeError(
+                    "NWOR requires CUDA graphs to be disabled. Relaunch with "
+                    "enforce_eager=True or VLLM_COMPILE_DISABLE_CUDA_GRAPHS=1.")
         self.nwor_controller = controller
         set_global_nwor_controller(controller)
 
