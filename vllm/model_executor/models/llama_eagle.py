@@ -125,6 +125,10 @@ class LlamaModel(nn.Module):
                     "embed_tokens." in name:
                     continue
 
+                if name not in params_dict:
+                    logger.debug("Skipping weight %s (not in model)", name)
+                    continue
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
