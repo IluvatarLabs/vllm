@@ -177,9 +177,23 @@ class NWORController:
             acc = self._current_accumulator
 
         staged_total = self._layer_staged_tokens.get(layer_name, 0)
-        remaining = max(self._total_tokens - staged_total, 0)
+        if staged_total >= self._total_tokens:
+            return False
+
+        remaining = self._total_tokens - staged_total
         stage_len = min(chunk_len, remaining)
         verifier_len = chunk_len - stage_len
+
+        if stage_len < chunk_len:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "NWOR fallback chunk crossing boundary: layer=%s staged=%d chunk=%d total=%d",
+                    layer_name,
+                    staged_total,
+                    chunk_len,
+                    self._total_tokens,
+                )
+            return False
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
