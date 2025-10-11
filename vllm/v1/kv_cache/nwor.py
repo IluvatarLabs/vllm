@@ -266,24 +266,17 @@ class NWORController:
                 return False
             acc = self._current_accumulator
 
-        if acc is None:
-            self._current_accumulator = _LayerAccumulator(
-                layer_name=layer_name,
-                layer_index=layer_idx,
-                slot_chunks=[],
-                draft_staged=0,
-                request_chunks=[],
-                key_cache=key_cache,
-                value_cache=value_cache,
-                kv_cache_dtype=kv_cache_dtype,
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
-            acc = self._current_accumulator
-
         staged_total = self._layer_staged_tokens.get(layer_name, 0)
-        if staged_total >= self._total_tokens:
-            return False
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "NWOR stage_input: layer=%s idx=%d chunk=%d total=%d staged_total=%d req_none=%s",
+                layer_name,
+                layer_idx,
+                chunk_len,
+                self._total_tokens,
+                staged_total,
+                request_indices is None,
+            )
 
         remaining = self._total_tokens - staged_total
         stage_len = min(chunk_len, remaining)
@@ -301,11 +294,35 @@ class NWORController:
             )
 
         if stage_len > 0:
+            if acc is None:
+                self._current_accumulator = _LayerAccumulator(
+                    layer_name=layer_name,
+                    layer_index=layer_idx,
+                    slot_chunks=[],
+                    draft_staged=0,
+                    request_chunks=[],
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    kv_cache_dtype=kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+                acc = self._current_accumulator
+
             canonical_slice = canonical_layout[staged_total:staged_total + stage_len]
             if request_indices is not None:
                 provided_slice = request_indices[:stage_len]
                 if provided_slice.numel() != canonical_slice.numel() or not torch.equal(
                         provided_slice, canonical_slice):
+                    if logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            "NWOR layout_mismatch: layer=%s idx=%d start=%d provided=%s canonical=%s",
+                            layer_name,
+                            layer_idx,
+                            staged_total,
+                            provided_slice.tolist(),
+                            canonical_slice.tolist(),
+                        )
                     self._fallback("request index layout mismatch for staged chunk")
                     self._write_pending_fallback()
                     self.abort_window()
@@ -317,6 +334,15 @@ class NWORController:
             slot_stage = slot_mapping[:stage_len]
             if not slot_stage.is_contiguous():
                 slot_stage = slot_stage.contiguous()
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "NWOR stage_chunk: layer=%s idx=%d start=%d len=%d canonical_len=%d",
+                    layer_name,
+                    layer_idx,
+                    staged_total,
+                    stage_len,
+                    canonical_slice.numel(),
+                )
             self._stage_chunk(layer_idx, key[:stage_len], value[:stage_len],
                               slot_stage, staged_total)
 
@@ -329,16 +355,16 @@ class NWORController:
                 logger.debug("[NWOR] layer=%s staged=%d/%d", acc.layer_name,
                               staged_total, self._total_tokens)
 
-            if staged_total == self._total_tokens:
-                if not self._finalize_current_layer():
-                    return False
-                acc = self._current_accumulator
-            elif staged_total > self._total_tokens:
+            if stage_len > 0 and staged_total > self._total_tokens:
                 self._fallback(
                     f"Layer {layer_name} over-accumulated: {staged_total} > {self._total_tokens}")
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
+            if staged_total == self._total_tokens and stage_len > 0:
+                if not self._finalize_current_layer():
+                    return False
+                acc = self._current_accumulator
 
         if verifier_len > 0:
             staged_now = self._layer_staged_tokens.get(layer_name, 0)
