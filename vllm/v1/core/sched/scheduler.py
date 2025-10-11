@@ -900,8 +900,23 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
-                num_rejected = num_draft_tokens - num_accepted
+                if generated_token_ids:
+                    num_accepted = len(generated_token_ids) - 1
+                else:
+                    logger.error(
+                        "Spec decode: empty generated tokens (req=%s, drafts=%d)",
+                        req_id,
+                        num_draft_tokens,
+                    )
+                    num_accepted = 0
+                if num_accepted < 0:
+                    logger.error(
+                        "Spec decode: negative accepted count (req=%s, len=%d)",
+                        req_id,
+                        len(generated_token_ids),
+                    )
+                    num_accepted = 0
+                num_rejected = max(num_draft_tokens - num_accepted, 0)
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
