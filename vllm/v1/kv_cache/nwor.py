@@ -299,12 +299,15 @@ class NWORController:
             key_stage = key[:stage_len]
             value_stage = value[:stage_len]
             slot_stage = slot_mapping[:stage_len]
-            if staged_total + stage_len > canonical_layout.numel():
-                self._fallback("canonical layout shorter than staged tokens")
-                self._write_pending_fallback()
-                self.abort_window()
-                return False
-            req_stage = canonical_layout[staged_total:staged_total + stage_len].clone()
+            if request_indices is not None and request_indices.numel() >= stage_len:
+                req_stage = request_indices[:stage_len].to(torch.int32)
+            else:
+                if staged_total + stage_len > canonical_layout.numel():
+                    self._fallback("canonical layout shorter than staged tokens")
+                    self._write_pending_fallback()
+                    self.abort_window()
+                    return False
+                req_stage = canonical_layout[staged_total:staged_total + stage_len].clone()
 
             acc = self._current_accumulator
             if acc is None:
