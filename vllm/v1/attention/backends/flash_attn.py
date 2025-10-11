@@ -31,6 +31,7 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               get_kv_cache_layout)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache.nwor import (build_token_request_indices,
+                                   extract_query_start_loc_cpu,
                                    record_or_write_kv_cache)
 
 logger = init_logger(__name__)
@@ -497,7 +498,7 @@ class FlashAttentionImpl(AttentionImpl):
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
             token_request_indices = build_token_request_indices(
-                getattr(attn_metadata, "query_start_loc_cpu", None))
+                extract_query_start_loc_cpu(attn_metadata))
             record_or_write_kv_cache(
                 layer_name=layer.layer_name,
                 key=key,

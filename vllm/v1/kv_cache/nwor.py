@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -18,6 +19,7 @@ __all__ = [
     "get_global_nwor_controller",
     "record_or_write_kv_cache",
     "build_token_request_indices",
+    "extract_query_start_loc_cpu",
 ]
 
 
@@ -42,31 +44,63 @@ class _StagingBuffers:
                head_dim: int,
                dtype: torch.dtype,
                device: torch.device) -> None:
-        need_realloc = (
-            self.capacity < num_tokens or self.dtype != dtype
+        need_resize = (
+            self.capacity != num_tokens or self.dtype != dtype
             or self.device != device or self.num_heads != num_heads
-            or self.head_dim != head_dim or len(self.keys) != num_layers)
-        if not need_realloc:
+            or self.head_dim != head_dim)
+        need_layer_list_resize = len(self.keys) != num_layers
+        if not (need_resize or need_layer_list_resize):
             return
+
+        old_keys = self.keys
+        old_values = self.values
+        old_slots = self.slots
+        old_capacity = self.capacity
+        old_num_heads = self.num_heads
+        old_head_dim = self.head_dim
+        old_dtype = self.dtype
+        old_device = self.device
 
         self.capacity = num_tokens
         self.dtype = dtype
         self.device = device
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.keys = [
+        new_keys = [
             torch.empty((num_tokens, num_heads, head_dim),
                         dtype=dtype,
                         device=device)
             for _ in range(num_layers)
         ]
-        self.values = [
+        new_values = [
             torch.empty((num_tokens, num_heads, head_dim),
                         dtype=dtype,
                         device=device)
             for _ in range(num_layers)
         ]
-        self.slots = torch.empty((num_tokens,), dtype=torch.int32, device=device)
+        new_slots = torch.empty((num_tokens,), dtype=torch.int32, device=device)
+
+        # Preserve any already-staged data when the buffer grows mid-window.
+        can_copy = (
+            old_keys and old_values and old_capacity > 0
+            and old_dtype == dtype and old_device == device
+            and old_num_heads == num_heads and old_head_dim == head_dim)
+        if can_copy:
+            copy_tokens = min(old_capacity, num_tokens)
+            copy_layers = min(len(old_keys), num_layers)
+            if copy_tokens > 0 and copy_layers > 0:
+                slice_spec = slice(0, copy_tokens)
+                for layer_idx in range(copy_layers):
+                    new_keys[layer_idx][slice_spec].copy_(
+                        old_keys[layer_idx][slice_spec])
+                    new_values[layer_idx][slice_spec].copy_(
+                        old_values[layer_idx][slice_spec])
+                if old_slots is not None and new_slots is not None:
+                    new_slots[slice_spec].copy_(old_slots[slice_spec])
+
+        self.keys = new_keys
+        self.values = new_values
+        self.slots = new_slots
 
     def zero_slots(self) -> None:
         if self.slots is not None:
@@ -81,10 +115,13 @@ class _PendingLayer:
     key_cache: torch.Tensor
     value_cache: torch.Tensor
     kv_cache_dtype: str
-    k_scale: torch.Tensor
-    v_scale: torch.Tensor
+    k_scale: Optional[torch.Tensor]
+    v_scale: Optional[torch.Tensor]
     request_indices: torch.Tensor
     staged_tokens: int = 0
+    backup_keys: Optional[torch.Tensor] = None
+    backup_values: Optional[torch.Tensor] = None
+    backup_index_map: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -97,8 +134,12 @@ class _LayerAccumulator:
     key_cache: torch.Tensor
     value_cache: torch.Tensor
     kv_cache_dtype: str
-    k_scale: torch.Tensor
-    v_scale: torch.Tensor
+    base_k_scale: Optional[torch.Tensor]
+    base_v_scale: Optional[torch.Tensor]
+    k_scale_chunks: list[torch.Tensor]
+    v_scale_chunks: list[torch.Tensor]
+    backup_key_chunks: list[torch.Tensor]
+    backup_value_chunks: list[torch.Tensor]
 
 
 @dataclass
@@ -279,21 +320,25 @@ class NWORController:
             )
 
         remaining = self._total_tokens - staged_total
-        stage_len = min(chunk_len, remaining)
-        verifier_len = chunk_len - stage_len
+        target_stage = min(chunk_len, remaining)
+        verifier_len = chunk_len - target_stage
+
+        stage_len = 0
+        stage_positions: Optional[list[int]] = None
+        tail_positions_for_verifier: Optional[list[int]] = None
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d staged_total=%d/%d",
                 layer_name,
                 chunk_len,
-                stage_len,
+                target_stage,
                 verifier_len,
                 staged_total,
                 self._total_tokens,
             )
 
-        if stage_len > 0:
+        if target_stage > 0:
             if acc is None:
                 self._current_accumulator = _LayerAccumulator(
                     layer_name=layer_name,
@@ -304,64 +349,185 @@ class NWORController:
                     key_cache=key_cache,
                     value_cache=value_cache,
                     kv_cache_dtype=kv_cache_dtype,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
+                    base_k_scale=k_scale,
+                    base_v_scale=v_scale,
+                    k_scale_chunks=[],
+                    v_scale_chunks=[],
+                    backup_key_chunks=[],
+                    backup_value_chunks=[],
                 )
                 acc = self._current_accumulator
 
-            canonical_slice = canonical_layout[staged_total:staged_total + stage_len]
+            canonical_slice = canonical_layout[staged_total:staged_total + target_stage]
+            default_stage_positions = list(range(target_stage))
+            default_tail_positions = list(range(target_stage, chunk_len))
+            stage_positions = default_stage_positions
+            tail_positions = default_tail_positions
+
             if request_indices is not None:
-                provided_slice = request_indices[:stage_len]
-                if provided_slice.numel() != canonical_slice.numel() or not torch.equal(
-                        provided_slice, canonical_slice):
+                align_result = self._align_request_indices(request_indices,
+                                                           canonical_slice)
+                if align_result is None:
+                    provided_full = request_indices[:target_stage].tolist()
+                    canonical_full = canonical_slice.tolist()
+                    max_preview = 32
+                    provided_preview = (provided_full if len(provided_full) <= max_preview
+                                        else provided_full[:max_preview] +
+                                        [f"...(+{len(provided_full) - max_preview} more)"])
+                    canonical_preview = (canonical_full if len(canonical_full) <= max_preview
+                                         else canonical_full[:max_preview] +
+                                         [f"...(+{len(canonical_full) - max_preview} more)"])
                     if logger.isEnabledFor(logging.INFO):
                         logger.info(
                             "NWOR layout_mismatch: layer=%s idx=%d start=%d provided=%s canonical=%s",
                             layer_name,
                             layer_idx,
                             staged_total,
-                            provided_slice.tolist(),
-                            canonical_slice.tolist(),
+                            provided_preview,
+                            canonical_preview,
                         )
                     self._fallback("request index layout mismatch for staged chunk")
                     self._write_pending_fallback()
                     self.abort_window()
                     return False
-                req_stage = provided_slice
+
+                stage_positions, tail_positions = align_result
+
+                if stage_positions != default_stage_positions or tail_positions != default_tail_positions:
+                    provided_full = request_indices[:target_stage].tolist()
+                    canonical_full = canonical_slice.tolist()
+                    max_preview = 32
+                    provided_preview = (provided_full if len(provided_full) <= max_preview
+                                        else provided_full[:max_preview] +
+                                        [f"...(+{len(provided_full) - max_preview} more)"])
+                    canonical_preview = (canonical_full if len(canonical_full) <= max_preview
+                                         else canonical_full[:max_preview] +
+                                         [f"...(+{len(canonical_full) - max_preview} more)"])
+                    stage_preview = (stage_positions if len(stage_positions) <= max_preview
+                                     else stage_positions[:max_preview] +
+                                     [f"...(+{len(stage_positions) - max_preview} more)"])
+                    tail_preview = (tail_positions if len(tail_positions) <= max_preview
+                                    else tail_positions[:max_preview] +
+                                    [f"...(+{len(tail_positions) - max_preview} more)"])
+                    if logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            "NWOR layout_remap: layer=%s idx=%d start=%d provided=%s canonical=%s stage_positions=%s tail_positions=%s",
+                            layer_name,
+                            layer_idx,
+                            staged_total,
+                            provided_preview,
+                            canonical_preview,
+                            stage_preview,
+                            tail_preview,
+                        )
+
+            idx_cpu = torch.tensor(stage_positions, dtype=torch.long)
+            idx_device = idx_cpu.to(key.device)
+            key_stage = key.index_select(0, idx_device)
+            value_stage = value.index_select(0, idx_device)
+            slot_stage = slot_mapping.index_select(0,
+                                                   idx_cpu.to(slot_mapping.device))
+
+            slot_indices = slot_stage.to(device=key_cache.device, dtype=torch.long)
+            valid_mask = (slot_indices >= 0)
+            if not bool(valid_mask.all()):
+                mask_list = valid_mask.tolist()
+                stage_positions = [pos for pos, keep in zip(stage_positions, mask_list) if keep]
+                idx_device = idx_device[valid_mask]
+                key_stage = key_stage[valid_mask]
+                value_stage = value_stage[valid_mask]
+                slot_stage = slot_stage[valid_mask]
+                slot_indices = slot_indices[valid_mask]
+
+            stage_len = slot_indices.numel()
+            if stage_len == 0:
+                stage_positions = []
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info("NWOR stage_chunk: layer=%s idx=%d len=0 (no valid slots)",
+                                layer_name, layer_idx)
+                acc.slot_chunks.append(torch.empty((0,), dtype=slot_mapping.dtype,
+                                                   device=slot_mapping.device))
+                acc.request_chunks.append(torch.empty((0,), dtype=torch.int32))
+                tail_positions_for_verifier = tail_positions
+                verifier_len = len(tail_positions)
             else:
-                req_stage = canonical_slice
+                stage_k_scale = self._select_token_scale(k_scale, stage_positions,
+                                                         chunk_len)
+                stage_v_scale = self._select_token_scale(v_scale, stage_positions,
+                                                         chunk_len)
 
-            slot_stage = slot_mapping[:stage_len]
-            if not slot_stage.is_contiguous():
-                slot_stage = slot_stage.contiguous()
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "NWOR stage_chunk: layer=%s idx=%d start=%d len=%d canonical_len=%d",
-                    layer_name,
-                    layer_idx,
-                    staged_total,
-                    stage_len,
-                    canonical_slice.numel(),
+                original_keys = acc.key_cache.index_select(0, slot_indices)
+                original_values = acc.value_cache.index_select(0, slot_indices)
+                acc.backup_key_chunks.append(original_keys)
+                acc.backup_value_chunks.append(original_values)
+                stage_k_scale_arg = (stage_k_scale if stage_k_scale is not None
+                                     else k_scale)
+                stage_v_scale_arg = (stage_v_scale if stage_v_scale is not None
+                                     else v_scale)
+                if isinstance(stage_k_scale_arg, torch.Tensor) and stage_k_scale_arg.device != key_stage.device:
+                    stage_k_scale_arg = stage_k_scale_arg.to(device=key_stage.device,
+                                                            non_blocking=True)
+                if isinstance(stage_v_scale_arg, torch.Tensor) and stage_v_scale_arg.device != value_stage.device:
+                    stage_v_scale_arg = stage_v_scale_arg.to(device=value_stage.device,
+                                                            non_blocking=True)
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key_stage,
+                    value_stage,
+                    acc.key_cache,
+                    acc.value_cache,
+                    slot_stage.to(device=acc.key_cache.device,
+                                  dtype=torch.long),
+                    acc.kv_cache_dtype,
+                    stage_k_scale_arg,
+                    stage_v_scale_arg,
                 )
-            self._stage_chunk(layer_idx, key[:stage_len], value[:stage_len],
-                              slot_stage, staged_total)
 
-            acc.slot_chunks.append(slot_stage)
-            acc.request_chunks.append(req_stage.clone())
-            acc.draft_staged += stage_len
-            staged_total = acc.draft_staged
-            self._layer_staged_tokens[layer_name] = staged_total
+                if not slot_stage.is_contiguous():
+                    slot_stage = slot_stage.contiguous()
+
+                if stage_k_scale is not None:
+                    acc.k_scale_chunks.append(stage_k_scale.clone())
+                if stage_v_scale is not None:
+                    acc.v_scale_chunks.append(stage_v_scale.clone())
+
+                req_stage_tensor = canonical_slice.to(dtype=torch.int32).clone()
+
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(
+                        "NWOR stage_chunk: layer=%s idx=%d start=%d len=%d canonical_len=%d",
+                        layer_name,
+                        layer_idx,
+                        staged_total,
+                        stage_len,
+                        canonical_slice.numel(),
+                    )
+
+                self._stage_chunk(layer_idx, key_stage, value_stage, slot_stage,
+                                  staged_total)
+
+                req_stage = req_stage_tensor.to(dtype=torch.int32).clone()
+                acc.slot_chunks.append(slot_stage)
+                acc.request_chunks.append(req_stage)
+                acc.draft_staged += stage_len
+                staged_total = acc.draft_staged
+                self._layer_staged_tokens[layer_name] = staged_total
+                tail_positions_for_verifier = tail_positions
+                verifier_len = len(tail_positions)
+
+            tail_positions_for_verifier = tail_positions
+            verifier_len = len(tail_positions)
+
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("[NWOR] layer=%s staged=%d/%d", acc.layer_name,
                               staged_total, self._total_tokens)
 
-            if stage_len > 0 and staged_total > self._total_tokens:
+            if staged_total > self._total_tokens:
                 self._fallback(
                     f"Layer {layer_name} over-accumulated: {staged_total} > {self._total_tokens}")
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
-            if staged_total == self._total_tokens and stage_len > 0:
+            if staged_total == self._total_tokens:
                 if not self._finalize_current_layer():
                     return False
                 acc = self._current_accumulator
@@ -380,35 +546,133 @@ class NWORController:
                     logger.debug("[NWOR] layer=%s ignoring duplicate verifier tail=%d",
                                   layer_name, verifier_len)
             else:
-                start = stage_len
-                verifier_key = key[start:]
-                verifier_value = value[start:]
-                verifier_slots = slot_mapping[start:]
-                verifier_key = (verifier_key if verifier_key.is_contiguous() else
-                                verifier_key.contiguous())
+                if tail_positions_for_verifier is None:
+                    tail_positions_for_verifier = list(range(verifier_len))
+
+                tail_idx_cpu = torch.tensor(tail_positions_for_verifier,
+                                            dtype=torch.long)
+                tail_idx = tail_idx_cpu.to(device=key.device)
+                verifier_key = key.index_select(0, tail_idx)
+                verifier_value = value.index_select(0, tail_idx)
+                verifier_slots = slot_mapping.index_select(
+                    0, tail_idx_cpu.to(device=slot_mapping.device))
+
+                verifier_slots_device = verifier_slots.to(device=key_cache.device,
+                                                          dtype=torch.long)
+                valid_tail_mask = (verifier_slots_device >= 0)
+                if not bool(valid_tail_mask.all()):
+                    tail_positions_for_verifier = [pos for pos, keep in zip(
+                        tail_positions_for_verifier,
+                        valid_tail_mask.tolist()) if keep]
+                    verifier_key = verifier_key[valid_tail_mask]
+                    verifier_value = verifier_value[valid_tail_mask]
+                    verifier_slots_device = verifier_slots_device[valid_tail_mask]
+                    if verifier_key.numel() == 0:
+                        self._layer_verifier_written[layer_name] = True
+                        logger.debug("NWOR verifier tail empty after filtering: layer=%s",
+                                     layer_name)
+                        return True
+                verifier_len = len(tail_positions_for_verifier)
+
+                verifier_key = (verifier_key if verifier_key.is_contiguous()
+                                else verifier_key.contiguous())
                 verifier_value = (verifier_value if verifier_value.is_contiguous()
                                   else verifier_value.contiguous())
-                verifier_slots = (verifier_slots if verifier_slots.is_contiguous()
-                                  else verifier_slots.contiguous())
-                tail = _VerifierTail(
-                    layer_name=layer_name,
-                    key=verifier_key,
-                    value=verifier_value,
-                    slots=verifier_slots,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    kv_cache_dtype=kv_cache_dtype,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
+
+                k_scale_tail = self._select_token_scale(k_scale,
+                                                        tail_positions_for_verifier,
+                                                        chunk_len)
+                v_scale_tail = self._select_token_scale(v_scale,
+                                                        tail_positions_for_verifier,
+                                                        chunk_len)
+                tail_k_scale = (k_scale_tail if k_scale_tail is not None else k_scale)
+                tail_v_scale = (v_scale_tail if v_scale_tail is not None else v_scale)
+                if isinstance(tail_k_scale, torch.Tensor):
+                    if tail_k_scale.device != verifier_key.device:
+                        tail_k_scale = tail_k_scale.to(device=verifier_key.device,
+                                                       non_blocking=True)
+                if isinstance(tail_v_scale, torch.Tensor):
+                    if tail_v_scale.device != verifier_value.device:
+                        tail_v_scale = tail_v_scale.to(device=verifier_value.device,
+                                                       non_blocking=True)
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    verifier_key,
+                    verifier_value,
+                    key_cache,
+                    value_cache,
+                    verifier_slots_device,
+                    kv_cache_dtype,
+                    tail_k_scale,
+                    tail_v_scale,
                 )
-                self._pending_verifier_tails.append(tail)
                 self._layer_verifier_written[layer_name] = True
-                logger.debug("NWOR queued verifier tail: layer=%s tail=%d",
+                logger.debug("NWOR flushed verifier tail: layer=%s tail=%d",
                              layer_name, verifier_len)
 
         return True
 
     # ------------------------------------------------------------------ commit
+
+    def _align_request_indices(
+        self,
+        request_indices: torch.Tensor,
+        canonical_slice: torch.Tensor,
+    ) -> Optional[tuple[list[int], list[int]]]:
+        """Map chunk token positions to canonical request ordering."""
+
+        if request_indices.numel() < canonical_slice.numel():
+            return None
+
+        req_list = request_indices.tolist()
+        canonical_list = canonical_slice.tolist()
+        num_requests = len(self._num_draft_tokens)
+
+        buckets: dict[int, deque[int]] = defaultdict(deque)
+        for pos, req in enumerate(req_list):
+            req_int = int(req)
+            if req_int < 0 or req_int >= num_requests:
+                continue
+            buckets[req_int].append(pos)
+
+        stage_positions: list[int] = []
+        for value in canonical_list:
+            req_int = int(value)
+            bucket = buckets.get(req_int)
+            if bucket is None or not bucket:
+                return None
+            stage_positions.append(bucket.popleft())
+
+        used = set(stage_positions)
+        tail_positions = [pos for pos in range(len(req_list)) if pos not in used]
+        return stage_positions, tail_positions
+
+    @staticmethod
+    def _select_token_scale(
+        scale: Optional[torch.Tensor],
+        positions: Sequence[int],
+        chunk_len: int,
+    ) -> Optional[torch.Tensor]:
+        if scale is None:
+            return None
+        if scale.dim() == 0:
+            return None
+        if scale.size(0) != chunk_len:
+            return None
+        if not positions:
+            return scale.new_empty((0, *scale.shape[1:]))
+        idx = torch.tensor(positions, dtype=torch.long, device=scale.device)
+        return scale.index_select(0, idx)
+
+    @staticmethod
+    def _merge_scales(
+        chunks: Sequence[torch.Tensor],
+        base_scale: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if chunks:
+            if len(chunks) == 1:
+                return chunks[0]
+            return torch.cat(list(chunks), dim=0)
+        return base_scale
 
     def _stage_chunk(self, layer_idx: int, key_chunk: torch.Tensor,
                      value_chunk: torch.Tensor, slot_chunk: torch.Tensor,
@@ -438,7 +702,7 @@ class NWORController:
         staging_values[start:end].copy_(value_chunk.contiguous())
         slots = self._staging_buffers.slots
         if slots is not None:
-            slots[start:end].copy_(slot_chunk.to(torch.int32))
+            slots[start:end].copy_(slot_chunk.to(dtype=torch.int32))
 
     def commit_window(self, accepted_prefix: Sequence[int]) -> None:
         if not self._window_active:
@@ -526,7 +790,29 @@ class NWORController:
         full_req = torch.cat(acc.request_chunks, dim=0)
         if full_req.device.type != "cpu":
             full_req = full_req.cpu()
-        full_req = full_req.to(torch.int32)
+        full_req = full_req.to(dtype=torch.int32)
+
+        backup_keys = (torch.cat(acc.backup_key_chunks, dim=0)
+                       if acc.backup_key_chunks else None)
+        backup_values = (torch.cat(acc.backup_value_chunks, dim=0)
+                         if acc.backup_value_chunks else None)
+        backup_index_map = None
+        if backup_keys is not None:
+            valid_mask = (full_slot >= 0)
+            backup_index_map = torch.full((full_slot.size(0),),
+                                          -1,
+                                          dtype=torch.int32,
+                                          device=full_slot.device)
+            valid_positions = torch.nonzero(valid_mask, as_tuple=False).view(-1)
+            backup_index_map[valid_positions] = torch.arange(
+                valid_positions.numel(),
+                dtype=torch.int32,
+                device=full_slot.device)
+            # Ensure backups reside on same device as caches
+            if backup_keys.device != acc.key_cache.device:
+                backup_keys = backup_keys.to(device=acc.key_cache.device)
+            if backup_values.device != acc.value_cache.device:
+                backup_values = backup_values.to(device=acc.value_cache.device)
 
         if self._shared_slot_mapping is None:
             self._shared_slot_mapping = full_slot
@@ -550,13 +836,16 @@ class NWORController:
             self.abort_window()
             return False
 
-        canonical_cpu = canonical_layout.to(torch.int32)
+        canonical_cpu = canonical_layout.to(dtype=torch.int32)
         if not torch.equal(full_req, canonical_cpu):
             self._current_accumulator = None
             self._fallback("Accumulated request indices mismatch canonical layout")
             self._write_pending_fallback()
             self.abort_window()
             return False
+
+        k_scale_full = self._merge_scales(acc.k_scale_chunks, acc.base_k_scale)
+        v_scale_full = self._merge_scales(acc.v_scale_chunks, acc.base_v_scale)
 
         self._pending_layers.append(
             _PendingLayer(
@@ -566,10 +855,13 @@ class NWORController:
                 key_cache=acc.key_cache,
                 value_cache=acc.value_cache,
                 kv_cache_dtype=acc.kv_cache_dtype,
-                k_scale=acc.k_scale,
-                v_scale=acc.v_scale,
+                k_scale=k_scale_full,
+                v_scale=v_scale_full,
                 request_indices=full_req,
                 staged_tokens=acc.draft_staged,
+                backup_keys=backup_keys,
+                backup_values=backup_values,
+                backup_index_map=backup_index_map,
             ))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[NWOR] finalize layer=%s total=%d expected=%d",
@@ -599,70 +891,43 @@ class NWORController:
         return True
 
     def _fallback(self, reason: str) -> None:
-        self._fallback_count += 1
-        self._metrics["fallbacks"] += 1
-        if self._fallback_count < self._max_fallbacks:
-            logger.warning("NWOR fallback #%d/%d: %s",
-                           self._fallback_count, self._max_fallbacks, reason)
-            return
-
-        if self._fallback_reason is None:
-            failure_rate = (100.0 * self._fallback_count /
-                            max(1, self._total_windows))
-            logger.error(
-                "NWOR disabled after %d failures (%.1f%% of %d windows): %s",
-                self._fallback_count,
-                failure_rate,
-                self._total_windows,
-                reason,
-            )
-            self._fallback_reason = reason
-            self._feature_enabled = False
-        else:
-            logger.debug("NWOR fallback after disable: %s", reason)
+        raise RuntimeError(f"NWOR fallback: {reason}")
 
     def _write_pending_fallback(self) -> None:
         if self._current_accumulator is not None:
             acc = self._current_accumulator
-            length = acc.draft_staged
-            if length > 0:
-                layer_idx = acc.layer_index
-                staging_keys = self._staging_buffers.keys[layer_idx]
-                staging_values = self._staging_buffers.values[layer_idx]
-                full_slot = torch.cat(acc.slot_chunks, dim=0)
-                if not full_slot.is_contiguous():
-                    full_slot = full_slot.contiguous()
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    staging_keys[:length],
-                    staging_values[:length],
-                    acc.key_cache,
-                    acc.value_cache,
-                    full_slot[:length],
-                    acc.kv_cache_dtype,
-                    acc.k_scale,
-                    acc.v_scale,
-                )
+            for slot_chunk, key_backup, value_backup in zip(
+                    acc.slot_chunks, acc.backup_key_chunks, acc.backup_value_chunks):
+                slot_indices = slot_chunk.to(device=acc.key_cache.device, dtype=torch.long)
+                valid_mask = slot_indices >= 0
+                if not bool(valid_mask.all()):
+                    slot_indices = slot_indices[valid_mask]
+                    key_backup = key_backup[valid_mask]
+                    value_backup = value_backup[valid_mask]
+                if slot_indices.numel() == 0:
+                    continue
+                acc.key_cache.index_copy_(0, slot_indices, key_backup)
+                acc.value_cache.index_copy_(0, slot_indices, value_backup)
             self._current_accumulator = None
 
         if self._pending_layers:
             try:
                 for pending in self._pending_layers:
-                    length = pending.staged_tokens
-                    if length <= 0:
+                    if (pending.backup_keys is None or pending.backup_values is None
+                            or pending.backup_index_map is None):
                         continue
-                    layer_idx = pending.layer_index
-                    staging_keys = self._staging_buffers.keys[layer_idx]
-                    staging_values = self._staging_buffers.values[layer_idx]
-                    torch.ops._C_cache_ops.reshape_and_cache_flash(
-                        staging_keys[:length],
-                        staging_values[:length],
-                        pending.key_cache,
-                        pending.value_cache,
-                        pending.slot_mapping[:length],
-                        pending.kv_cache_dtype,
-                        pending.k_scale,
-                        pending.v_scale,
-                    )
+                    index_map = pending.backup_index_map.to(device=pending.key_cache.device,
+                                                            dtype=torch.long)
+                    valid_mask = index_map >= 0
+                    slot_indices = pending.slot_mapping.to(device=pending.key_cache.device,
+                                                            dtype=torch.long)[valid_mask]
+                    if slot_indices.numel() == 0:
+                        continue
+                    key_indices = index_map[valid_mask]
+                    key_backup = pending.backup_keys.index_select(0, key_indices)
+                    value_backup = pending.backup_values.index_select(0, key_indices)
+                    pending.key_cache.index_copy_(0, slot_indices, key_backup)
+                    pending.value_cache.index_copy_(0, slot_indices, value_backup)
             finally:
                 self._pending_layers.clear()
 
@@ -701,7 +966,7 @@ class NWORController:
                 mask_cpu[token_idx] = True
                 consumed[req_idx] += 1
 
-        return mask_cpu.to(device, non_blocking=True)
+        return mask_cpu.to(device=device, non_blocking=True)
 
     def _commit_layer(self, pending: _PendingLayer,
                       accepted_mask: torch.Tensor) -> None:
@@ -709,27 +974,47 @@ class NWORController:
         if slot_mapping.numel() < self._total_tokens:
             raise ValueError("slot mapping shorter than expected window")
 
-        local_mask = accepted_mask[:slot_mapping.numel()] & (slot_mapping >= 0)
-        if not bool(local_mask.any()):
-            return
-
         layer_idx = pending.layer_index
         staging_keys = self._staging_buffers.keys[layer_idx]
         staging_values = self._staging_buffers.values[layer_idx]
 
-        key_slice = staging_keys[local_mask].contiguous()
-        value_slice = staging_values[local_mask].contiguous()
-        slots_slice = slot_mapping[local_mask].contiguous()
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key_slice,
-            value_slice,
-            pending.key_cache,
-            pending.value_cache,
-            slots_slice,
-            pending.kv_cache_dtype,
-            pending.k_scale,
-            pending.v_scale,
-        )
+        staged_mask = (pending.backup_index_map >= 0
+                       if pending.backup_index_map is not None else
+                       (slot_mapping >= 0))
+        local_mask = accepted_mask[:slot_mapping.numel()] & staged_mask
+        if bool(local_mask.any()):
+            key_slice = staging_keys[local_mask].contiguous()
+            value_slice = staging_values[local_mask].contiguous()
+            slots_slice = slot_mapping[local_mask].contiguous()
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key_slice,
+                value_slice,
+                pending.key_cache,
+                pending.value_cache,
+                slots_slice,
+                pending.kv_cache_dtype,
+                pending.k_scale,
+                pending.v_scale,
+            )
+
+        if (pending.backup_keys is not None and pending.backup_values is not None
+                and pending.backup_index_map is not None):
+            rejected_mask = staged_mask & (~accepted_mask[:slot_mapping.numel()])
+            if bool(rejected_mask.any()):
+                restore_index = pending.backup_index_map[rejected_mask]
+                valid_restore = restore_index >= 0
+                if bool(valid_restore.any()):
+                    restore_index = restore_index[valid_restore].to(
+                        device=pending.key_cache.device, dtype=torch.long)
+                    slot_indices = slot_mapping[rejected_mask][valid_restore].to(
+                        device=pending.key_cache.device, dtype=torch.long)
+                    restore_keys = pending.backup_keys.index_select(0, restore_index)
+                    restore_values = pending.backup_values.index_select(0, restore_index)
+                    pending.key_cache.index_copy_(0, slot_indices, restore_keys)
+                    pending.value_cache.index_copy_(0, slot_indices, restore_values)
+        pending.backup_keys = None
+        pending.backup_values = None
+        pending.backup_index_map = None
 
     def _flush_verifier_tails(self) -> None:
         if not self._pending_verifier_tails:
@@ -853,7 +1138,7 @@ def build_token_request_indices(
     else:
         qsl = query_start_loc_cpu
 
-    qsl = qsl.to(torch.int32)
+    qsl = qsl.to(dtype=torch.int32)
     lengths = qsl[1:] - qsl[:-1]
     if lengths.numel() == 0:
         return torch.empty(0, dtype=torch.int32)
@@ -864,3 +1149,39 @@ def build_token_request_indices(
 
     request_ids = torch.arange(lengths.numel(), dtype=torch.int32)
     return torch.repeat_interleave(request_ids, lengths)
+
+
+def extract_query_start_loc_cpu(attn_metadata: object) -> Optional[torch.Tensor]:
+    """Best-effort extraction of query-start offsets from metadata graphs."""
+
+    if attn_metadata is None:
+        return None
+
+    def _coerce(candidate: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if candidate is None or not isinstance(candidate, torch.Tensor):
+            return None
+        if candidate.numel() < 2:
+            return None
+        if candidate.device.type != "cpu":
+            candidate = candidate.cpu()
+        return candidate
+
+    def _from(obj: object) -> Optional[torch.Tensor]:
+        if obj is None:
+            return None
+        for name in ("query_start_loc_cpu", "query_start_loc"):
+            value = _coerce(getattr(obj, name, None))
+            if value is not None:
+                return value
+        return None
+
+    direct = _from(attn_metadata)
+    if direct is not None:
+        return direct
+
+    for attr in ("prefill_metadata", "decode_metadata", "prefill", "decode"):
+        nested = _from(getattr(attn_metadata, attr, None))
+        if nested is not None:
+            return nested
+
+    return None
