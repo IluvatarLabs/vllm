@@ -91,6 +91,7 @@ class NWORController:
         self._layer_staged_tokens: dict[str, int] = {}
         self._layer_verifier_written: dict[str, bool] = {}
         self._pending_verifier_tails: list[_VerifierTail] = []
+        self._window_request_layout: Optional[torch.Tensor] = None
         self._window_request_indices: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ flags
@@ -119,6 +120,11 @@ class NWORController:
         self._num_draft_tokens = counts
         self._draft_total = total
         self._total_tokens = total
+
+        request_ids = torch.arange(len(counts), dtype=torch.int32)
+        counts_tensor = torch.tensor(counts, dtype=torch.int32)
+        self._window_request_layout = torch.repeat_interleave(request_ids, counts_tensor)
+
         logger.debug(
             "NWOR begin_window: num_draft=%s draft_total=%d total_tokens=%d",
             counts,
@@ -147,6 +153,7 @@ class NWORController:
         self._layer_staged_tokens = {}
         self._layer_verifier_written = {}
         self._pending_verifier_tails = []
+        self._window_request_layout = None
         self._window_request_indices = None
 
     # ------------------------------------------------------------------ staging
@@ -171,17 +178,19 @@ class NWORController:
         if chunk_len == 0:
             return True
 
-        if token_request_indices is None or token_request_indices.numel() != chunk_len:
-            self._fallback(
-                "token_request_indices missing or length mismatch for staged chunk")
+        canonical_layout = self._window_request_layout
+        if canonical_layout is None or canonical_layout.numel() != self._total_tokens:
+            self._fallback("canonical request layout missing or inconsistent")
             self._write_pending_fallback()
             self.abort_window()
             return False
 
-        request_indices = token_request_indices
-        if request_indices.device.type != "cpu":
-            request_indices = request_indices.cpu()
-        request_indices = request_indices.to(torch.int32)
+        request_indices: Optional[torch.Tensor] = None
+        if token_request_indices is not None:
+            request_indices = token_request_indices
+            if request_indices.device.type != "cpu":
+                request_indices = request_indices.cpu()
+            request_indices = request_indices.to(torch.int32)
 
         if key.size(0) < chunk_len or value.size(0) < chunk_len:
             self._fallback("key/value tensors shorter than chunk")
@@ -216,8 +225,19 @@ class NWORController:
 
         if (self._current_accumulator is None and staged_total == 0
                 and stage_len == self._total_tokens and verifier_len == 0):
+            if request_indices is not None:
+                if (request_indices.numel() != canonical_layout.numel()
+                        or not torch.equal(request_indices, canonical_layout)):
+                    self._fallback(
+                        "fast path request indices mismatch canonical layout")
+                    self._write_pending_fallback()
+                    self.abort_window()
+                    return False
+                req_view = request_indices
+            else:
+                req_view = canonical_layout
+
             slot_view = slot_mapping[:stage_len]
-            req_view = request_indices[:stage_len]
             if self._shared_slot_mapping is None:
                 slot_full = (slot_view if slot_view.is_contiguous() else
                              slot_view.contiguous())
@@ -279,7 +299,12 @@ class NWORController:
             key_stage = key[:stage_len]
             value_stage = value[:stage_len]
             slot_stage = slot_mapping[:stage_len]
-            req_stage = request_indices[:stage_len].to(torch.int32)
+            if staged_total + stage_len > canonical_layout.numel():
+                self._fallback("canonical layout shorter than staged tokens")
+                self._write_pending_fallback()
+                self.abort_window()
+                return False
+            req_stage = canonical_layout[staged_total:staged_total + stage_len].clone()
 
             acc = self._current_accumulator
             if acc is None:
@@ -289,7 +314,7 @@ class NWORController:
                     value_chunks=[value_stage],
                     slot_chunks=[slot_stage],
                     draft_staged=stage_len,
-                    request_chunks=[req_stage.clone()],
+                    request_chunks=[req_stage],
                     key_cache=key_cache,
                     value_cache=value_cache,
                     kv_cache_dtype=kv_cache_dtype,
@@ -305,7 +330,7 @@ class NWORController:
                 acc.key_chunks.append(key_stage)
                 acc.value_chunks.append(value_stage)
                 acc.slot_chunks.append(slot_stage)
-                acc.request_chunks.append(req_stage.clone())
+                acc.request_chunks.append(req_stage)
                 acc.draft_staged += stage_len
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug("NWOR chunk layer=%s chunk_len=%d acc=%d/%d",
@@ -484,6 +509,22 @@ class NWORController:
                 return False
             full_slot = expected
 
+        canonical_layout = self._window_request_layout
+        if canonical_layout is None or canonical_layout.numel() != full_req.numel():
+            self._current_accumulator = None
+            self._fallback("canonical request layout missing during finalize")
+            self._write_pending_fallback()
+            self.abort_window()
+            return False
+
+        canonical_cpu = canonical_layout.to(torch.int32)
+        if not torch.equal(full_req, canonical_cpu):
+            self._current_accumulator = None
+            self._fallback("Accumulated request indices mismatch canonical layout")
+            self._write_pending_fallback()
+            self.abort_window()
+            return False
+
         self._pending_layers.append(
             _PendingLayer(
                 layer_name=acc.layer_name,
@@ -592,7 +633,9 @@ class NWORController:
             return None
         layout = self._window_request_indices
         if layout is None:
-            return None
+            layout = self._window_request_layout
+            if layout is None:
+                return None
 
         layout_cpu = layout.cpu()
         total_tokens = layout_cpu.numel()
