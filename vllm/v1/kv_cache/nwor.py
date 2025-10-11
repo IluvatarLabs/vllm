@@ -226,13 +226,25 @@ class NWORController:
         if (self._current_accumulator is None and staged_total == 0
                 and stage_len == self._total_tokens and verifier_len == 0):
             if request_indices is not None:
-                if (request_indices.numel() != canonical_layout.numel()
-                        or not torch.equal(request_indices, canonical_layout)):
+                if request_indices.numel() != canonical_layout.numel():
+                    logger.warning(
+                        "NWOR fast-path length mismatch: layer=%s provided=%d canonical=%d",
+                        layer_name,
+                        request_indices.numel(),
+                        canonical_layout.numel(),
+                    )
                     self._fallback(
-                        "fast path request indices mismatch canonical layout")
+                        "fast path request indices length mismatch canonical layout")
                     self._write_pending_fallback()
                     self.abort_window()
                     return False
+                if not torch.equal(request_indices, canonical_layout):
+                    logger.debug(
+                        "NWOR fast-path layout diff: layer=%s provided=%s canonical=%s",
+                        layer_name,
+                        request_indices.tolist(),
+                        canonical_layout.tolist(),
+                    )
                 req_view = request_indices
             else:
                 req_view = canonical_layout
@@ -301,6 +313,35 @@ class NWORController:
             slot_stage = slot_mapping[:stage_len]
             if request_indices is not None and request_indices.numel() >= stage_len:
                 req_stage = request_indices[:stage_len].to(torch.int32)
+                canonical_slice = canonical_layout[staged_total:staged_total + stage_len]
+                if canonical_slice.numel() != req_stage.numel():
+                    logger.warning(
+                        "NWOR chunk length mismatch: layer=%s chunk_offset=%d provided=%d canonical=%d",
+                        layer_name,
+                        staged_total,
+                        req_stage.numel(),
+                        canonical_slice.numel(),
+                    )
+                    self._fallback("chunk layout length mismatch")
+                    self._write_pending_fallback()
+                    self.abort_window()
+                    return False
+                if not torch.equal(req_stage, canonical_slice):
+                    logger.debug(
+                        "NWOR chunk layout diff: layer=%s chunk_offset=%d provided=%s canonical=%s",
+                        layer_name,
+                        staged_total,
+                        req_stage.tolist(),
+                        canonical_slice.tolist(),
+                    )
+                else:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "NWOR chunk layout match: layer=%s offset=%d len=%d",
+                            layer_name,
+                            staged_total,
+                            stage_len,
+                        )
             else:
                 if staged_total + stage_len > canonical_layout.numel():
                     self._fallback("canonical layout shorter than staged tokens")
