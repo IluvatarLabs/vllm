@@ -681,6 +681,12 @@ class NWORController:
             if layout is None:
                 return None
 
+        logger.info("NWOR mask input: accepted_prefix=%s total_tokens=%d layout_counts=%s",
+                    accepted_prefix,
+                    self._total_tokens,
+                    layout.tolist() if layout.numel() <= 128 else f"len={layout.numel()}"
+                    )
+
         layout_cpu = layout.cpu()
         total_tokens = layout_cpu.numel()
         if total_tokens != self._total_tokens:
@@ -705,6 +711,10 @@ class NWORController:
                 mask_cpu[token_idx] = True
                 consumed[req_idx] += 1
 
+        true_positions = mask_cpu.nonzero(as_tuple=False).view(-1).tolist()
+        logger.info("NWOR mask result: true_indices=%s",
+                    true_positions if len(true_positions) <= 128 else f"count={len(true_positions)}")
+
         return mask_cpu.to(device, non_blocking=True)
 
     def _commit_layer(self, pending: _PendingLayer,
@@ -714,6 +724,11 @@ class NWORController:
             raise ValueError("slot mapping shorter than expected window")
 
         local_mask = accepted_mask[:slot_mapping.numel()] & (slot_mapping >= 0)
+        true_positions = local_mask.nonzero(as_tuple=False).view(-1).tolist()
+        logger.info("NWOR commit: layer=%s accept_count=%d slots=%s",
+                    pending.layer_name,
+                    len(true_positions),
+                    true_positions if len(true_positions) <= 128 else f"count={len(true_positions)}")
         if not bool(local_mask.any()):
             return
 
