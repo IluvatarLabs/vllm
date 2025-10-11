@@ -421,37 +421,35 @@ class NWORController:
                 )
                 acc = self._current_accumulator
 
-            if request_indices is None:
-                self._fallback("request indices missing for NWOR staging")
-                self._write_pending_fallback()
-                self.abort_window()
-                return False
-
             canonical_slice = canonical_layout[staged_total:staged_total + target_stage]
-            per_request_positions: dict[int, deque[int]] = defaultdict(deque)
-            remaining_positions: list[int] = []
-            for pos in range(chunk_len):
-                req_idx = int(request_indices[pos])
-                if req_idx < 0 or req_idx >= len(self._num_draft_tokens):
-                    remaining_positions.append(pos)
-                else:
-                    per_request_positions[req_idx].append(pos)
+            if request_indices is None:
+                stage_positions = list(range(target_stage))
+                tail_positions = list(range(target_stage, chunk_len))
+            else:
+                per_request_positions: dict[int, deque[int]] = defaultdict(deque)
+                remaining_positions: list[int] = []
+                for pos in range(chunk_len):
+                    req_idx = int(request_indices[pos])
+                    if req_idx < 0 or req_idx >= len(self._num_draft_tokens):
+                        remaining_positions.append(pos)
+                    else:
+                        per_request_positions[req_idx].append(pos)
 
-            stage_positions = []
-            for req_idx in canonical_slice.tolist():
-                queue = per_request_positions.get(int(req_idx))
-                if queue is None or not queue:
-                    self._fallback(
-                        f"insufficient draft tokens for request {req_idx} in chunk")
-                    self._write_pending_fallback()
-                    self.abort_window()
-                    return False
-                stage_positions.append(queue.popleft())
+                stage_positions = []
+                for req_idx in canonical_slice.tolist():
+                    queue = per_request_positions.get(int(req_idx))
+                    if queue is None or not queue:
+                        self._fallback(
+                            f"insufficient draft tokens for request {req_idx} in chunk")
+                        self._write_pending_fallback()
+                        self.abort_window()
+                        return False
+                    stage_positions.append(queue.popleft())
 
-            tail_positions = remaining_positions
-            for queue in per_request_positions.values():
-                tail_positions.extend(queue)
-            tail_positions.sort()
+                tail_positions = remaining_positions
+                for queue in per_request_positions.values():
+                    tail_positions.extend(queue)
+                tail_positions.sort()
 
             if logger.isEnabledFor(logging.INFO):
                 max_preview = 32
@@ -636,12 +634,9 @@ class NWORController:
             req_stage = req_stage_tensor.to(dtype=torch.int32).clone()
             acc.slot_chunks.append(slot_stage)
             acc.request_chunks.append(req_stage)
-                acc.draft_staged += stage_len
-                staged_total = acc.draft_staged
-                self._layer_staged_tokens[layer_name] = staged_total
-                tail_positions_for_verifier = tail_positions
-                verifier_len = len(tail_positions)
-
+            acc.draft_staged += stage_len
+            staged_total = acc.draft_staged
+            self._layer_staged_tokens[layer_name] = staged_total
             tail_positions_for_verifier = tail_positions
             verifier_len = len(tail_positions)
 
@@ -1060,12 +1055,17 @@ class NWORController:
                     valid_mask = (pending.slot_mapping >= 0)
                     if not bool(valid_mask.any()):
                         continue
-                    block_idx = pending.backup_block_indices.to(
+                    valid_mask_cpu = valid_mask.cpu()
+                    block_idx_cpu = pending.backup_block_indices.to(
+                        dtype=torch.long)
+                    offset_cpu = pending.backup_block_offsets.to(
+                        dtype=torch.long)
+                    block_idx = block_idx_cpu[valid_mask_cpu].to(
                         device=pending.key_cache.device,
-                        dtype=torch.long)[valid_mask.cpu()]
-                    offset = pending.backup_block_offsets.to(
+                        dtype=torch.long)
+                    offset = offset_cpu[valid_mask_cpu].to(
                         device=pending.key_cache.device,
-                        dtype=torch.long)[valid_mask.cpu()]
+                        dtype=torch.long)
                     key_restore = pending.backup_keys[valid_mask]
                     value_restore = pending.backup_values[valid_mask]
                     self._scatter_cache_entries(pending.key_cache, block_idx,
@@ -1148,12 +1148,16 @@ class NWORController:
             rejected_mask = staged_mask & (~accepted_mask[:slot_mapping.numel()])
             if bool(rejected_mask.any()):
                 rejected_mask_cpu = rejected_mask.cpu()
-                block_idx = pending.backup_block_indices.to(
+                block_idx_cpu = pending.backup_block_indices.to(
+                    dtype=torch.long)
+                offset_cpu = pending.backup_block_offsets.to(
+                    dtype=torch.long)
+                block_idx = block_idx_cpu[rejected_mask_cpu].to(
                     device=pending.key_cache.device,
-                    dtype=torch.long)[rejected_mask_cpu]
-                offset = pending.backup_block_offsets.to(
+                    dtype=torch.long)
+                offset = offset_cpu[rejected_mask_cpu].to(
                     device=pending.key_cache.device,
-                    dtype=torch.long)[rejected_mask_cpu]
+                    dtype=torch.long)
                 restore_keys = pending.backup_keys[rejected_mask]
                 restore_values = pending.backup_values[rejected_mask]
                 self._scatter_cache_entries(pending.key_cache, block_idx, offset,
