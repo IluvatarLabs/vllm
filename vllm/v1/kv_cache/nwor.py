@@ -21,11 +21,62 @@ __all__ = [
 ]
 
 
+class _StagingBuffers:
+    """Device-side staging slabs shared across layers for a window."""
+
+    def __init__(self) -> None:
+        self.capacity: int = 0
+        self.dtype: Optional[torch.dtype] = None
+        self.device: Optional[torch.device] = None
+        self.num_heads: Optional[int] = None
+        self.head_dim: Optional[int] = None
+        self.keys: list[torch.Tensor] = []
+        self.values: list[torch.Tensor] = []
+        self.slots: Optional[torch.Tensor] = None
+
+    def ensure(self,
+               *,
+               num_layers: int,
+               num_tokens: int,
+               num_heads: int,
+               head_dim: int,
+               dtype: torch.dtype,
+               device: torch.device) -> None:
+        need_realloc = (
+            self.capacity < num_tokens or self.dtype != dtype
+            or self.device != device or self.num_heads != num_heads
+            or self.head_dim != head_dim or len(self.keys) != num_layers)
+        if not need_realloc:
+            return
+
+        self.capacity = num_tokens
+        self.dtype = dtype
+        self.device = device
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.keys = [
+            torch.empty((num_tokens, num_heads, head_dim),
+                        dtype=dtype,
+                        device=device)
+            for _ in range(num_layers)
+        ]
+        self.values = [
+            torch.empty((num_tokens, num_heads, head_dim),
+                        dtype=dtype,
+                        device=device)
+            for _ in range(num_layers)
+        ]
+        self.slots = torch.empty((num_tokens,), dtype=torch.int32, device=device)
+
+    def zero_slots(self) -> None:
+        if self.slots is not None:
+            self.slots.zero_()
+
+
 @dataclass
 class _PendingLayer:
     layer_name: str
-    key: torch.Tensor
-    value: torch.Tensor
+    layer_index: int
     slot_mapping: torch.Tensor
     key_cache: torch.Tensor
     value_cache: torch.Tensor
@@ -39,8 +90,7 @@ class _PendingLayer:
 @dataclass
 class _LayerAccumulator:
     layer_name: str
-    key_chunks: list[torch.Tensor]
-    value_chunks: list[torch.Tensor]
+    layer_index: int
     slot_chunks: list[torch.Tensor]
     draft_staged: int
     request_chunks: list[torch.Tensor]
@@ -93,6 +143,10 @@ class NWORController:
         self._pending_verifier_tails: list[_VerifierTail] = []
         self._window_request_layout: Optional[torch.Tensor] = None
         self._window_request_indices: Optional[torch.Tensor] = None
+        self._layer_name_to_index: dict[str, int] = {}
+        self._layer_names: list[str] = []
+        self._staging_buffers = _StagingBuffers()
+        self._staging_reset_pending = False
 
     # ------------------------------------------------------------------ flags
     @property
@@ -124,6 +178,7 @@ class NWORController:
         request_ids = torch.arange(len(counts), dtype=torch.int32)
         counts_tensor = torch.tensor(counts, dtype=torch.int32)
         self._window_request_layout = torch.repeat_interleave(request_ids, counts_tensor)
+        self._staging_reset_pending = True
 
         logger.debug(
             "NWOR begin_window: num_draft=%s draft_total=%d total_tokens=%d",
@@ -155,6 +210,7 @@ class NWORController:
         self._pending_verifier_tails = []
         self._window_request_layout = None
         self._window_request_indices = None
+        self._staging_reset_pending = False
 
     # ------------------------------------------------------------------ staging
     def record_layer(
@@ -174,16 +230,16 @@ class NWORController:
         if not self.can_stage:
             return False
 
-        chunk_len = int(slot_mapping.numel())
-        if chunk_len == 0:
-            return True
-
         canonical_layout = self._window_request_layout
         if canonical_layout is None or canonical_layout.numel() != self._total_tokens:
             self._fallback("canonical request layout missing or inconsistent")
             self._write_pending_fallback()
             self.abort_window()
             return False
+
+        chunk_len = int(slot_mapping.numel())
+        if chunk_len == 0:
+            return True
 
         request_indices: Optional[torch.Tensor] = None
         if token_request_indices is not None:
@@ -198,10 +254,31 @@ class NWORController:
             self.abort_window()
             return False
 
+        layer_idx = self._layer_name_to_index.get(layer_name)
+        if layer_idx is None:
+            layer_idx = len(self._layer_names)
+            self._layer_names.append(layer_name)
+            self._layer_name_to_index[layer_name] = layer_idx
+
         acc = self._current_accumulator
         if acc is not None and acc.layer_name != layer_name:
             if not self._finalize_current_layer():
                 return False
+            acc = self._current_accumulator
+
+        if acc is None:
+            self._current_accumulator = _LayerAccumulator(
+                layer_name=layer_name,
+                layer_index=layer_idx,
+                slot_chunks=[],
+                draft_staged=0,
+                request_chunks=[],
+                key_cache=key_cache,
+                value_cache=value_cache,
+                kv_cache_dtype=kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
             acc = self._current_accumulator
 
         staged_total = self._layer_staged_tokens.get(layer_name, 0)
@@ -223,165 +300,29 @@ class NWORController:
                 self._total_tokens,
             )
 
-        if (self._current_accumulator is None and staged_total == 0
-                and stage_len == self._total_tokens and verifier_len == 0):
-            if request_indices is not None:
-                if request_indices.numel() != canonical_layout.numel():
-                    logger.warning(
-                        "NWOR fast-path length mismatch: layer=%s provided=%d canonical=%d",
-                        layer_name,
-                        request_indices.numel(),
-                        canonical_layout.numel(),
-                    )
-                    self._fallback(
-                        "fast path request indices length mismatch canonical layout")
-                    self._write_pending_fallback()
-                    self.abort_window()
-                    return False
-                if not torch.equal(request_indices, canonical_layout):
-                    logger.debug(
-                        "NWOR fast-path layout diff: layer=%s provided=%s canonical=%s",
-                        layer_name,
-                        request_indices.tolist(),
-                        canonical_layout.tolist(),
-                    )
-                req_view = request_indices
-            else:
-                req_view = canonical_layout
-
-            slot_view = slot_mapping[:stage_len]
-            if self._shared_slot_mapping is None:
-                slot_full = (slot_view if slot_view.is_contiguous() else
-                             slot_view.contiguous())
-                self._shared_slot_mapping = slot_full
-            else:
-                expected = self._shared_slot_mapping
-                if (slot_view.device != expected.device
-                        or slot_view.shape != expected.shape
-                        or not torch.equal(slot_view, expected)):
-                    self._fallback("slot mapping values differ across layers")
-                    self._write_pending_fallback()
-                    self.abort_window()
-                    return False
-                slot_full = expected
-
-            key_view = key[:stage_len]
-            value_view = value[:stage_len]
-            key_full = (key_view if key_view.is_contiguous() else
-                        key_view.contiguous())
-            value_full = (value_view if value_view.is_contiguous() else
-                          value_view.contiguous())
-            req_full = req_view.clone().to(torch.int32)
-            self._pending_layers.append(
-                _PendingLayer(
-                    layer_name=layer_name,
-                    key=key_full,
-                    value=value_full,
-                    slot_mapping=slot_full,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    kv_cache_dtype=kv_cache_dtype,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    request_indices=req_full,
-                    staged_tokens=stage_len,
-                ))
-            self._layer_staged_tokens[layer_name] = self._total_tokens
-            self._layer_verifier_written[layer_name] = False
-            if self._window_request_indices is None:
-                self._window_request_indices = req_full
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("NWOR request layout: %s",
-                                 req_full.tolist())
-            elif self._window_request_indices.shape != req_full.shape or not torch.equal(
-                    self._window_request_indices, req_full):
-                self._fallback("inconsistent request index layout across layers")
-                self._write_pending_fallback()
-                self.abort_window()
-                return False
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[NWOR] layer=%s staged=%d/%d", layer_name,
-                              self._total_tokens, self._total_tokens)
-            logger.debug("NWOR window summary: layer=%s staged=%d verifier=%d",
-                         layer_name, self._total_tokens, 0)
-            return True
-
-        stage_success = True
         if stage_len > 0:
-            key_stage = key[:stage_len]
-            value_stage = value[:stage_len]
+            canonical_slice = canonical_layout[staged_total:staged_total + stage_len]
+            if request_indices is not None:
+                provided_slice = request_indices[:stage_len]
+                if provided_slice.numel() != canonical_slice.numel() or not torch.equal(
+                        provided_slice, canonical_slice):
+                    self._fallback("request index layout mismatch for staged chunk")
+                    self._write_pending_fallback()
+                    self.abort_window()
+                    return False
+                req_stage = provided_slice
+            else:
+                req_stage = canonical_slice
+
             slot_stage = slot_mapping[:stage_len]
-            if request_indices is not None and request_indices.numel() >= stage_len:
-                req_stage = request_indices[:stage_len].to(torch.int32)
-                canonical_slice = canonical_layout[staged_total:staged_total + stage_len]
-                if canonical_slice.numel() != req_stage.numel():
-                    logger.warning(
-                        "NWOR chunk length mismatch: layer=%s chunk_offset=%d provided=%d canonical=%d",
-                        layer_name,
-                        staged_total,
-                        req_stage.numel(),
-                        canonical_slice.numel(),
-                    )
-                    self._fallback("chunk layout length mismatch")
-                    self._write_pending_fallback()
-                    self.abort_window()
-                    return False
-                if not torch.equal(req_stage, canonical_slice):
-                    logger.debug(
-                        "NWOR chunk layout diff: layer=%s chunk_offset=%d provided=%s canonical=%s",
-                        layer_name,
-                        staged_total,
-                        req_stage.tolist(),
-                        canonical_slice.tolist(),
-                    )
-                else:
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            "NWOR chunk layout match: layer=%s offset=%d len=%d",
-                            layer_name,
-                            staged_total,
-                            stage_len,
-                        )
-            else:
-                if staged_total + stage_len > canonical_layout.numel():
-                    self._fallback("canonical layout shorter than staged tokens")
-                    self._write_pending_fallback()
-                    self.abort_window()
-                    return False
-                req_stage = canonical_layout[staged_total:staged_total + stage_len].clone()
+            if not slot_stage.is_contiguous():
+                slot_stage = slot_stage.contiguous()
+            self._stage_chunk(layer_idx, key[:stage_len], value[:stage_len],
+                              slot_stage, staged_total)
 
-            acc = self._current_accumulator
-            if acc is None:
-                self._current_accumulator = _LayerAccumulator(
-                    layer_name=layer_name,
-                    key_chunks=[key_stage],
-                    value_chunks=[value_stage],
-                    slot_chunks=[slot_stage],
-                    draft_staged=stage_len,
-                    request_chunks=[req_stage],
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    kv_cache_dtype=kv_cache_dtype,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                )
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("NWOR chunk layer=%s chunk_len=%d acc=%d/%d",
-                                 layer_name, stage_len, stage_len,
-                                 self._total_tokens)
-                acc = self._current_accumulator
-            else:
-                acc.key_chunks.append(key_stage)
-                acc.value_chunks.append(value_stage)
-                acc.slot_chunks.append(slot_stage)
-                acc.request_chunks.append(req_stage)
-                acc.draft_staged += stage_len
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("NWOR chunk layer=%s chunk_len=%d acc=%d/%d",
-                                 layer_name, stage_len, acc.draft_staged,
-                                 self._total_tokens)
-
-            assert acc is not None
+            acc.slot_chunks.append(slot_stage)
+            acc.request_chunks.append(req_stage.clone())
+            acc.draft_staged += stage_len
             staged_total = acc.draft_staged
             self._layer_staged_tokens[layer_name] = staged_total
             if logger.isEnabledFor(logging.DEBUG):
@@ -389,17 +330,15 @@ class NWORController:
                               staged_total, self._total_tokens)
 
             if staged_total == self._total_tokens:
-                stage_success = self._finalize_current_layer()
+                if not self._finalize_current_layer():
+                    return False
+                acc = self._current_accumulator
             elif staged_total > self._total_tokens:
                 self._fallback(
-                    f"Layer {acc.layer_name} over-accumulated: {staged_total} > {self._total_tokens}")
+                    f"Layer {layer_name} over-accumulated: {staged_total} > {self._total_tokens}")
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
-
-            if not stage_success:
-                return False
-            acc = self._current_accumulator
 
         if verifier_len > 0:
             staged_now = self._layer_staged_tokens.get(layer_name, 0)
@@ -441,9 +380,40 @@ class NWORController:
                 logger.debug("NWOR queued verifier tail: layer=%s tail=%d",
                              layer_name, verifier_len)
 
-        return stage_success
+        return True
 
     # ------------------------------------------------------------------ commit
+
+    def _stage_chunk(self, layer_idx: int, key_chunk: torch.Tensor,
+                     value_chunk: torch.Tensor, slot_chunk: torch.Tensor,
+                     start: int) -> None:
+        """Copy staged tokens into shared device buffers."""
+        num_layers = len(self._layer_names)
+        num_tokens = self._total_tokens
+        num_heads = key_chunk.shape[1]
+        head_dim = key_chunk.shape[2]
+        dtype = key_chunk.dtype
+        device = key_chunk.device
+
+        self._staging_buffers.ensure(num_layers=num_layers,
+                                     num_tokens=num_tokens,
+                                     num_heads=num_heads,
+                                     head_dim=head_dim,
+                                     dtype=dtype,
+                                     device=device)
+        if self._staging_reset_pending:
+            self._staging_buffers.zero_slots()
+            self._staging_reset_pending = False
+
+        end = start + key_chunk.shape[0]
+        staging_keys = self._staging_buffers.keys[layer_idx]
+        staging_values = self._staging_buffers.values[layer_idx]
+        staging_keys[start:end].copy_(key_chunk.contiguous())
+        staging_values[start:end].copy_(value_chunk.contiguous())
+        slots = self._staging_buffers.slots
+        if slots is not None:
+            slots[start:end].copy_(slot_chunk.to(torch.int32))
+
     def commit_window(self, accepted_prefix: Sequence[int]) -> None:
         if not self._window_active:
             return
@@ -510,7 +480,7 @@ class NWORController:
             acc.layer_name,
             acc.draft_staged,
             self._total_tokens,
-            len(acc.key_chunks),
+            len(acc.slot_chunks),
         )
         if acc.draft_staged != self._total_tokens:
             logger.warning("[NWOR] abort layer=%s accumulated=%d expected=%d",
@@ -523,20 +493,13 @@ class NWORController:
             self.abort_window()
             return False
 
-        full_key = torch.cat(acc.key_chunks, dim=0)
-        full_value = torch.cat(acc.value_chunks, dim=0)
         full_slot = torch.cat(acc.slot_chunks, dim=0)
-        full_req = torch.cat(acc.request_chunks, dim=0)
-
-        if not full_key.is_contiguous():
-            full_key = full_key.contiguous()
-        if not full_value.is_contiguous():
-            full_value = full_value.contiguous()
         if not full_slot.is_contiguous():
             full_slot = full_slot.contiguous()
+
+        full_req = torch.cat(acc.request_chunks, dim=0)
         if full_req.device.type != "cpu":
             full_req = full_req.cpu()
-
         full_req = full_req.to(torch.int32)
 
         if self._shared_slot_mapping is None:
@@ -572,8 +535,7 @@ class NWORController:
         self._pending_layers.append(
             _PendingLayer(
                 layer_name=acc.layer_name,
-                key=full_key,
-                value=full_value,
+                layer_index=acc.layer_index,
                 slot_mapping=full_slot,
                 key_cache=acc.key_cache,
                 value_cache=acc.value_cache,
@@ -636,17 +598,20 @@ class NWORController:
     def _write_pending_fallback(self) -> None:
         if self._current_accumulator is not None:
             acc = self._current_accumulator
-            for key_chunk, value_chunk, slot_chunk in zip(
-                    acc.key_chunks, acc.value_chunks, acc.slot_chunks):
-                key_local = key_chunk if key_chunk.is_contiguous() else key_chunk.contiguous()
-                value_local = value_chunk if value_chunk.is_contiguous() else value_chunk.contiguous()
-                slot_local = slot_chunk if slot_chunk.is_contiguous() else slot_chunk.contiguous()
+            length = acc.draft_staged
+            if length > 0:
+                layer_idx = acc.layer_index
+                staging_keys = self._staging_buffers.keys[layer_idx]
+                staging_values = self._staging_buffers.values[layer_idx]
+                full_slot = torch.cat(acc.slot_chunks, dim=0)
+                if not full_slot.is_contiguous():
+                    full_slot = full_slot.contiguous()
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key_local,
-                    value_local,
+                    staging_keys[:length],
+                    staging_values[:length],
                     acc.key_cache,
                     acc.value_cache,
-                    slot_local,
+                    full_slot[:length],
                     acc.kv_cache_dtype,
                     acc.k_scale,
                     acc.v_scale,
@@ -656,13 +621,18 @@ class NWORController:
         if self._pending_layers:
             try:
                 for pending in self._pending_layers:
-                    staged = pending.staged_tokens or pending.key.shape[0]
+                    length = pending.staged_tokens
+                    if length <= 0:
+                        continue
+                    layer_idx = pending.layer_index
+                    staging_keys = self._staging_buffers.keys[layer_idx]
+                    staging_values = self._staging_buffers.values[layer_idx]
                     torch.ops._C_cache_ops.reshape_and_cache_flash(
-                        pending.key[:staged],
-                        pending.value[:staged],
+                        staging_keys[:length],
+                        staging_values[:length],
                         pending.key_cache,
                         pending.value_cache,
-                        pending.slot_mapping[:staged],
+                        pending.slot_mapping[:length],
                         pending.kv_cache_dtype,
                         pending.k_scale,
                         pending.v_scale,
@@ -680,12 +650,6 @@ class NWORController:
             layout = self._window_request_layout
             if layout is None:
                 return None
-
-        logger.info("NWOR mask input: accepted_prefix=%s total_tokens=%d layout_counts=%s",
-                    accepted_prefix,
-                    self._total_tokens,
-                    layout.tolist() if layout.numel() <= 128 else f"len={layout.numel()}"
-                    )
 
         layout_cpu = layout.cpu()
         total_tokens = layout_cpu.numel()
@@ -711,10 +675,6 @@ class NWORController:
                 mask_cpu[token_idx] = True
                 consumed[req_idx] += 1
 
-        true_positions = mask_cpu.nonzero(as_tuple=False).view(-1).tolist()
-        logger.info("NWOR mask result: true_indices=%s",
-                    true_positions if len(true_positions) <= 128 else f"count={len(true_positions)}")
-
         return mask_cpu.to(device, non_blocking=True)
 
     def _commit_layer(self, pending: _PendingLayer,
@@ -724,16 +684,15 @@ class NWORController:
             raise ValueError("slot mapping shorter than expected window")
 
         local_mask = accepted_mask[:slot_mapping.numel()] & (slot_mapping >= 0)
-        true_positions = local_mask.nonzero(as_tuple=False).view(-1).tolist()
-        logger.info("NWOR commit: layer=%s accept_count=%d slots=%s",
-                    pending.layer_name,
-                    len(true_positions),
-                    true_positions if len(true_positions) <= 128 else f"count={len(true_positions)}")
         if not bool(local_mask.any()):
             return
 
-        key_slice = pending.key[local_mask].contiguous()
-        value_slice = pending.value[local_mask].contiguous()
+        layer_idx = pending.layer_index
+        staging_keys = self._staging_buffers.keys[layer_idx]
+        staging_values = self._staging_buffers.values[layer_idx]
+
+        key_slice = staging_keys[local_mask].contiguous()
+        value_slice = staging_values[local_mask].contiguous()
         slots_slice = slot_mapping[local_mask].contiguous()
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key_slice,
