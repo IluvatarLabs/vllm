@@ -17,6 +17,7 @@ __all__ = [
     "set_global_nwor_controller",
     "get_global_nwor_controller",
     "record_or_write_kv_cache",
+    "build_token_request_indices",
 ]
 
 
@@ -31,6 +32,7 @@ class _PendingLayer:
     kv_cache_dtype: str
     k_scale: torch.Tensor
     v_scale: torch.Tensor
+    request_indices: torch.Tensor
     staged_tokens: int = 0
 
 
@@ -41,6 +43,7 @@ class _LayerAccumulator:
     value_chunks: list[torch.Tensor]
     slot_chunks: list[torch.Tensor]
     draft_staged: int
+    request_chunks: list[torch.Tensor]
     key_cache: torch.Tensor
     value_cache: torch.Tensor
     kv_cache_dtype: str
@@ -88,6 +91,7 @@ class NWORController:
         self._layer_staged_tokens: dict[str, int] = {}
         self._layer_verifier_written: dict[str, bool] = {}
         self._pending_verifier_tails: list[_VerifierTail] = []
+        self._window_request_indices: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ flags
     @property
@@ -126,6 +130,7 @@ class NWORController:
         self._layer_staged_tokens = {}
         self._layer_verifier_written = {}
         self._pending_verifier_tails = []
+        self._window_request_indices = None
         self._total_windows += 1
         self._metrics["windows_attempted"] += 1
         self._metrics["tokens_deferred"] += total
@@ -142,6 +147,7 @@ class NWORController:
         self._layer_staged_tokens = {}
         self._layer_verifier_written = {}
         self._pending_verifier_tails = []
+        self._window_request_indices = None
 
     # ------------------------------------------------------------------ staging
     def record_layer(
@@ -156,6 +162,7 @@ class NWORController:
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        token_request_indices: Optional[torch.Tensor],
     ) -> bool:
         if not self.can_stage:
             return False
@@ -163,6 +170,18 @@ class NWORController:
         chunk_len = int(slot_mapping.numel())
         if chunk_len == 0:
             return True
+
+        if token_request_indices is None or token_request_indices.numel() != chunk_len:
+            self._fallback(
+                "token_request_indices missing or length mismatch for staged chunk")
+            self._write_pending_fallback()
+            self.abort_window()
+            return False
+
+        request_indices = token_request_indices
+        if request_indices.device.type != "cpu":
+            request_indices = request_indices.cpu()
+        request_indices = request_indices.to(torch.int32)
 
         if key.size(0) < chunk_len or value.size(0) < chunk_len:
             self._fallback("key/value tensors shorter than chunk")
@@ -184,17 +203,6 @@ class NWORController:
         stage_len = min(chunk_len, remaining)
         verifier_len = chunk_len - stage_len
 
-        if stage_len < chunk_len:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "NWOR fallback chunk crossing boundary: layer=%s staged=%d chunk=%d total=%d",
-                    layer_name,
-                    staged_total,
-                    chunk_len,
-                    self._total_tokens,
-                )
-            return False
-
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d staged_total=%d/%d",
@@ -209,6 +217,7 @@ class NWORController:
         if (self._current_accumulator is None and staged_total == 0
                 and stage_len == self._total_tokens and verifier_len == 0):
             slot_view = slot_mapping[:stage_len]
+            req_view = request_indices[:stage_len]
             if self._shared_slot_mapping is None:
                 slot_full = (slot_view if slot_view.is_contiguous() else
                              slot_view.contiguous())
@@ -230,6 +239,7 @@ class NWORController:
                         key_view.contiguous())
             value_full = (value_view if value_view.is_contiguous() else
                           value_view.contiguous())
+            req_full = req_view.clone().to(torch.int32)
             self._pending_layers.append(
                 _PendingLayer(
                     layer_name=layer_name,
@@ -241,10 +251,22 @@ class NWORController:
                     kv_cache_dtype=kv_cache_dtype,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    request_indices=req_full,
                     staged_tokens=stage_len,
                 ))
             self._layer_staged_tokens[layer_name] = self._total_tokens
             self._layer_verifier_written[layer_name] = False
+            if self._window_request_indices is None:
+                self._window_request_indices = req_full
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("NWOR request layout: %s",
+                                 req_full.tolist())
+            elif self._window_request_indices.shape != req_full.shape or not torch.equal(
+                    self._window_request_indices, req_full):
+                self._fallback("inconsistent request index layout across layers")
+                self._write_pending_fallback()
+                self.abort_window()
+                return False
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("[NWOR] layer=%s staged=%d/%d", layer_name,
                               self._total_tokens, self._total_tokens)
@@ -257,6 +279,7 @@ class NWORController:
             key_stage = key[:stage_len]
             value_stage = value[:stage_len]
             slot_stage = slot_mapping[:stage_len]
+            req_stage = request_indices[:stage_len].to(torch.int32)
 
             acc = self._current_accumulator
             if acc is None:
@@ -266,6 +289,7 @@ class NWORController:
                     value_chunks=[value_stage],
                     slot_chunks=[slot_stage],
                     draft_staged=stage_len,
+                    request_chunks=[req_stage.clone()],
                     key_cache=key_cache,
                     value_cache=value_cache,
                     kv_cache_dtype=kv_cache_dtype,
@@ -281,6 +305,7 @@ class NWORController:
                 acc.key_chunks.append(key_stage)
                 acc.value_chunks.append(value_stage)
                 acc.slot_chunks.append(slot_stage)
+                acc.request_chunks.append(req_stage.clone())
                 acc.draft_staged += stage_len
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug("NWOR chunk layer=%s chunk_len=%d acc=%d/%d",
@@ -366,7 +391,6 @@ class NWORController:
         accepted_total = sum(max(0, int(x)) for x in accepted_prefix)
 
         if not self._pending_layers:
-            self._flush_verifier_tails()
             self.abort_window()
             return
 
@@ -433,6 +457,7 @@ class NWORController:
         full_key = torch.cat(acc.key_chunks, dim=0)
         full_value = torch.cat(acc.value_chunks, dim=0)
         full_slot = torch.cat(acc.slot_chunks, dim=0)
+        full_req = torch.cat(acc.request_chunks, dim=0)
 
         if not full_key.is_contiguous():
             full_key = full_key.contiguous()
@@ -440,6 +465,10 @@ class NWORController:
             full_value = full_value.contiguous()
         if not full_slot.is_contiguous():
             full_slot = full_slot.contiguous()
+        if full_req.device.type != "cpu":
+            full_req = full_req.cpu()
+
+        full_req = full_req.to(torch.int32)
 
         if self._shared_slot_mapping is None:
             self._shared_slot_mapping = full_slot
@@ -466,12 +495,28 @@ class NWORController:
                 kv_cache_dtype=acc.kv_cache_dtype,
                 k_scale=acc.k_scale,
                 v_scale=acc.v_scale,
+                request_indices=full_req,
                 staged_tokens=acc.draft_staged,
             ))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[NWOR] finalize layer=%s total=%d expected=%d",
                          acc.layer_name, acc.draft_staged, self._total_tokens)
         self._layer_staged_tokens[acc.layer_name] = acc.draft_staged
+
+        if self._window_request_indices is None:
+            self._window_request_indices = full_req
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("NWOR request layout: %s",
+                             full_req.tolist())
+        else:
+            if (self._window_request_indices.shape != full_req.shape or
+                    not torch.equal(self._window_request_indices, full_req)):
+                self._fallback(
+                    "inconsistent request index layout across layers")
+                self._write_pending_fallback()
+                self.abort_window()
+                return False
+
         verifier_logged = self._layer_verifier_written.get(acc.layer_name, False)
         if not verifier_logged:
             logger.debug("NWOR window summary: layer=%s staged=%d verifier=%d",
@@ -545,20 +590,34 @@ class NWORController:
     def _build_accept_mask(self, accepted_prefix: Sequence[int]) -> Optional[torch.Tensor]:
         if not self._pending_layers:
             return None
+        layout = self._window_request_indices
+        if layout is None:
+            return None
+
+        layout_cpu = layout.cpu()
+        total_tokens = layout_cpu.numel()
+        if total_tokens != self._total_tokens:
+            raise ValueError("request index layout length mismatch")
+
         device = self._pending_layers[0].slot_mapping.device
-        mask_cpu = torch.zeros(self._total_tokens, dtype=torch.bool)
-        cursor = 0
-        for count, accepted in zip(self._num_draft_tokens, accepted_prefix):
-            accepted_int = max(0, int(accepted))
-            if accepted_int > count:
+        mask_cpu = torch.zeros(total_tokens, dtype=torch.bool)
+
+        accepted_counts = [max(0, int(x)) for x in accepted_prefix]
+        for idx, count in enumerate(accepted_counts):
+            drafted = self._num_draft_tokens[idx]
+            if count > drafted:
                 raise ValueError(
-                    f"Accepted tokens ({accepted_int}) exceed drafted tokens ({count})")
-            end = cursor + accepted_int
-            if end > mask_cpu.numel():
-                return None
-            if end > cursor:
-                mask_cpu[cursor:end] = True
-            cursor += count
+                    f"Accepted tokens ({count}) exceed drafted tokens ({drafted})")
+
+        consumed = [0] * len(accepted_counts)
+        layout_list = layout_cpu.tolist()
+        for token_idx, req_idx in enumerate(layout_list):
+            if req_idx < 0 or req_idx >= len(accepted_counts):
+                continue
+            if consumed[req_idx] < accepted_counts[req_idx]:
+                mask_cpu[token_idx] = True
+                consumed[req_idx] += 1
+
         return mask_cpu.to(device, non_blocking=True)
 
     def _commit_layer(self, pending: _PendingLayer,
@@ -651,6 +710,7 @@ def record_or_write_kv_cache(
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    token_request_indices: Optional[torch.Tensor] = None,
 ) -> None:
     controller = get_global_nwor_controller()
     if controller is None or not controller.can_stage:
@@ -676,6 +736,7 @@ def record_or_write_kv_cache(
         kv_cache_dtype=kv_cache_dtype,
         k_scale=k_scale,
         v_scale=v_scale,
+        token_request_indices=token_request_indices,
     )
     if not staged:
         torch.ops._C_cache_ops.reshape_and_cache_flash(
@@ -688,3 +749,31 @@ def record_or_write_kv_cache(
             k_scale,
             v_scale,
         )
+
+
+def build_token_request_indices(
+    query_start_loc_cpu: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Builds per-token request indices from query start offsets."""
+
+    if query_start_loc_cpu is None:
+        return None
+    if query_start_loc_cpu.numel() < 2:
+        return None
+
+    if query_start_loc_cpu.device.type != "cpu":
+        qsl = query_start_loc_cpu.cpu()
+    else:
+        qsl = query_start_loc_cpu
+
+    qsl = qsl.to(torch.int32)
+    lengths = qsl[1:] - qsl[:-1]
+    if lengths.numel() == 0:
+        return torch.empty(0, dtype=torch.int32)
+
+    total = int(lengths.sum().item())
+    if total == 0:
+        return torch.empty(0, dtype=torch.int32)
+
+    request_ids = torch.arange(lengths.numel(), dtype=torch.int32)
+    return torch.repeat_interleave(request_ids, lengths)

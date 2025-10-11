@@ -30,7 +30,8 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               CommonAttentionMetadata,
                                               get_kv_cache_layout)
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.v1.kv_cache.nwor import record_or_write_kv_cache
+from vllm.v1.kv_cache.nwor import (build_token_request_indices,
+                                   record_or_write_kv_cache)
 
 logger = init_logger(__name__)
 
@@ -495,6 +496,8 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
+            token_request_indices = build_token_request_indices(
+                getattr(attn_metadata, "query_start_loc_cpu", None))
             record_or_write_kv_cache(
                 layer_name=layer.layer_name,
                 key=key,
@@ -505,6 +508,7 @@ class FlashAttentionImpl(AttentionImpl):
                 kv_cache_dtype=self.kv_cache_dtype,
                 k_scale=layer._k_scale,
                 v_scale=layer._v_scale,
+                token_request_indices=token_request_indices,
             )
 
         if self.kv_cache_dtype.startswith("fp8"):
