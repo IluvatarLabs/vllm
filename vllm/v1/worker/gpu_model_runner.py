@@ -2332,6 +2332,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "enforce_eager=True or VLLM_COMPILE_DISABLE_CUDA_GRAPHS=1.")
         self.nwor_controller = controller
         set_global_nwor_controller(controller)
+        logger.info("NWOR INIT: enabled=%s controller=%s",
+                    envs.VLLM_ENABLE_NWOR, controller is not None)
 
     def _maybe_enable_nwor_window(
         self,
