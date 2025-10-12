@@ -199,11 +199,21 @@ class NWORController:
         self._enable_trace = bool(getattr(envs, "VLLM_NWOR_TRACE_WRITES", False))
         self._enable_debug_asserts = bool(
             getattr(envs, "VLLM_NWOR_DEBUG_ASSERTS", False))
+        prune_commit_flag = bool(
+            getattr(envs, "VLLM_NWOR_PRUNE_COMMIT", False))
         self._trace_json_path: Optional[str] = getattr(
             envs, "VLLM_NWOR_TRACE_WRITES_JSON_PATH", None)
         self._trace_totals_dirty = False
         self._last_fallback_reason: Optional[str] = None
         self._window_summary_logged = True
+        self._enable_commit_prune = False
+        if prune_commit_flag:
+            if not self._enable_debug_asserts:
+                logger.warning(
+                    "NWOR commit pruning requested but debug asserts disabled; keeping baseline commit path.")
+            else:
+                self._enable_commit_prune = True
+                logger.info("NWOR commit pruning enabled")
         self._reset_counters()
 
     def _reset_counters(self) -> None:
@@ -1301,17 +1311,18 @@ class NWORController:
                     raise RuntimeError("NWOR debug assert: cache keys diverged before commit")
                 if not torch.equal(cached_values, value_slice):
                     raise RuntimeError("NWOR debug assert: cache values diverged before commit")
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key_slice,
-                value_slice,
-                pending.key_cache,
-                pending.value_cache,
-                slots_slice,
-                pending.kv_cache_dtype,
-                pending.k_scale,
-                pending.v_scale,
-            )
-            self._trace_inc("writes_commit", int(key_slice.shape[0]))
+            if not self._enable_commit_prune:
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key_slice,
+                    value_slice,
+                    pending.key_cache,
+                    pending.value_cache,
+                    slots_slice,
+                    pending.kv_cache_dtype,
+                    pending.k_scale,
+                    pending.v_scale,
+                )
+                self._trace_inc("writes_commit", int(key_slice.shape[0]))
 
         if (pending.backup_keys is not None and pending.backup_values is not None
                 and pending.backup_block_indices is not None

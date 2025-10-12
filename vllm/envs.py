@@ -633,6 +633,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_NWOR_DEBUG_ASSERTS", "0"))),
     "VLLM_NWOR_TRACE_WRITES_JSON_PATH":
     lambda: os.getenv("VLLM_NWOR_TRACE_WRITES_JSON_PATH", None),
+    "VLLM_NWOR_PRUNE_COMMIT":
+    lambda: bool(int(os.getenv("VLLM_NWOR_PRUNE_COMMIT", "0"))),
 
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION":
