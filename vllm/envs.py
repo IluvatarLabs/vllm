@@ -627,6 +627,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ else None,
     "VLLM_ENABLE_NWOR":
     lambda: bool(int(os.getenv("VLLM_ENABLE_NWOR", "0"))),
+    "VLLM_NWOR_TRACE_WRITES":
+    lambda: bool(int(os.getenv("VLLM_NWOR_TRACE_WRITES", "0"))),
+    "VLLM_NWOR_DEBUG_ASSERTS":
+    lambda: bool(int(os.getenv("VLLM_NWOR_DEBUG_ASSERTS", "0"))),
+    "VLLM_NWOR_TRACE_WRITES_JSON_PATH":
+    lambda: os.getenv("VLLM_NWOR_TRACE_WRITES_JSON_PATH", None),
 
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION":

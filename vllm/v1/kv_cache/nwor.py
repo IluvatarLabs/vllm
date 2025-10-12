@@ -9,6 +9,7 @@ from typing import Optional, Sequence
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -195,6 +196,105 @@ class NWORController:
         self._layer_names: list[str] = []
         self._staging_buffers = _StagingBuffers()
         self._staging_reset_pending = False
+        self._enable_trace = bool(getattr(envs, "VLLM_NWOR_TRACE_WRITES", False))
+        self._enable_debug_asserts = bool(
+            getattr(envs, "VLLM_NWOR_DEBUG_ASSERTS", False))
+        self._trace_json_path: Optional[str] = getattr(
+            envs, "VLLM_NWOR_TRACE_WRITES_JSON_PATH", None)
+        self._trace_totals_dirty = False
+        self._last_fallback_reason: Optional[str] = None
+        self._window_summary_logged = True
+        self._reset_counters()
+
+    def _reset_counters(self) -> None:
+        # Global counters
+        self._trace_totals = {
+            "windows": 0,
+            "writes_stage": 0,
+            "writes_commit": 0,
+            "writes_verifier": 0,
+            "writes_fallback": 0,
+        }
+        self._window_trace = {
+            "writes_stage": 0,
+            "writes_commit": 0,
+            "writes_verifier": 0,
+            "writes_fallback": 0,
+        }
+        self._trace_totals_dirty = False
+
+    def _trace_inc(self, key: str, amount: int = 1) -> None:
+        if not self._enable_trace:
+            return
+        self._window_trace[key] += amount
+        self._trace_totals[key] += amount
+        self._trace_totals_dirty = True
+
+    def _trace_window_begin(self) -> None:
+        if not self._enable_trace:
+            return
+        self._window_trace = {
+            "writes_stage": 0,
+            "writes_commit": 0,
+            "writes_verifier": 0,
+            "writes_fallback": 0,
+        }
+        self._trace_totals["windows"] += 1
+        self._trace_totals_dirty = True
+        self._last_fallback_reason = None
+        self._window_summary_logged = False
+
+    def _trace_window_summary(self, *,
+                              staged: int,
+                              accepted: int,
+                              rejected: int,
+                              fallback: Optional[str]) -> None:
+        if not self._enable_trace:
+            return
+        logger.info(
+            "NWOR window summary: staged=%d accepted=%d rejected=%d fall=%s writes={stage:%d commit:%d verifier:%d fallback:%d}",
+            staged,
+            accepted,
+            rejected,
+            fallback if fallback is not None else self._last_fallback_reason,
+            self._window_trace["writes_stage"],
+            self._window_trace["writes_commit"],
+            self._window_trace["writes_verifier"],
+            self._window_trace["writes_fallback"],
+        )
+        self._trace_totals_dirty = True
+
+    def _trace_window_close(self, *, accepted: int, rejected: int) -> None:
+        if not self._enable_trace or self._window_summary_logged:
+            return
+        staged = self._draft_total
+        self._trace_window_summary(staged=staged,
+                                   accepted=accepted,
+                                   rejected=rejected,
+                                   fallback=None)
+        self._window_summary_logged = True
+
+    def _trace_dump_totals(self) -> None:
+        if not self._enable_trace or not self._trace_totals_dirty:
+            return
+        summary = {
+            **self._trace_totals,
+            "tokens_deferred": self._metrics.get("tokens_deferred", 0),
+            "tokens_committed": self._metrics.get("tokens_committed", 0),
+            "tokens_rejected": self._metrics.get("tokens_rejected", 0),
+            "acceptance_rate_pct": self.get_metrics().get("acceptance_rate_pct",
+                                                          0.0),
+            "fallbacks": self._metrics.get("fallbacks", 0),
+        }
+        logger.info("NWOR trace totals: %s", summary)
+        if self._trace_json_path:
+            try:
+                import json  # local import to avoid mandatory dependency
+                with open(self._trace_json_path, "w", encoding="utf-8") as out:
+                    json.dump(summary, out, indent=2, sort_keys=True)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("NWOR trace json dump failed: %s", exc)
+        self._trace_totals_dirty = False
 
     # ------------------------------------------------------------------ flags
     @property
@@ -269,6 +369,9 @@ class NWORController:
             self.abort_window()
             return False
 
+        if self._enable_trace:
+            self._trace_window_begin()
+
         self._window_active = True
         self._pending_layers = []
         self._num_draft_tokens = counts
@@ -311,6 +414,8 @@ class NWORController:
         self._window_request_layout = None
         self._window_request_indices = None
         self._staging_reset_pending = False
+        self._last_fallback_reason = None
+        self._window_summary_logged = True
 
     # ------------------------------------------------------------------ staging
     def record_layer(
@@ -598,6 +703,7 @@ class NWORController:
                 stage_k_scale_arg,
                 stage_v_scale_arg,
             )
+            self._trace_inc("writes_stage", int(key_stage.shape[0]))
 
             if not slot_stage.is_contiguous():
                 slot_stage = slot_stage.contiguous()
@@ -766,6 +872,7 @@ class NWORController:
                     tail_k_scale,
                     tail_v_scale,
                 )
+                self._trace_inc("writes_verifier", int(verifier_key.shape[0]))
                 self._layer_verifier_written[layer_name] = True
                 logger.debug("NWOR flushed verifier tail: layer=%s tail=%d",
                              layer_name, verifier_len)
@@ -846,7 +953,6 @@ class NWORController:
                 return
 
         accepted_total = sum(max(0, int(x)) for x in accepted_prefix)
-
         if not self._pending_layers:
             self.abort_window()
             return
@@ -884,8 +990,13 @@ class NWORController:
                 self._metrics["tokens_committed"] += accepted_total
                 self._metrics["tokens_rejected"] += rejected_total
                 self._flush_verifier_tails()
+                accepted_total_for_trace = accepted_total
+                rejected_total_for_trace = rejected_total
+                self._trace_window_close(accepted=accepted_total,
+                                         rejected=rejected_total)
         finally:
             self.abort_window()
+            self._trace_dump_totals()
 
     # ------------------------------------------------------------------ helpers
     def _finalize_current_layer(self) -> bool:
@@ -1016,6 +1127,7 @@ class NWORController:
     def _fallback(self, reason: str) -> None:
         self._fallback_count += 1
         self._metrics["fallbacks"] += 1
+        self._last_fallback_reason = reason
         if self._fallback_count < self._max_fallbacks:
             logger.warning("NWOR fallback #%d/%d: %s",
                            self._fallback_count, self._max_fallbacks, reason)
@@ -1058,12 +1170,14 @@ class NWORController:
                         device=acc.key_cache.device, dtype=torch.long)
                     key_restore = key_backup[valid_mask]
                     value_restore = value_backup[valid_mask]
+                    tokens_restored = int(key_restore.shape[0])
                     self._scatter_cache_entries(acc.key_cache, block_idx,
                                                 offset, key_restore,
                                                 layout=layout)
                     self._scatter_cache_entries(acc.value_cache, block_idx,
                                                 offset, value_restore,
                                                 layout=layout)
+                    self._trace_inc("writes_fallback", tokens_restored)
             self._current_accumulator = None
 
         if self._pending_layers:
@@ -1091,16 +1205,21 @@ class NWORController:
                         dtype=torch.long)
                     key_restore = pending.backup_keys[valid_mask]
                     value_restore = pending.backup_values[valid_mask]
+                    tokens_restored = int(key_restore.shape[0])
                     self._scatter_cache_entries(pending.key_cache, block_idx,
                                                 offset, key_restore,
                                                 layout=pending.cache_layout)
                     self._scatter_cache_entries(pending.value_cache, block_idx,
                                                 offset, value_restore,
                                                 layout=pending.cache_layout)
+                    self._trace_inc("writes_fallback", tokens_restored)
             finally:
                 self._pending_layers.clear()
 
         self._flush_verifier_tails()
+        if self._enable_trace:
+            self._trace_window_close(accepted=0, rejected=self._draft_total)
+            self._trace_dump_totals()
 
     def _build_accept_mask(self, accepted_prefix: Sequence[int]) -> Optional[torch.Tensor]:
         if not self._pending_layers:
@@ -1153,6 +1272,35 @@ class NWORController:
             key_slice = staging_keys[local_mask].contiguous()
             value_slice = staging_values[local_mask].contiguous()
             slots_slice = slot_mapping[local_mask].contiguous()
+            if self._enable_debug_asserts and pending.cache_layout is not None:
+                slot_cpu = slots_slice.to(device="cpu", dtype=torch.long)
+                block_size = pending.cache_block_size
+                if block_size is None:
+                    block_size = self._infer_cache_layout(
+                        pending.key_cache,
+                        num_heads=int(key_slice.shape[1]))[1]
+                block_idx_cpu = torch.div(slot_cpu, block_size, rounding_mode="floor")
+                offset_cpu = torch.remainder(slot_cpu, block_size)
+                block_idx = block_idx_cpu.to(device=pending.key_cache.device,
+                                             dtype=torch.long)
+                offset = offset_cpu.to(device=pending.key_cache.device,
+                                       dtype=torch.long)
+                cached_keys = self._gather_cache_entries(
+                    pending.key_cache,
+                    block_idx,
+                    offset,
+                    layout=pending.cache_layout,
+                    num_heads=int(key_slice.shape[1]))
+                cached_values = self._gather_cache_entries(
+                    pending.value_cache,
+                    block_idx,
+                    offset,
+                    layout=pending.cache_layout,
+                    num_heads=int(value_slice.shape[1]))
+                if not torch.equal(cached_keys, key_slice):
+                    raise RuntimeError("NWOR debug assert: cache keys diverged before commit")
+                if not torch.equal(cached_values, value_slice):
+                    raise RuntimeError("NWOR debug assert: cache values diverged before commit")
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key_slice,
                 value_slice,
@@ -1163,6 +1311,7 @@ class NWORController:
                 pending.k_scale,
                 pending.v_scale,
             )
+            self._trace_inc("writes_commit", int(key_slice.shape[0]))
 
         if (pending.backup_keys is not None and pending.backup_values is not None
                 and pending.backup_block_indices is not None
@@ -1183,12 +1332,14 @@ class NWORController:
                     dtype=torch.long)
                 restore_keys = pending.backup_keys[rejected_mask]
                 restore_values = pending.backup_values[rejected_mask]
+                tokens_restored = int(restore_keys.shape[0])
                 self._scatter_cache_entries(pending.key_cache, block_idx, offset,
                                             restore_keys,
                                             layout=pending.cache_layout)
                 self._scatter_cache_entries(pending.value_cache, block_idx, offset,
                                             restore_values,
                                             layout=pending.cache_layout)
+                self._trace_inc("writes_fallback", tokens_restored)
         pending.backup_keys = None
         pending.backup_values = None
         pending.backup_block_indices = None
@@ -1211,6 +1362,7 @@ class NWORController:
                     tail.k_scale,
                     tail.v_scale,
                 )
+                self._trace_inc("writes_verifier", int(tail.key.shape[0]))
         finally:
             self._pending_verifier_tails.clear()
 
@@ -1266,6 +1418,8 @@ def record_or_write_kv_cache(
 ) -> None:
     controller = get_global_nwor_controller()
     if controller is None or not controller.can_stage:
+        if controller is not None:
+            controller._trace_inc("writes_fallback", int(key.shape[0]))
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
@@ -1291,6 +1445,7 @@ def record_or_write_kv_cache(
         token_request_indices=token_request_indices,
     )
     if not staged:
+        controller._trace_inc("writes_fallback", int(key.shape[0]))
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
