@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills, split_decodes_and_prefills)
 from vllm.v1.kv_cache.nwor import (build_token_request_indices,
                                    extract_query_start_loc_cpu,
+                                   get_cache_view_for_layer,
                                    record_or_write_kv_cache)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -385,6 +386,9 @@ class TreeAttentionImpl(AttentionImpl):
 
         # Cache the input KVs.
         key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = get_cache_view_for_layer(layer.layer_name,
+                                                          key_cache,
+                                                          value_cache)
         if self.kv_sharing_target_layer_name is None:
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.

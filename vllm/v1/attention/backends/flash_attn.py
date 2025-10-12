@@ -32,6 +32,7 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache.nwor import (build_token_request_indices,
                                    extract_query_start_loc_cpu,
+                                   get_cache_view_for_layer,
                                    record_or_write_kv_cache)
 
 logger = init_logger(__name__)
@@ -484,6 +485,9 @@ class FlashAttentionImpl(AttentionImpl):
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = get_cache_view_for_layer(layer.layer_name,
+                                                          key_cache,
+                                                          value_cache)
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
