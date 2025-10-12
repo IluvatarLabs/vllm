@@ -367,16 +367,16 @@ class NWORController:
             acc = self._current_accumulator
 
         staged_total = self._layer_staged_tokens.get(layer_name, 0)
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "NWOR stage_input: layer=%s idx=%d chunk=%d total=%d staged_total=%d req_none=%s",
-                layer_name,
-                layer_idx,
-                chunk_len,
-                self._total_tokens,
-                staged_total,
-                request_indices is None,
-            )
+        # if logger.isEnabledFor(logging.INFO):
+        #     logger.info(
+        #         "NWOR stage_input: layer=%s idx=%d chunk=%d total=%d staged_total=%d req_none=%s",
+        #         layer_name,
+        #         layer_idx,
+        #         chunk_len,
+        #         self._total_tokens,
+        #         staged_total,
+        #         request_indices is None,
+        #     )
 
         remaining = self._total_tokens - staged_total
         target_stage = min(chunk_len, remaining)
@@ -386,16 +386,16 @@ class NWORController:
         stage_positions: Optional[list[int]] = None
         tail_positions_for_verifier: Optional[list[int]] = None
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d staged_total=%d/%d",
-                layer_name,
-                chunk_len,
-                target_stage,
-                verifier_len,
-                staged_total,
-                self._total_tokens,
-            )
+            # if logger.isEnabledFor(logging.DEBUG):
+            #     logger.debug(
+            #         "NWOR record_layer: layer=%s chunk_len=%d stage_len=%d verifier_len=%d staged_total=%d/%d",
+            #         layer_name,
+            #         chunk_len,
+            #         target_stage,
+            #         verifier_len,
+            #         staged_total,
+            #         self._total_tokens,
+            #     )
 
         if target_stage > 0:
             if acc is None:
@@ -451,22 +451,22 @@ class NWORController:
                     tail_positions.extend(queue)
                 tail_positions.sort()
 
-            if logger.isEnabledFor(logging.INFO):
-                max_preview = 32
-                stage_preview = (stage_positions if len(stage_positions) <= max_preview
-                                 else stage_positions[:max_preview] +
-                                 [f"...(+{len(stage_positions) - max_preview} more)"])
-                tail_preview = (tail_positions if len(tail_positions) <= max_preview
-                                else tail_positions[:max_preview] +
-                                [f"...(+{len(tail_positions) - max_preview} more)"])
-                logger.info(
-                    "NWOR layout_remap: layer=%s idx=%d start=%d stage_positions=%s tail_positions=%s",
-                    layer_name,
-                    layer_idx,
-                    staged_total,
-                    stage_preview,
-                    tail_preview,
-                )
+            # if logger.isEnabledFor(logging.INFO):
+            #     max_preview = 32
+            #     stage_preview = (stage_positions if len(stage_positions) <= max_preview
+            #                      else stage_positions[:max_preview] +
+            #                      [f"...(+{len(stage_positions) - max_preview} more)"])
+            #     tail_preview = (tail_positions if len(tail_positions) <= max_preview
+            #                     else tail_positions[:max_preview] +
+            #                     [f"...(+{len(tail_positions) - max_preview} more)"])
+            #     logger.info(
+            #         "NWOR layout_remap: layer=%s idx=%d start=%d stage_positions=%s tail_positions=%s",
+            #         layer_name,
+            #         layer_idx,
+            #         staged_total,
+            #         stage_preview,
+            #         tail_preview,
+            #     )
 
             stage_len = len(stage_positions)
             if stage_len != target_stage:
@@ -483,14 +483,14 @@ class NWORController:
                 0, idx_cpu.to(device=slot_mapping.device))
 
             slot_indices_cpu = slot_stage.to(device="cpu", dtype=torch.long)
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "NWOR slot_stage_raw: layer=%s idx=%d slots=%s",
-                    layer_name,
-                    layer_idx,
-                    slot_indices_cpu.tolist() if slot_indices_cpu.numel() <= 32
-                    else slot_indices_cpu[:32].tolist() +
-                    [f"...(+{slot_indices_cpu.numel() - 32} more)"])
+            # if logger.isEnabledFor(logging.INFO):
+            #     logger.info(
+            #         "NWOR slot_stage_raw: layer=%s idx=%d slots=%s",
+            #         layer_name,
+            #         layer_idx,
+            #         slot_indices_cpu.tolist() if slot_indices_cpu.numel() <= 32
+            #         else slot_indices_cpu[:32].tolist() +
+            #         [f"...(+{slot_indices_cpu.numel() - 32} more)"])
             if slot_indices_cpu.numel() == 0:
                 self._fallback("no valid slot indices for staged tokens")
                 self._write_pending_fallback()
@@ -550,21 +550,21 @@ class NWORController:
             offset_dev = offset_cpu.to(device=acc.key_cache.device,
                                        dtype=torch.long)
 
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "NWOR cache_rows: layer=%s idx=%d cache_rows=%d block_size=%d",
-                    layer_name,
-                    layer_idx,
-                    acc.key_cache.shape[0],
-                    block_size,
-                )
-                logger.info(
-                    "NWOR slot_indices: layer=%s idx=%d slots=%s",
-                    layer_name,
-                    layer_idx,
-                    slot_indices_cpu.tolist() if slot_indices_cpu.numel() <= 32
-                    else slot_indices_cpu[:32].tolist() +
-                    [f"...(+{slot_indices_cpu.numel() - 32} more)"])
+            # if logger.isEnabledFor(logging.INFO):
+            #     logger.info(
+            #         "NWOR cache_rows: layer=%s idx=%d cache_rows=%d block_size=%d",
+            #         layer_name,
+            #         layer_idx,
+            #         acc.key_cache.shape[0],
+            #         block_size,
+            #     )
+            #     logger.info(
+            #         "NWOR slot_indices: layer=%s idx=%d slots=%s",
+            #         layer_name,
+            #         layer_idx,
+            #         slot_indices_cpu.tolist() if slot_indices_cpu.numel() <= 32
+            #         else slot_indices_cpu[:32].tolist() +
+            #         [f"...(+{slot_indices_cpu.numel() - 32} more)"])
 
             original_keys = self._gather_cache_entries(
                 acc.key_cache, block_idx_dev, offset_dev, layout=layout,
@@ -609,24 +609,24 @@ class NWORController:
 
             req_stage_tensor = canonical_slice.to(dtype=torch.int32).clone()
 
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "NWOR stage_chunk: layer=%s idx=%d start=%d len=%d canonical_len=%d",
-                    layer_name,
-                    layer_idx,
-                    staged_total,
-                    stage_len,
-                    canonical_slice.numel(),
-                )
-                slot_min = int(slot_indices_cpu.min().item()) if slot_indices_cpu.numel() > 0 else -1
-                slot_max = int(slot_indices_cpu.max().item()) if slot_indices_cpu.numel() > 0 else -1
-                logger.info(
-                    "NWOR stage_slots: layer=%s idx=%d slot_min=%d slot_max=%d",
-                    layer_name,
-                    layer_idx,
-                    slot_min,
-                    slot_max,
-                )
+            # if logger.isEnabledFor(logging.INFO):
+            #     logger.info(
+            #         "NWOR stage_chunk: layer=%s idx=%d start=%d len=%d canonical_len=%d",
+            #         layer_name,
+            #         layer_idx,
+            #         staged_total,
+            #         stage_len,
+            #         canonical_slice.numel(),
+            #     )
+            #     slot_min = int(slot_indices_cpu.min().item()) if slot_indices_cpu.numel() > 0 else -1
+            #     slot_max = int(slot_indices_cpu.max().item()) if slot_indices_cpu.numel() > 0 else -1
+            #     logger.info(
+            #         "NWOR stage_slots: layer=%s idx=%d slot_min=%d slot_max=%d",
+            #         layer_name,
+            #         layer_idx,
+            #         slot_min,
+            #         slot_max,
+            #     )
 
             self._stage_chunk(layer_idx, key_stage, value_stage, slot_stage,
                               staged_total)
@@ -685,12 +685,34 @@ class NWORController:
                 verifier_slots = slot_mapping.index_select(
                     0, tail_idx_cpu.to(device=slot_mapping.device))
 
-                verifier_slots_device = verifier_slots.to(device=key_cache.device,
-                                                          dtype=torch.long)
+                verifier_slots_device = verifier_slots.to(
+                    device=key_cache.device, dtype=torch.long)
                 valid_tail_mask = (verifier_slots_device >= 0)
-                cache_capacity = key_cache.shape[0]
-                if cache_capacity > 0:
-                    valid_tail_mask &= (verifier_slots_device < cache_capacity)
+                cache_rows = key_cache.shape[0]
+                block_size = (acc.cache_block_size
+                               if acc is not None else None)
+                if cache_rows > 0:
+                    if block_size is None:
+                        try:
+                            inferred_layout, inferred_block_size = (
+                                self._infer_cache_layout(
+                                    key_cache,
+                                    num_heads=int(verifier_key.shape[1]),
+                                ))
+                        except RuntimeError as exc:
+                            self._fallback(str(exc))
+                            self._write_pending_fallback()
+                            self.abort_window()
+                            return False
+                        block_size = inferred_block_size
+                        if acc is not None:
+                            if acc.cache_layout is None:
+                                acc.cache_layout = inferred_layout
+                            acc.cache_block_size = inferred_block_size
+                    if block_size is not None:
+                        total_slots = cache_rows * block_size
+                        valid_tail_mask &= (
+                            verifier_slots_device < total_slots)
                 if not bool(valid_tail_mask.all()):
                     tail_positions_for_verifier = [pos for pos, keep in zip(
                         tail_positions_for_verifier,
@@ -752,6 +774,7 @@ class NWORController:
 
     # ------------------------------------------------------------------ commit
 
+    @staticmethod
     def _select_token_scale(
         scale: Optional[torch.Tensor],
         positions: Sequence[int],
