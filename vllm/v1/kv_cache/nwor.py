@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 import torch
@@ -126,6 +126,9 @@ class _PendingLayer:
     backup_block_offsets: Optional[torch.Tensor] = None
     cache_layout: Optional[str] = None
     cache_block_size: Optional[int] = None
+    staging_ranges: list[tuple[int, int]] = field(default_factory=list)
+    k_scale_args: list[Optional[torch.Tensor]] = field(default_factory=list)
+    v_scale_args: list[Optional[torch.Tensor]] = field(default_factory=list)
 
 
 @dataclass
@@ -148,6 +151,9 @@ class _LayerAccumulator:
     backup_block_offsets: list[torch.Tensor]
     cache_layout: Optional[str]
     cache_block_size: Optional[int]
+    staging_ranges: list[tuple[int, int]]
+    k_scale_args: list[Optional[torch.Tensor]]
+    v_scale_args: list[Optional[torch.Tensor]]
 
 
 @dataclass
@@ -214,6 +220,19 @@ class NWORController:
             else:
                 self._enable_commit_prune = True
                 logger.info("NWOR commit pruning enabled")
+        defer_write_flag = bool(
+            getattr(envs, "VLLM_NWOR_DEFER_WRITE", False))
+        self._enable_defer_write = False
+        if defer_write_flag:
+            if not self._enable_commit_prune:
+                logger.warning(
+                    "NWOR deferred write requested but commit pruning is disabled; keeping eager staging writes.")
+            elif not self._enable_debug_asserts:
+                logger.warning(
+                    "NWOR deferred write requested but debug asserts disabled; keeping eager staging writes.")
+            else:
+                self._enable_defer_write = True
+                logger.info("NWOR deferred write enabled (writes occur at commit)")
         self._reset_counters()
 
     def _reset_counters(self) -> None:
@@ -533,6 +552,9 @@ class NWORController:
                     backup_block_offsets=[],
                     cache_layout=None,
                     cache_block_size=None,
+                    staging_ranges=[],
+                    k_scale_args=[],
+                    v_scale_args=[],
                 )
                 acc = self._current_accumulator
 
@@ -681,39 +703,40 @@ class NWORController:
                     else slot_indices_cpu[:32].tolist() +
                     [f"...(+{slot_indices_cpu.numel() - 32} more)"])
 
-            original_keys = self._gather_cache_entries(
-                acc.key_cache, block_idx_dev, offset_dev, layout=layout,
-                num_heads=num_heads)
-            original_values = self._gather_cache_entries(
-                acc.value_cache, block_idx_dev, offset_dev, layout=layout,
-                num_heads=num_heads)
-            acc.backup_key_chunks.append(original_keys)
-            acc.backup_value_chunks.append(original_values)
-            acc.backup_block_indices.append(block_idx_cpu.to(torch.int32))
-            acc.backup_block_offsets.append(offset_cpu.to(torch.int32))
             stage_k_scale_arg = (stage_k_scale if stage_k_scale is not None
                                  else k_scale)
             stage_v_scale_arg = (stage_v_scale if stage_v_scale is not None
                                  else v_scale)
-            if isinstance(stage_k_scale_arg, torch.Tensor) and stage_k_scale_arg.device != key_stage.device:
-                stage_k_scale_arg = stage_k_scale_arg.to(device=key_stage.device,
-                                                        non_blocking=True)
-            if isinstance(stage_v_scale_arg, torch.Tensor) and stage_v_scale_arg.device != value_stage.device:
-                stage_v_scale_arg = stage_v_scale_arg.to(device=value_stage.device,
-                                                        non_blocking=True)
-            slot_stage_device = slot_stage.to(device=acc.key_cache.device,
-                                              dtype=torch.long)
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key_stage,
-                value_stage,
-                acc.key_cache,
-                acc.value_cache,
-                slot_stage_device,
-                acc.kv_cache_dtype,
-                stage_k_scale_arg,
-                stage_v_scale_arg,
-            )
-            self._trace_inc("writes_stage", int(key_stage.shape[0]))
+            if not self._enable_defer_write:
+                original_keys = self._gather_cache_entries(
+                    acc.key_cache, block_idx_dev, offset_dev, layout=layout,
+                    num_heads=num_heads)
+                original_values = self._gather_cache_entries(
+                    acc.value_cache, block_idx_dev, offset_dev, layout=layout,
+                    num_heads=num_heads)
+                acc.backup_key_chunks.append(original_keys)
+                acc.backup_value_chunks.append(original_values)
+                acc.backup_block_indices.append(block_idx_cpu.to(torch.int32))
+                acc.backup_block_offsets.append(offset_cpu.to(torch.int32))
+                if isinstance(stage_k_scale_arg, torch.Tensor) and stage_k_scale_arg.device != key_stage.device:
+                    stage_k_scale_arg = stage_k_scale_arg.to(device=key_stage.device,
+                                                            non_blocking=True)
+                if isinstance(stage_v_scale_arg, torch.Tensor) and stage_v_scale_arg.device != value_stage.device:
+                    stage_v_scale_arg = stage_v_scale_arg.to(device=value_stage.device,
+                                                            non_blocking=True)
+                slot_stage_device = slot_stage.to(device=acc.key_cache.device,
+                                                  dtype=torch.long)
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key_stage,
+                    value_stage,
+                    acc.key_cache,
+                    acc.value_cache,
+                    slot_stage_device,
+                    acc.kv_cache_dtype,
+                    stage_k_scale_arg,
+                    stage_v_scale_arg,
+                )
+                self._trace_inc("writes_stage", int(key_stage.shape[0]))
 
             if not slot_stage.is_contiguous():
                 slot_stage = slot_stage.contiguous()
@@ -744,12 +767,16 @@ class NWORController:
                     slot_max,
                 )
 
+            range_start = staged_total
             self._stage_chunk(layer_idx, key_stage, value_stage, slot_stage,
                               staged_total)
 
             req_stage = req_stage_tensor.to(dtype=torch.int32).clone()
             acc.slot_chunks.append(slot_stage)
             acc.request_chunks.append(req_stage)
+            acc.staging_ranges.append((range_start, range_start + stage_len))
+            acc.k_scale_args.append(stage_k_scale_arg)
+            acc.v_scale_args.append(stage_v_scale_arg)
             acc.draft_staged += stage_len
             staged_total = acc.draft_staged
             self._layer_staged_tokens[layer_name] = staged_total
@@ -1106,6 +1133,9 @@ class NWORController:
                 backup_block_offsets=backup_block_offsets,
                 cache_layout=acc.cache_layout,
                 cache_block_size=acc.cache_block_size,
+                staging_ranges=list(acc.staging_ranges),
+                k_scale_args=list(acc.k_scale_args),
+                v_scale_args=list(acc.v_scale_args),
             ))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[NWOR] finalize layer=%s total=%d expected=%d",
@@ -1159,6 +1189,9 @@ class NWORController:
             logger.debug("NWOR fallback after disable: %s", reason)
 
     def _write_pending_fallback(self) -> None:
+        if self._enable_defer_write:
+            self._write_pending_fallback_deferred()
+            return
         if self._current_accumulator is not None:
             acc = self._current_accumulator
             layout = acc.cache_layout
@@ -1231,6 +1264,65 @@ class NWORController:
             self._trace_window_close(accepted=0, rejected=self._draft_total)
             self._trace_dump_totals()
 
+    def _write_pending_fallback_deferred(self) -> None:
+        if self._current_accumulator is not None:
+            self._flush_deferred_layer(self._current_accumulator)
+            self._current_accumulator = None
+
+        for pending in self._pending_layers:
+            self._flush_deferred_layer(pending)
+        self._pending_layers.clear()
+
+        self._flush_verifier_tails()
+        if self._enable_trace:
+            self._trace_window_close(accepted=0, rejected=self._draft_total)
+            self._trace_dump_totals()
+
+    def _flush_deferred_layer(self, layer_state: _LayerAccumulator | _PendingLayer) -> None:
+        layer_idx = layer_state.layer_index
+        staging_keys = self._staging_buffers.keys[layer_idx]
+        staging_values = self._staging_buffers.values[layer_idx]
+        if isinstance(layer_state, _LayerAccumulator):
+            num_chunks = len(layer_state.slot_chunks)
+        else:
+            num_chunks = len(layer_state.staging_ranges)
+
+        for chunk_idx in range(num_chunks):
+            start, end = layer_state.staging_ranges[chunk_idx]
+            if isinstance(layer_state, _LayerAccumulator):
+                slot_chunk = layer_state.slot_chunks[chunk_idx]
+            else:
+                slot_chunk = layer_state.slot_mapping[start:end]
+            key_slice = staging_keys[start:end]
+            value_slice = staging_values[start:end]
+            if key_slice.numel() == 0:
+                continue
+            slot_device = slot_chunk.to(device=layer_state.key_cache.device,
+                                        dtype=torch.long)
+            stage_k_scale_arg = None
+            stage_v_scale_arg = None
+            if chunk_idx < len(layer_state.k_scale_args):
+                stage_k_scale_arg = layer_state.k_scale_args[chunk_idx]
+            if chunk_idx < len(layer_state.v_scale_args):
+                stage_v_scale_arg = layer_state.v_scale_args[chunk_idx]
+            if isinstance(stage_k_scale_arg, torch.Tensor) and stage_k_scale_arg.device != key_slice.device:
+                stage_k_scale_arg = stage_k_scale_arg.to(device=key_slice.device,
+                                                        non_blocking=True)
+            if isinstance(stage_v_scale_arg, torch.Tensor) and stage_v_scale_arg.device != value_slice.device:
+                stage_v_scale_arg = stage_v_scale_arg.to(device=value_slice.device,
+                                                        non_blocking=True)
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key_slice.contiguous(),
+                value_slice.contiguous(),
+                layer_state.key_cache,
+                layer_state.value_cache,
+                slot_device,
+                layer_state.kv_cache_dtype,
+                stage_k_scale_arg,
+                stage_v_scale_arg,
+            )
+            self._trace_inc("writes_fallback", int(key_slice.shape[0]))
+
     def _build_accept_mask(self, accepted_prefix: Sequence[int]) -> Optional[torch.Tensor]:
         if not self._pending_layers:
             return None
@@ -1282,7 +1374,8 @@ class NWORController:
             key_slice = staging_keys[local_mask].contiguous()
             value_slice = staging_values[local_mask].contiguous()
             slots_slice = slot_mapping[local_mask].contiguous()
-            if self._enable_debug_asserts and pending.cache_layout is not None:
+            if (self._enable_debug_asserts and not self._enable_defer_write
+                    and pending.cache_layout is not None):
                 slot_cpu = slots_slice.to(device="cpu", dtype=torch.long)
                 block_size = pending.cache_block_size
                 if block_size is None:
