@@ -69,13 +69,17 @@ else:
                           VLLM_NWOR_DEFER_WRITE="1"):
                 controller = NWORController(enabled=True)
 
-            controller.begin_window([2])
+        controller.begin_window([2])
 
-            with patch("vllm.v1.kv_cache.nwor.torch.ops._C_cache_ops.reshape_and_cache_flash") as mock_op:
-                self._stage_sample(controller)
-                self.assertEqual(mock_op.call_count, 0)
-                controller.commit_window([1])
-                self.assertEqual(mock_op.call_count, 1)
+        op_packet = getattr(torch.ops, "_C_cache_ops", None)
+        if op_packet is None or not hasattr(op_packet, "reshape_and_cache_flash"):
+            self.skipTest("reshape_and_cache_flash op unavailable")
+
+        with patch.object(op_packet, "reshape_and_cache_flash") as mock_op:
+            self._stage_sample(controller)
+            self.assertEqual(mock_op.call_count, 0)
+            controller.commit_window([1])
+            self.assertEqual(mock_op.call_count, 1)
 
         def test_defer_write_fallback_flushes_once(self):
             with nwor_env(VLLM_NWOR_PRUNE_COMMIT="1",
@@ -83,13 +87,17 @@ else:
                           VLLM_NWOR_DEFER_WRITE="1"):
                 controller = NWORController(enabled=True)
 
-            controller.begin_window([2])
+        controller.begin_window([2])
 
-            with patch("vllm.v1.kv_cache.nwor.torch.ops._C_cache_ops.reshape_and_cache_flash") as mock_op:
-                self._stage_sample(controller)
-                self.assertEqual(mock_op.call_count, 0)
-                controller.commit_all_pending()
-                self.assertEqual(mock_op.call_count, 1)
+        op_packet = getattr(torch.ops, "_C_cache_ops", None)
+        if op_packet is None or not hasattr(op_packet, "reshape_and_cache_flash"):
+            self.skipTest("reshape_and_cache_flash op unavailable")
+
+        with patch.object(op_packet, "reshape_and_cache_flash") as mock_op:
+            self._stage_sample(controller)
+            self.assertEqual(mock_op.call_count, 0)
+            controller.commit_all_pending()
+            self.assertEqual(mock_op.call_count, 1)
 
 
 if __name__ == "__main__":  # pragma: no cover - direct execution helper
