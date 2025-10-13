@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import torch
@@ -19,7 +19,6 @@ __all__ = [
     "set_global_nwor_controller",
     "get_global_nwor_controller",
     "record_or_write_kv_cache",
-    "get_cache_view_for_layer",
     "build_token_request_indices",
     "extract_query_start_loc_cpu",
 ]
@@ -127,9 +126,6 @@ class _PendingLayer:
     backup_block_offsets: Optional[torch.Tensor] = None
     cache_layout: Optional[str] = None
     cache_block_size: Optional[int] = None
-    staging_ranges: list[tuple[int, int]] = field(default_factory=list)
-    overlay_key_cache: Optional[torch.Tensor] = None
-    overlay_value_cache: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -152,9 +148,6 @@ class _LayerAccumulator:
     backup_block_offsets: list[torch.Tensor]
     cache_layout: Optional[str]
     cache_block_size: Optional[int]
-    staging_ranges: list[tuple[int, int]]
-    overlay_key_cache: Optional[torch.Tensor]
-    overlay_value_cache: Optional[torch.Tensor]
 
 
 @dataclass
@@ -208,8 +201,6 @@ class NWORController:
             getattr(envs, "VLLM_NWOR_DEBUG_ASSERTS", False))
         prune_commit_flag = bool(
             getattr(envs, "VLLM_NWOR_PRUNE_COMMIT", False))
-        defer_write_flag = bool(
-            getattr(envs, "VLLM_NWOR_DEFER_WRITE", False))
         self._trace_json_path: Optional[str] = getattr(
             envs, "VLLM_NWOR_TRACE_WRITES_JSON_PATH", None)
         self._trace_totals_dirty = False
@@ -223,17 +214,6 @@ class NWORController:
             else:
                 self._enable_commit_prune = True
                 logger.info("NWOR commit pruning enabled")
-        self._enable_defer_write = False
-        if defer_write_flag:
-            if not self._enable_commit_prune:
-                logger.warning(
-                    "NWOR deferred write requested but commit pruning is disabled; keeping eager staging writes.")
-            elif not self._enable_debug_asserts:
-                logger.warning(
-                    "NWOR deferred write requested but debug asserts disabled; keeping eager staging writes.")
-            else:
-                self._enable_defer_write = True
-                logger.info("NWOR deferred write snapshot enabled (writes still eager)")
         self._reset_counters()
 
     def _reset_counters(self) -> None:
@@ -553,9 +533,6 @@ class NWORController:
                     backup_block_offsets=[],
                     cache_layout=None,
                     cache_block_size=None,
-                    staging_ranges=[],
-                    overlay_key_cache=None,
-                    overlay_value_cache=None,
                 )
                 acc = self._current_accumulator
 
@@ -704,17 +681,16 @@ class NWORController:
                     else slot_indices_cpu[:32].tolist() +
                     [f"...(+{slot_indices_cpu.numel() - 32} more)"])
 
-            if not self._enable_defer_write:
-                original_keys = self._gather_cache_entries(
-                    acc.key_cache, block_idx_dev, offset_dev, layout=layout,
-                    num_heads=num_heads)
-                original_values = self._gather_cache_entries(
-                    acc.value_cache, block_idx_dev, offset_dev, layout=layout,
-                    num_heads=num_heads)
-                acc.backup_key_chunks.append(original_keys)
-                acc.backup_value_chunks.append(original_values)
-                acc.backup_block_indices.append(block_idx_cpu.to(torch.int32))
-                acc.backup_block_offsets.append(offset_cpu.to(torch.int32))
+            original_keys = self._gather_cache_entries(
+                acc.key_cache, block_idx_dev, offset_dev, layout=layout,
+                num_heads=num_heads)
+            original_values = self._gather_cache_entries(
+                acc.value_cache, block_idx_dev, offset_dev, layout=layout,
+                num_heads=num_heads)
+            acc.backup_key_chunks.append(original_keys)
+            acc.backup_value_chunks.append(original_values)
+            acc.backup_block_indices.append(block_idx_cpu.to(torch.int32))
+            acc.backup_block_offsets.append(offset_cpu.to(torch.int32))
             stage_k_scale_arg = (stage_k_scale if stage_k_scale is not None
                                  else k_scale)
             stage_v_scale_arg = (stage_v_scale if stage_v_scale is not None
@@ -727,24 +703,17 @@ class NWORController:
                                                         non_blocking=True)
             slot_stage_device = slot_stage.to(device=acc.key_cache.device,
                                               dtype=torch.long)
-            if not self._enable_defer_write:
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key_stage,
-                    value_stage,
-                    acc.key_cache,
-                    acc.value_cache,
-                    slot_stage_device,
-                    acc.kv_cache_dtype,
-                    stage_k_scale_arg,
-                    stage_v_scale_arg,
-                )
-                self._trace_inc("writes_stage", int(key_stage.shape[0]))
-            if self._enable_defer_write:
-                self._overlay_stage_chunk(acc, key_stage, value_stage,
-                                          slot_stage_device,
-                                          acc.kv_cache_dtype,
-                                          stage_k_scale_arg,
-                                          stage_v_scale_arg)
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key_stage,
+                value_stage,
+                acc.key_cache,
+                acc.value_cache,
+                slot_stage_device,
+                acc.kv_cache_dtype,
+                stage_k_scale_arg,
+                stage_v_scale_arg,
+            )
+            self._trace_inc("writes_stage", int(key_stage.shape[0]))
 
             if not slot_stage.is_contiguous():
                 slot_stage = slot_stage.contiguous()
@@ -775,14 +744,12 @@ class NWORController:
                     slot_max,
                 )
 
-            range_start = staged_total
             self._stage_chunk(layer_idx, key_stage, value_stage, slot_stage,
                               staged_total)
 
             req_stage = req_stage_tensor.to(dtype=torch.int32).clone()
             acc.slot_chunks.append(slot_stage)
             acc.request_chunks.append(req_stage)
-            acc.staging_ranges.append((range_start, range_start + stage_len))
             acc.draft_staged += stage_len
             staged_total = acc.draft_staged
             self._layer_staged_tokens[layer_name] = staged_total
@@ -905,33 +872,17 @@ class NWORController:
                         verifier_slots_device.cpu().tolist() if verifier_slots_device.numel() <= 32
                         else verifier_slots_device[:32].cpu().tolist() +
                         [f"...(+{verifier_slots_device.numel() - 32} more)"])
-                if not self._enable_defer_write:
-                    torch.ops._C_cache_ops.reshape_and_cache_flash(
-                        verifier_key,
-                        verifier_value,
-                        key_cache,
-                        value_cache,
-                        verifier_slots_device,
-                        kv_cache_dtype,
-                        tail_k_scale,
-                        tail_v_scale,
-                    )
-                    self._trace_inc("writes_verifier",
-                                     int(verifier_key.shape[0]))
-                if self._enable_defer_write and acc is not None:
-                    overlay_key_cache, overlay_value_cache = self._ensure_overlay_cache(
-                        acc, key_cache, value_cache)
-                    torch.ops._C_cache_ops.reshape_and_cache_flash(
-                        verifier_key,
-                        verifier_value,
-                        overlay_key_cache,
-                        overlay_value_cache,
-                        verifier_slots_device,
-                        kv_cache_dtype,
-                        tail_k_scale,
-                        tail_v_scale,
-                    )
-                    self._trace_inc("writes_verifier", int(verifier_key.shape[0]))
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    verifier_key,
+                    verifier_value,
+                    key_cache,
+                    value_cache,
+                    verifier_slots_device,
+                    kv_cache_dtype,
+                    tail_k_scale,
+                    tail_v_scale,
+                )
+                self._trace_inc("writes_verifier", int(verifier_key.shape[0]))
                 self._layer_verifier_written[layer_name] = True
                 logger.debug("NWOR flushed verifier tail: layer=%s tail=%d",
                              layer_name, verifier_len)
@@ -998,48 +949,6 @@ class NWORController:
         if slots is not None:
             slots[start:end].copy_(slot_chunk.to(dtype=torch.int32))
 
-    def _ensure_overlay_cache(self, acc: _LayerAccumulator,
-                              key_cache: torch.Tensor,
-                              value_cache: torch.Tensor
-                              ) -> tuple[torch.Tensor, torch.Tensor]:
-        if acc.overlay_key_cache is None or acc.overlay_value_cache is None:
-            acc.overlay_key_cache = key_cache.clone()
-            acc.overlay_value_cache = value_cache.clone()
-        return acc.overlay_key_cache, acc.overlay_value_cache
-
-    def _overlay_stage_chunk(self, acc: _LayerAccumulator,
-                             key_chunk: torch.Tensor,
-                             value_chunk: torch.Tensor,
-                             slot_chunk_device: torch.Tensor,
-                             kv_cache_dtype: str,
-                             k_scale: Optional[torch.Tensor],
-                             v_scale: Optional[torch.Tensor]) -> None:
-        overlay_key, overlay_value = self._ensure_overlay_cache(acc, acc.key_cache,
-                                                                acc.value_cache)
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key_chunk,
-            value_chunk,
-            overlay_key,
-            overlay_value,
-            slot_chunk_device,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-        )
-
-    def _flush_overlay_accumulator(self, acc: _LayerAccumulator) -> None:
-        if acc.overlay_key_cache is None or acc.overlay_value_cache is None:
-            return
-        acc.key_cache.copy_(acc.overlay_key_cache)
-        acc.value_cache.copy_(acc.overlay_value_cache)
-
-    def _flush_overlay_pending(self, pending: _PendingLayer) -> None:
-        if (pending.overlay_key_cache is None
-                or pending.overlay_value_cache is None):
-            return
-        pending.key_cache.copy_(pending.overlay_key_cache)
-        pending.value_cache.copy_(pending.overlay_value_cache)
-
     def commit_window(self, accepted_prefix: Sequence[int]) -> None:
         if not self._window_active:
             return
@@ -1097,30 +1006,7 @@ class NWORController:
                                          rejected=rejected_total)
         finally:
             self.abort_window()
-        self._trace_dump_totals()
-
-    def get_layer_cache_view(self, layer_name: str,
-                             key_cache: torch.Tensor,
-                             value_cache: torch.Tensor
-                             ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self._enable_defer_write:
-            return key_cache, value_cache
-
-        acc = self._current_accumulator
-        if acc is not None and acc.layer_name == layer_name:
-            overlay_key, overlay_value = self._ensure_overlay_cache(acc, key_cache,
-                                                                    value_cache)
-            return overlay_key, overlay_value
-
-        for pending in reversed(self._pending_layers):
-            if pending.layer_name != layer_name:
-                continue
-            if (pending.overlay_key_cache is not None
-                    and pending.overlay_value_cache is not None):
-                return pending.overlay_key_cache, pending.overlay_value_cache
-            break
-
-        return key_cache, value_cache
+            self._trace_dump_totals()
 
     # ------------------------------------------------------------------ helpers
     def _finalize_current_layer(self) -> bool:
@@ -1220,9 +1106,6 @@ class NWORController:
                 backup_block_offsets=backup_block_offsets,
                 cache_layout=acc.cache_layout,
                 cache_block_size=acc.cache_block_size,
-                staging_ranges=list(acc.staging_ranges),
-                overlay_key_cache=acc.overlay_key_cache,
-                overlay_value_cache=acc.overlay_value_cache,
             ))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[NWOR] finalize layer=%s total=%d expected=%d",
@@ -1248,8 +1131,6 @@ class NWORController:
             logger.debug("NWOR window summary: layer=%s staged=%d verifier=%d",
                          acc.layer_name, acc.draft_staged, 0)
         self._layer_verifier_written[acc.layer_name] = False
-        acc.overlay_key_cache = None
-        acc.overlay_value_cache = None
         self._current_accumulator = None
         return True
 
@@ -1278,16 +1159,6 @@ class NWORController:
             logger.debug("NWOR fallback after disable: %s", reason)
 
     def _write_pending_fallback(self) -> None:
-        if self._enable_defer_write:
-            if self._current_accumulator is not None:
-                self._flush_overlay_accumulator(self._current_accumulator)
-            for pending in self._pending_layers:
-                self._flush_overlay_pending(pending)
-            self._pending_layers.clear()
-            self._current_accumulator = None
-            self._flush_verifier_tails()
-            return
-
         if self._current_accumulator is not None:
             acc = self._current_accumulator
             layout = acc.cache_layout
@@ -1596,17 +1467,6 @@ def record_or_write_kv_cache(
             k_scale,
             v_scale,
         )
-
-
-def get_cache_view_for_layer(
-    layer_name: str,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    controller = get_global_nwor_controller()
-    if controller is None:
-        return key_cache, value_cache
-    return controller.get_layer_cache_view(layer_name, key_cache, value_cache)
 
 
 def build_token_request_indices(
