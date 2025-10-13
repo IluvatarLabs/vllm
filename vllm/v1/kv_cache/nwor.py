@@ -482,7 +482,7 @@ class NWORController:
             acc = self._current_accumulator
 
         staged_total = self._layer_staged_tokens.get(layer_name, 0)
-        if logger.isEnabledFor(logging.INFO):
+        if self._enable_trace and logger.isEnabledFor(logging.INFO):
             logger.info(
                 "NWOR stage_input: layer=%s idx=%d chunk=%d total=%d staged_total=%d req_none=%s",
                 layer_name,
@@ -566,7 +566,7 @@ class NWORController:
                     tail_positions.extend(queue)
                 tail_positions.sort()
 
-            if logger.isEnabledFor(logging.INFO):
+            if self._enable_trace and logger.isEnabledFor(logging.INFO):
                 max_preview = 32
                 stage_preview = (stage_positions if len(stage_positions) <= max_preview
                                  else stage_positions[:max_preview] +
@@ -591,14 +591,18 @@ class NWORController:
                 self.abort_window()
                 return False
 
-            idx_cpu = torch.tensor(stage_positions, dtype=torch.long)
-            key_stage = key.index_select(0, idx_cpu.to(device=key.device))
-            value_stage = value.index_select(0, idx_cpu.to(device=value.device))
+            index_device = torch.tensor(stage_positions,
+                                        dtype=torch.long,
+                                        device=key.device)
+            key_stage = key.index_select(0, index_device)
+            value_stage = value.index_select(
+                0, index_device.to(device=value.device))
             slot_stage = slot_mapping.index_select(
-                0, idx_cpu.to(device=slot_mapping.device))
+                0, index_device.to(device=slot_mapping.device))
 
-            slot_indices_cpu = slot_stage.to(device="cpu", dtype=torch.long)
-            if logger.isEnabledFor(logging.INFO):
+            slot_stage_long = slot_stage.to(dtype=torch.long)
+            if self._enable_trace and logger.isEnabledFor(logging.INFO):
+                slot_indices_cpu = slot_stage_long.to(device="cpu")
                 logger.info(
                     "NWOR slot_stage_raw: layer=%s idx=%d slots=%s",
                     layer_name,
@@ -606,12 +610,12 @@ class NWORController:
                     slot_indices_cpu.tolist() if slot_indices_cpu.numel() <= 32
                     else slot_indices_cpu[:32].tolist() +
                     [f"...(+{slot_indices_cpu.numel() - 32} more)"])
-            if slot_indices_cpu.numel() == 0:
+            if slot_stage_long.numel() == 0:
                 self._fallback("no valid slot indices for staged tokens")
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
-            if (slot_indices_cpu < 0).any():
+            if torch.any(slot_stage_long < 0):
                 self._fallback("negative slot index in staged tokens")
                 self._write_pending_fallback()
                 self.abort_window()
@@ -651,21 +655,22 @@ class NWORController:
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
-            if (slot_indices_cpu >= total_slots).any():
+            if torch.any(slot_stage_long >= total_slots):
                 self._fallback("slot index exceeds cache capacity")
                 self._write_pending_fallback()
                 self.abort_window()
                 return False
 
-            block_idx_cpu = torch.div(slot_indices_cpu, block_size,
-                                      rounding_mode="floor")
-            offset_cpu = torch.remainder(slot_indices_cpu, block_size)
-            block_idx_dev = block_idx_cpu.to(device=acc.key_cache.device,
-                                             dtype=torch.long)
-            offset_dev = offset_cpu.to(device=acc.key_cache.device,
-                                       dtype=torch.long)
+            block_idx_long = torch.div(slot_stage_long, block_size,
+                                       rounding_mode="floor")
+            offset_long = torch.remainder(slot_stage_long, block_size)
+            block_idx_dev = block_idx_long.to(device=acc.key_cache.device,
+                                              dtype=torch.long)
+            offset_dev = offset_long.to(device=acc.key_cache.device,
+                                        dtype=torch.long)
 
-            if logger.isEnabledFor(logging.INFO):
+            if self._enable_trace and logger.isEnabledFor(logging.INFO):
+                slot_indices_cpu = slot_stage_long.to(device="cpu")
                 logger.info(
                     "NWOR cache_rows: layer=%s idx=%d cache_rows=%d block_size=%d",
                     layer_name,
@@ -689,8 +694,10 @@ class NWORController:
                 num_heads=num_heads)
             acc.backup_key_chunks.append(original_keys)
             acc.backup_value_chunks.append(original_values)
-            acc.backup_block_indices.append(block_idx_cpu.to(torch.int32))
-            acc.backup_block_offsets.append(offset_cpu.to(torch.int32))
+            acc.backup_block_indices.append(block_idx_long.to(device="cpu",
+                                                              dtype=torch.int32))
+            acc.backup_block_offsets.append(offset_long.to(device="cpu",
+                                                           dtype=torch.int32))
             stage_k_scale_arg = (stage_k_scale if stage_k_scale is not None
                                  else k_scale)
             stage_v_scale_arg = (stage_v_scale if stage_v_scale is not None
@@ -725,7 +732,8 @@ class NWORController:
 
             req_stage_tensor = canonical_slice.to(dtype=torch.int32).clone()
 
-            if logger.isEnabledFor(logging.INFO):
+            if self._enable_trace and logger.isEnabledFor(logging.INFO):
+                slot_indices_cpu = slot_stage_long.to(device="cpu")
                 logger.info(
                     "NWOR stage_chunk: layer=%s idx=%d start=%d len=%d canonical_len=%d",
                     layer_name,
@@ -864,7 +872,7 @@ class NWORController:
                     if tail_v_scale.device != verifier_value.device:
                         tail_v_scale = tail_v_scale.to(device=verifier_value.device,
                                                        non_blocking=True)
-                if logger.isEnabledFor(logging.INFO):
+                if self._enable_trace and logger.isEnabledFor(logging.INFO):
                     logger.info(
                         "NWOR tail_slots: layer=%s idx=%d slots=%s",
                         layer_name,
