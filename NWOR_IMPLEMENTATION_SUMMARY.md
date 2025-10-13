@@ -174,3 +174,13 @@ grep "NWOR" output.log
 ---
 
 **Total Implementation**: ~430 lines of surgical, tested code that fixes the fundamental slot mapping bug and provides clean metrics for validation.
+
+## Postmortem (Attempt #3)
+
+While this branch (\`nwor-device-staging\`) successfully stages draft KV rows on device and commits the accepted prefix, **FlashAttention still reads the base cache during verification**. Because the kernel never sees the staged rows before commit:
+
+- Accepted tokens are written *twice* (first into the staging buffer, then into the live cache during commit), so bandwidth savings never materialize.
+- Rejected tokens are only dropped at commit time, so the verifier attends over stale values.
+- Latency remains worse than baseline despite commit pruning and on-device remap work.
+
+Conclusion: real NWOR efficiency requires kernel-level overlay support so attention kernels can source staged rows directly. This branch is therefore frozen as a reference implementation; future work must either modify the kernels or pursue an alternative optimisation.
