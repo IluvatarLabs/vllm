@@ -514,6 +514,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._scv_graph_executor: SCVGraphExecutor | None = None
 
     def _scv_enabled(self) -> bool:
+        if not hasattr(self, "_scv_mode"):
+            self._scv_mode = envs.VLLM_SCV_MODE.lower()
         if self._scv_mode not in ("off", "graph", "adaptive"):
             logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
             self._scv_mode = "off"
@@ -2385,10 +2387,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         cu = spec_decode_metadata.cu_num_draft_tokens.to(device=device)
 
-        if self._scv_mode == "graph":
-            if self._scv_graph_executor is None:
-                self._scv_graph_executor = SCVGraphExecutor(device)
-            mask = self._scv_graph_executor.run(
+        if hasattr(self, "_scv_mode") and self._scv_mode == "graph":
+            executor = getattr(self, "_scv_graph_executor", None)
+            if executor is None:
+                executor = SCVGraphExecutor(device)
+                self._scv_graph_executor = executor
+            mask = executor.run(
                 spec_decode_metadata, sampled_token_ids, total_tokens
             )
             if mask is not None:
