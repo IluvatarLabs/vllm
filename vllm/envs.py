@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_DISABLE_PAD_FOR_CUDAGRAPH: bool = False
+    VLLM_DISABLE_NWOR: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
@@ -1309,6 +1310,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_PAD_FOR_CUDAGRAPH": lambda: bool(
         int(os.getenv("VLLM_DISABLE_PAD_FOR_CUDAGRAPH", "0"))
     ),
+    # Disable No-Write-On-Reject staging for speculative decoding if set to 1.
+    "VLLM_DISABLE_NWOR": lambda: bool(int(os.getenv("VLLM_DISABLE_NWOR", "0"))),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
     # Used to set the process name prefix for vLLM processes.

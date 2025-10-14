@@ -2249,6 +2249,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> None:
         set_global_deferred_manager(None)
 
+        if envs.VLLM_DISABLE_NWOR:
+            return
+
         if self.speculative_config is None or spec_decode_metadata is None:
             return
 

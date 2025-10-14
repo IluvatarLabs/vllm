@@ -121,3 +121,16 @@ def test_build_acceptance_mask_matches_expected():
     mask = runner._build_nwor_acceptance_mask(metadata, sampled)
     expected = torch.tensor([True, False, True], dtype=torch.bool)
     assert torch.equal(mask.cpu(), expected)
+
+
+def test_nwor_disabled_env(monkeypatch):
+    monkeypatch.setenv("VLLM_DISABLE_NWOR", "1")
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = object()
+    runner._deferred_write_manager = DeferredWriteManager()
+
+    metadata = _make_metadata([1, 2], [2])
+    runner._maybe_begin_nwor_window(metadata)
+
+    assert not runner._deferred_write_manager.window_active
