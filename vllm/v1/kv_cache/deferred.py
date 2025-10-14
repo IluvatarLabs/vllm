@@ -292,6 +292,9 @@ class DeferredWriteManager:
                     v_scale_slice,
                 )
             except Exception as exc:  # pragma: no cover - propagate for upstream handling
+                self._record_fallback(f"commit_failed:{entry.layer_id}")
+                self._flush_entries()
+                self._clear_window()
                 raise ShouldFallback(f"commit_failed:{entry.layer_id}") from exc
 
         rejected = max(self._expected_tokens - committed_total, 0)
