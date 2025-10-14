@@ -508,6 +508,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Cached outputs.
         self._deferred_write_manager = DeferredWriteManager(mode=envs.VLLM_NWOR_MODE)
+        self._latest_nwor_window_metrics: dict[str, int | str] | None = None
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -2250,9 +2251,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         set_global_deferred_manager(None)
 
         if envs.VLLM_DISABLE_NWOR:
+            self._latest_nwor_window_metrics = None
             return
 
         self._deferred_write_manager.set_mode(envs.VLLM_NWOR_MODE)
+        self._latest_nwor_window_metrics = None
 
         if self._deferred_write_manager.get_mode() != "stage":
             return
@@ -2276,29 +2279,29 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if not manager.window_active:
             return
 
-        if spec_decode_metadata is None or sampled_token_ids is None:
-            manager.cancel_and_flush("missing_spec_metadata")
-            set_global_deferred_manager(None)
-            return
-
-        mask = self._build_nwor_acceptance_mask(
-            spec_decode_metadata, sampled_token_ids
-        )
-        if mask is None:
-            manager.cancel_and_flush("accept_mask_construction_failed")
-            set_global_deferred_manager(None)
-            return
-
         try:
-            manager.commit(mask)
-        except ShouldFallback as exc:
-            manager.cancel_and_flush(str(exc))
+            if spec_decode_metadata is None or sampled_token_ids is None:
+                manager.cancel_and_flush("missing_spec_metadata")
+            else:
+                mask = self._build_nwor_acceptance_mask(
+                    spec_decode_metadata, sampled_token_ids
+                )
+                if mask is None:
+                    manager.cancel_and_flush("accept_mask_construction_failed")
+                else:
+                    manager.commit(mask)
+        except ShouldFallback:
+            pass
         finally:
+            self._latest_nwor_window_metrics = manager.pop_last_window_metrics()
             set_global_deferred_manager(None)
 
     def _cleanup_nwor(self) -> None:
         set_global_deferred_manager(None)
         self._deferred_write_manager.finish_step()
+        pending = self._deferred_write_manager.pop_last_window_metrics()
+        if pending is not None and self._latest_nwor_window_metrics is None:
+            self._latest_nwor_window_metrics = pending
 
     def _build_nwor_acceptance_mask(
         self,
@@ -2783,6 +2786,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     kv_connector_output=kv_connector_output,
                     num_nans_in_logits=num_nans_in_logits,
                 )
+                output.nwor_metrics = self._latest_nwor_window_metrics
+                self._latest_nwor_window_metrics = None
 
                 if not self.use_async_scheduling:
                     return output

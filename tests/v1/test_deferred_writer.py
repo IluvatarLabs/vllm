@@ -58,9 +58,13 @@ def test_deferred_manager_commit_partial_acceptance():
     committed_key, committed_slots = writes[0]
     assert committed_key.shape[0] == 1
     assert committed_slots.tolist() == [3]
-    metrics = manager.get_metrics()
-    assert metrics["tokens_committed"] == 1
-    assert metrics["tokens_rejected"] == 1
+    window_metrics = manager.pop_last_window_metrics()
+    assert window_metrics == {
+        "mode": "stage",
+        "committed": 1,
+        "rejected": 1,
+        "fallback": 0,
+    }
 
 
 def test_deferred_manager_cancel_flush_writes_all():
@@ -106,6 +110,9 @@ def test_deferred_manager_cancel_flush_writes_all():
     manager.cancel_and_flush("test_cancel")
     assert len(writes) == 2
     assert all(tensor.shape[0] == 1 for _tag, tensor in writes)
+    window_metrics = manager.pop_last_window_metrics()
+    assert window_metrics is not None
+    assert window_metrics.get("fallback") == 1
 
 
 def test_build_acceptance_mask_matches_expected():
@@ -174,6 +181,13 @@ def test_fp8_staging_slices_quant_scales():
     assert committed_key.shape[0] == 1
     assert torch.equal(slots, torch.tensor([3], dtype=torch.int32))
     assert committed_k_scale is None or committed_k_scale.shape[0] == 1
+    window_metrics = manager.pop_last_window_metrics()
+    assert window_metrics == {
+        "mode": "stage",
+        "committed": 1,
+        "rejected": 1,
+        "fallback": 0,
+    }
 
 
 def test_nwor_immediate_mode_skips_window():
@@ -211,5 +225,6 @@ def test_commit_failure_triggers_fallback_metrics():
     with pytest.raises(ShouldFallback):
         manager.commit(torch.tensor([True]))
 
-    metrics = manager.get_metrics()
-    assert metrics["fallbacks"] >= 1
+    window_metrics = manager.pop_last_window_metrics()
+    assert window_metrics is not None
+    assert window_metrics.get("fallback") == 1

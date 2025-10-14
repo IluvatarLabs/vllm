@@ -147,6 +147,7 @@ class DeferredWriteManager:
             "fallbacks": 0,
         }
         self._mode = self._validate_mode(mode)
+        self._last_window_metrics: dict[str, int | str] | None = None
 
     # ----------------------------------------------------------------------
     # Lifecycle
@@ -181,6 +182,7 @@ class DeferredWriteManager:
         self._staged_tokens = 0
         self._entries.clear()
         self._fallback_reason = None
+        self._last_window_metrics = None
         self._metrics["windows"] += 1
         self._metrics["tokens_staged"] += total_tokens
         return True
@@ -197,8 +199,10 @@ class DeferredWriteManager:
         if self._window_active:
             self.cancel_and_flush("incomplete_window")
 
-    def get_metrics(self) -> dict[str, int]:
-        return dict(self._metrics)
+    def get_metrics(self) -> dict[str, int | str]:
+        metrics = dict(self._metrics)
+        metrics["mode"] = self._mode
+        return metrics
 
     # ------------------------------------------------------------------
     # Staging
@@ -304,14 +308,28 @@ class DeferredWriteManager:
                     v_scale_slice,
                 )
             except Exception as exc:  # pragma: no cover - propagate for upstream handling
-                self._record_fallback(f"commit_failed:{entry.layer_id}")
+                reason = f"commit_failed:{entry.layer_id}"
+                self._record_fallback(reason)
                 self._flush_entries()
+                self._last_window_metrics = {
+                    "mode": self._mode,
+                    "committed": 0,
+                    "rejected": self._expected_tokens,
+                    "fallback": 1,
+                    "reason": reason,
+                }
                 self._clear_window()
-                raise ShouldFallback(f"commit_failed:{entry.layer_id}") from exc
+                raise ShouldFallback(reason) from exc
 
         rejected = max(self._expected_tokens - committed_total, 0)
         self._metrics["tokens_committed"] += committed_total
         self._metrics["tokens_rejected"] += rejected
+        self._last_window_metrics = {
+            "mode": self._mode,
+            "committed": committed_total,
+            "rejected": rejected,
+            "fallback": 0,
+        }
         self._clear_window()
 
     def cancel_and_flush(self, reason: str) -> None:
@@ -319,6 +337,13 @@ class DeferredWriteManager:
             return
         self._record_fallback(reason)
         self._flush_entries()
+        self._last_window_metrics = {
+            "mode": self._mode,
+            "committed": 0,
+            "rejected": 0,
+            "fallback": 1,
+            "reason": reason,
+        }
         self._clear_window()
 
     # ------------------------------------------------------------------
@@ -360,6 +385,11 @@ class DeferredWriteManager:
             logger.warning("NWOR: unsupported mode '%s', defaulting to 'stage'", mode)
             return "stage"
         return normalized
+
+    def pop_last_window_metrics(self) -> dict[str, int | str] | None:
+        metrics = self._last_window_metrics
+        self._last_window_metrics = None
+        return metrics
 
 
 def record_or_write_kv_cache(
