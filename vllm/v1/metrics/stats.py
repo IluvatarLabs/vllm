@@ -154,6 +154,7 @@ class SchedulerStats:
 
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
+    nwor_stats: dict[str, Any] | None = None
 
     num_corrupted_reqs: int = 0
 
