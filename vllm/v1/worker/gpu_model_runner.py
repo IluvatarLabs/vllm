@@ -2398,6 +2398,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if mask is not None:
                 return mask
 
+        if hasattr(self, "_scv_mode") and self._scv_mode == "adaptive":
+            mask = self._scv_compute_mask(
+                draft_ids,
+                num_draft_tensor,
+                cu,
+                sampled_token_ids,
+                max_spec_len,
+                total_tokens,
+            )
+            self._scv_update_controller(spec_decode_metadata, mask)
+            return mask
+
         mask = self._scv_compute_mask(
             draft_ids,
             num_draft_tensor,
@@ -2448,6 +2460,37 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         accepted_broadcast = accepted[req_idx]
         mask_flat = pos_in_req < accepted_broadcast
         return mask_flat
+
+    def _scv_update_controller(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        mask: torch.Tensor,
+    ) -> None:
+        target_ratio = 0.6
+        alpha = 0.2
+        accepted = int(mask.sum().item())
+        total = max(mask.numel(), 1)
+        ratio = accepted / total
+        prev = getattr(self, "_scv_accept_ratio", target_ratio)
+        new_ratio = (1 - alpha) * prev + alpha * ratio
+        self._scv_accept_ratio = new_ratio
+
+        draft_model_config = getattr(self.speculative_config, "draft_model_config", None)
+        if draft_model_config is None or not hasattr(self.speculative_config, "num_speculative_tokens"):
+            return
+
+        base_k = self.speculative_config.num_speculative_tokens
+        k_min = max(1, base_k // 4)
+        k_max = max(1, base_k * 2)
+
+        if new_ratio < target_ratio * 0.8:
+            new_k = max(k_min, base_k - 1)
+        elif new_ratio > target_ratio * 1.2:
+            new_k = min(k_max, base_k + 1)
+        else:
+            new_k = base_k
+
+        self.speculative_config.num_speculative_tokens = new_k
 
     def _bookkeeping_sync(
         self,
