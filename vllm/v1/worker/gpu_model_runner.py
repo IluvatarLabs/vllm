@@ -2336,16 +2336,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 row = row.to(dtype=draft_ids.dtype)
 
             draft_slice = draft_ids[start:end]
-            comparison = (row == draft_slice).flatten()
-
-            if bool(comparison.all().item()):
-                accepted = draft_count
-            else:
-                reject = torch.nonzero(~comparison, as_tuple=False)
-                accepted = int(reject[0, 0].item()) if reject.numel() > 0 else draft_count
-
-            if accepted > 0:
-                mask_work[start : start + accepted] = True
+            comparison = (row == draft_slice)
+            prefix = torch.cumprod(comparison.to(torch.int32), dim=0)
+            mask_work[start:end] = prefix.to(torch.bool)
             start = end
 
         if start != total_tokens:
