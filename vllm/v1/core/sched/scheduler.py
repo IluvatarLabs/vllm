@@ -918,6 +918,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        nwor_stats = model_runner_output.nwor_metrics
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -1077,7 +1078,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids.clear()
 
         if (
-            stats := self.make_stats(spec_decoding_stats, kv_connector_stats)
+            stats := self.make_stats(spec_decoding_stats, kv_connector_stats, nwor_stats)
         ) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
@@ -1244,6 +1245,7 @@ class Scheduler(SchedulerInterface):
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
         kv_connector_stats: KVConnectorStats | None = None,
+        nwor_stats: dict[str, Any] | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -1257,6 +1259,7 @@ class Scheduler(SchedulerInterface):
             spec_decoding_stats=spec_decoding_stats,
             num_corrupted_reqs=sum(req.is_output_corrupted for req in self.running),
             kv_connector_stats=kv_connector_stats.data if kv_connector_stats else None,
+            nwor_stats=nwor_stats,
         )
 
     def make_spec_decoding_stats(

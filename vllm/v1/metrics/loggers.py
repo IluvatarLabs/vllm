@@ -165,6 +165,24 @@ class LoggingStatLogger(StatLoggerBase):
             *log_args,
         )
 
+        if scheduler_stats.nwor_stats:
+            nwor = scheduler_stats.nwor_stats
+            mode = nwor.get("mode", "stage")
+            committed = nwor.get("committed", 0)
+            rejected = nwor.get("rejected", 0)
+            fallback = nwor.get("fallback", 0)
+            reason = nwor.get("reason")
+            extra = f", reason={reason}" if reason else ""
+            log_fn(
+                "Engine %03d: NWOR mode=%s committed=%s rejected=%s fallback=%s%s",
+                self.engine_index,
+                mode,
+                committed,
+                rejected,
+                fallback,
+                extra,
+            )
+
         self.spec_decoding_logging.log(log_fn=log_fn)
         self.kv_connector_logging.log(log_fn=log_fn)
 
@@ -337,6 +355,44 @@ class PrometheusStatLogger(StatLoggerBase):
         )
         self.counter_mm_cache_hits = make_per_engine(
             counter_mm_cache_hits, engine_indexes, model_name
+        )
+
+        self.counter_nwor_committed = make_per_engine(
+            self._counter_cls(
+                name="vllm:nwor_committed_tokens",
+                documentation="Number of tokens committed via NWOR in this engine.",
+                labelnames=labelnames,
+            ),
+            engine_indexes,
+            model_name,
+        )
+        self.counter_nwor_rejected = make_per_engine(
+            self._counter_cls(
+                name="vllm:nwor_rejected_tokens",
+                documentation="Number of draft tokens rejected by NWOR.",
+                labelnames=labelnames,
+            ),
+            engine_indexes,
+            model_name,
+        )
+        self.counter_nwor_fallbacks = make_per_engine(
+            self._counter_cls(
+                name="vllm:nwor_fallbacks",
+                documentation="Number of NWOR fallbacks triggered.",
+                labelnames=labelnames,
+            ),
+            engine_indexes,
+            model_name,
+        )
+        self.gauge_nwor_enabled = make_per_engine(
+            self._gauge_cls(
+                name="vllm:nwor_enabled",
+                documentation="Whether NWOR is active for this engine (1=yes, 0=no).",
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            ),
+            engine_indexes,
+            model_name,
         )
 
         #
@@ -743,6 +799,17 @@ class PrometheusStatLogger(StatLoggerBase):
                 self.spec_decoding_prom.observe(
                     scheduler_stats.spec_decoding_stats, engine_idx
                 )
+
+            if scheduler_stats.nwor_stats is not None:
+                nwor = scheduler_stats.nwor_stats
+                committed = int(nwor.get("committed", 0))
+                rejected = int(nwor.get("rejected", 0))
+                fallback = int(nwor.get("fallback", 0))
+                mode = nwor.get("mode", "stage")
+                self.counter_nwor_committed[engine_idx].inc(committed)
+                self.counter_nwor_rejected[engine_idx].inc(rejected)
+                self.counter_nwor_fallbacks[engine_idx].inc(fallback)
+                self.gauge_nwor_enabled[engine_idx].set(1 if mode == "stage" else 0)
 
         if mm_cache_stats is not None:
             self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)

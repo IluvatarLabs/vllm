@@ -132,6 +132,8 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    nwor_metrics: dict[str, int | str] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
@@ -162,4 +164,5 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
     prompt_logprobs_dict={},
     pooler_output=[],
     num_nans_in_logits=None,
+    nwor_metrics=None,
 )
