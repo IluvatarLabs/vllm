@@ -509,6 +509,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Cached outputs.
         self._deferred_write_manager = DeferredWriteManager(mode=envs.VLLM_NWOR_MODE)
         self._latest_nwor_window_metrics: dict[str, int | str] | None = None
+        self._scv_mode = envs.VLLM_SCV_MODE.lower()
+
+    def _scv_enabled(self) -> bool:
+        if self._scv_mode not in ("off", "graph", "adaptive"):
+            logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
+            self._scv_mode = "off"
+        return self._scv_mode != "off"
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
