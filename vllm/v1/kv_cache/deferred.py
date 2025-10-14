@@ -260,6 +260,8 @@ class DeferredWriteManager:
         for entry in self._entries:
             end = start + entry.length
             layer_mask = accepted_mask[start:end]
+            if layer_mask.device != entry.key.device:
+                layer_mask = layer_mask.to(device=entry.key.device)
             start = end
 
             if layer_mask.numel() != entry.length:
