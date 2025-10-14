@@ -176,6 +176,12 @@ def test_fp8_staging_slices_quant_scales():
     assert committed_k_scale is None or committed_k_scale.shape[0] == 1
 
 
+def test_nwor_immediate_mode_skips_window():
+    manager = DeferredWriteManager(mode="immediate")
+    assert not manager.begin_window([2])
+    assert manager.get_mode() == "immediate"
+
+
 def test_commit_failure_triggers_fallback_metrics():
     manager = DeferredWriteManager()
     assert manager.begin_window([1])

@@ -507,7 +507,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.runner_only_attn_layers: set[str] = set()
 
         # Cached outputs.
-        self._deferred_write_manager = DeferredWriteManager()
+        self._deferred_write_manager = DeferredWriteManager(mode=envs.VLLM_NWOR_MODE)
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -2250,6 +2250,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         set_global_deferred_manager(None)
 
         if envs.VLLM_DISABLE_NWOR:
+            return
+
+        self._deferred_write_manager.set_mode(envs.VLLM_NWOR_MODE)
+
+        if self._deferred_write_manager.get_mode() != "stage":
             return
 
         if self.speculative_config is None or spec_decode_metadata is None:

@@ -129,7 +129,9 @@ def _slice_scale(scale: Optional[Tensor], indices: Tensor) -> Optional[Tensor]:
 class DeferredWriteManager:
     """Stages KV writes until acceptance is known."""
 
-    def __init__(self) -> None:
+    SUPPORTED_MODES = {"stage", "immediate"}
+
+    def __init__(self, *, mode: str = "stage") -> None:
         self._window_active = False
         self._num_draft_tokens: list[int] = []
         self._expected_tokens = 0
@@ -144,6 +146,7 @@ class DeferredWriteManager:
             "tokens_fallback": 0,
             "fallbacks": 0,
         }
+        self._mode = self._validate_mode(mode)
 
     # ----------------------------------------------------------------------
     # Lifecycle
@@ -158,6 +161,9 @@ class DeferredWriteManager:
 
     def begin_window(self, num_draft_tokens: Sequence[int]) -> bool:
         """Arm the manager for a new speculative decode window."""
+
+        if self._mode != "stage":
+            return False
 
         self._clear_window()
 
@@ -178,6 +184,12 @@ class DeferredWriteManager:
         self._metrics["windows"] += 1
         self._metrics["tokens_staged"] += total_tokens
         return True
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = self._validate_mode(mode)
+
+    def get_mode(self) -> str:
+        return self._mode
 
     def finish_step(self) -> None:
         """Flush any pending data if the window did not complete."""
@@ -341,6 +353,13 @@ class DeferredWriteManager:
         self._expected_tokens = 0
         self._staged_tokens = 0
         self._entries.clear()
+
+    def _validate_mode(self, mode: str) -> str:
+        normalized = mode.lower()
+        if normalized not in self.SUPPORTED_MODES:
+            logger.warning("NWOR: unsupported mode '%s', defaulting to 'stage'", mode)
+            return "stage"
+        return normalized
 
 
 def record_or_write_kv_cache(
