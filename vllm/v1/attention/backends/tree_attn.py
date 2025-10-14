@@ -24,6 +24,7 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     split_decodes_and_prefills,
 )
+from vllm.v1.kv_cache import record_or_write_kv_cache
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -391,15 +392,22 @@ class TreeAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            ops.reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
+            layer_id = getattr(
+                layer,
+                "layer_name",
+                getattr(layer, "layer_id", layer.__class__.__name__),
+            )
+            record_or_write_kv_cache(
+                writer=ops.reshape_and_cache_flash,
+                layer_id=layer_id,
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                slot_mapping=attn_metadata.slot_mapping,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
             )
 
         num_actual_tokens = attn_metadata.num_actual_tokens

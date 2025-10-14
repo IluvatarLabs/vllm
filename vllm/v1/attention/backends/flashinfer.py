@@ -50,6 +50,7 @@ from vllm.v1.attention.backends.utils import (
     infer_global_hyperparameters,
     split_decodes_and_prefills,
 )
+from vllm.v1.kv_cache import record_or_write_kv_cache
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
@@ -922,20 +923,25 @@ class FlashInferImpl(AttentionImpl):
         if self.kv_sharing_target_layer_name is None:
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
-            # NOTE(woosuk): Here, key and value are padded while slot_mapping is
-            # not padded. However, we don't need to do key[:num_actual_tokens]
-            # and value[:num_actual_tokens] because the reshape_and_cache_flash
-            # op uses the slot_mapping's shape to determine the number of
-            # actual tokens.
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                kv_cache[:, 0],
-                kv_cache[:, 1],
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
+            # NOTE(woosuk): key/value are padded while slot_mapping is not.
+            key_cache = kv_cache[:, 0]
+            value_cache = kv_cache[:, 1]
+            layer_id = getattr(
+                layer,
+                "layer_name",
+                getattr(layer, "layer_id", layer.__class__.__name__),
+            )
+            record_or_write_kv_cache(
+                writer=torch.ops._C_cache_ops.reshape_and_cache_flash,
+                layer_id=layer_id,
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                slot_mapping=attn_metadata.slot_mapping,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
             )
 
             # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2
