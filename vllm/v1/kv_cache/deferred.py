@@ -35,8 +35,8 @@ class _LayerEntry:
     layer_id: str
     start: int
     length: int
-    key: Tensor
-    value: Tensor
+    key_source: Tensor
+    value_source: Tensor
     slot_mapping: Tensor
     key_cache: Tensor
     value_cache: Tensor
@@ -214,8 +214,7 @@ class DeferredWriteManager:
         if not (_tensor_has_storage(key_cache) and _tensor_has_storage(value_cache)):
             raise ShouldFallback("kv_cache_not_materialized")
 
-        slot_mapping_device = key.device
-        slot_mapping = _ensure_int32_slots(slot_mapping, slot_mapping_device)
+        slot_mapping = _ensure_int32_slots(slot_mapping, key.device)
 
         length = int(slot_mapping.shape[0])
         if length == 0:
@@ -228,8 +227,8 @@ class DeferredWriteManager:
             layer_id=layer_id,
             start=self._staged_tokens,
             length=length,
-            key=key,
-            value=value,
+            key_source=key,
+            value_source=value,
             slot_mapping=slot_mapping,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -273,8 +272,8 @@ class DeferredWriteManager:
             indices = torch.nonzero(layer_mask, as_tuple=False).squeeze(1)
             committed_total += int(indices.numel())
 
-            key_slice = torch.index_select(entry.key, 0, indices).contiguous()
-            value_slice = torch.index_select(entry.value, 0, indices).contiguous()
+            key_slice = torch.index_select(entry.key_source, 0, indices).contiguous()
+            value_slice = torch.index_select(entry.value_source, 0, indices).contiguous()
             slot_slice = torch.index_select(entry.slot_mapping, 0, indices)
             slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
 
@@ -314,8 +313,8 @@ class DeferredWriteManager:
         for entry in self._entries:
             try:
                 entry.writer(
-                    entry.key,
-                    entry.value,
+                    entry.key_source,
+                    entry.value_source,
                     entry.key_cache,
                     entry.value_cache,
                     entry.slot_mapping,
