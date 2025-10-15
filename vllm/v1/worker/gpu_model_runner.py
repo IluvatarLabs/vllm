@@ -2477,11 +2477,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         new_ratio = (1 - alpha) * prev + alpha * ratio
         self._scv_accept_ratio = new_ratio
 
-        draft_model_config = getattr(self.speculative_config, "draft_model_config", None)
-        if draft_model_config is None or not hasattr(self.speculative_config, "num_speculative_tokens"):
+        speculative_config = getattr(self, "speculative_config", None)
+        if speculative_config is None or not hasattr(speculative_config, "num_speculative_tokens"):
             return
 
-        base_k = self.speculative_config.num_speculative_tokens
+        base_k = speculative_config.num_speculative_tokens
         k_min = max(1, base_k // 4)
         k_max = max(1, base_k * 2)
 
@@ -2492,7 +2492,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             new_k = base_k
 
-        self.speculative_config.num_speculative_tokens = new_k
+        speculative_config.num_speculative_tokens = new_k
 
     def _bookkeeping_sync(
         self,
