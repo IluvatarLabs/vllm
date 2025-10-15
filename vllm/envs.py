@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PAD_FOR_CUDAGRAPH: bool = False
     VLLM_DISABLE_NWOR: bool = False
     VLLM_NWOR_MODE: str = "stage"
+    VLLM_SCV_MODE: str = "off"
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
@@ -1315,6 +1316,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_NWOR": lambda: bool(int(os.getenv("VLLM_DISABLE_NWOR", "0"))),
     # Select NWOR mode: "stage" (default) or "immediate" to bypass staging.
     "VLLM_NWOR_MODE": lambda: os.getenv("VLLM_NWOR_MODE", "stage"),
+    # Speculative chunk verify mode: "off" (default), "graph", or "adaptive".
+    "VLLM_SCV_MODE": lambda: os.getenv("VLLM_SCV_MODE", "off"),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
     # Used to set the process name prefix for vLLM processes.

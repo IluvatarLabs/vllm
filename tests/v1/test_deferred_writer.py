@@ -196,6 +196,17 @@ def test_nwor_immediate_mode_skips_window():
     assert manager.get_mode() == "immediate"
 
 
+def test_scv_vectorized_mask_matches_reference():
+    metadata = _make_metadata([1, 2, 3, 4], [4])
+    sampled = torch.tensor([[1, 2, 0, 4]], dtype=torch.int32)
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._scv_mode = "adaptive"
+
+    mask = runner._build_nwor_acceptance_mask(metadata, sampled)
+    assert mask.tolist() == [True, True, False, False]
+
+
 def test_commit_failure_triggers_fallback_metrics():
     manager = DeferredWriteManager()
     assert manager.begin_window([1])
