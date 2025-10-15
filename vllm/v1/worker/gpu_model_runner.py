@@ -512,16 +512,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._latest_nwor_window_metrics: dict[str, int | str] | None = None
         self._scv_mode = envs.VLLM_SCV_MODE.lower()
         self._scv_graph_executor: SCVGraphExecutor | None = None
-
-    def _scv_enabled(self) -> bool:
-        if not hasattr(self, "_scv_mode"):
-            self._scv_mode = envs.VLLM_SCV_MODE.lower()
-        if self._scv_mode not in ("off", "graph", "adaptive"):
-            logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
-            self._scv_mode = "off"
-        return self._scv_mode != "off"
-
-        # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -530,6 +520,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device="cpu",
             pin_memory=self.pin_memory,
         )
+
+    def _scv_enabled(self) -> bool:
+        if not hasattr(self, "_scv_mode"):
+            self._scv_mode = envs.VLLM_SCV_MODE.lower()
+        if self._scv_mode not in ("off", "graph", "adaptive"):
+            logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
+            self._scv_mode = "off"
+        return self._scv_mode != "off"
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
