@@ -511,7 +511,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._deferred_write_manager = DeferredWriteManager(mode=envs.VLLM_NWOR_MODE)
         self._latest_nwor_window_metrics: dict[str, int | str] | None = None
         self._scv_mode = envs.VLLM_SCV_MODE.lower()
+        self._scv_capture_available = bool(
+            torch.cuda.is_available()
+            and self.cudagraph_dispatcher.cudagraph_mode != CUDAGraphMode.NONE
+        )
+        if self._scv_mode == "graph" and not self._scv_capture_available:
+            logger.info(
+                "SCV graph mode disabled: CUDA graph capture unavailable (mode=%s)",
+                self.cudagraph_dispatcher.cudagraph_mode.name,
+            )
+            self._scv_mode = "off"
         self._scv_graph_executor: SCVGraphExecutor | None = None
+        self._scv_graph_notice_logged = False
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -527,6 +538,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self._scv_mode not in ("off", "graph", "adaptive"):
             logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
             self._scv_mode = "off"
+        if self._scv_mode == "graph" and not getattr(
+            self, "_scv_capture_available", False
+        ):
+            return False
         return self._scv_mode != "off"
 
     def reset_mm_cache(self) -> None:
@@ -2390,12 +2405,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if hasattr(self, "_scv_mode") and self._scv_mode == "graph":
             executor = getattr(self, "_scv_graph_executor", None)
             if executor is None:
-                executor = SCVGraphExecutor(device)
+                executor = SCVGraphExecutor(device, self._scv_capture_available)
                 self._scv_graph_executor = executor
             mask = executor.run(
                 spec_decode_metadata, sampled_token_ids, total_tokens
             )
             if mask is not None:
+                if not self._scv_graph_notice_logged:
+                    logger.info("SCV graph capture active for chunk len %d", max_spec_len)
+                    self._scv_graph_notice_logged = True
                 return mask
 
         if hasattr(self, "_scv_mode") and self._scv_mode == "adaptive":
@@ -5035,10 +5053,10 @@ class _SCVGraphEntry:
 
 
 class SCVGraphExecutor:
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, capture_available: bool):
         self.device = device
         self.entries: dict[tuple[Any, ...], _SCVGraphEntry] = {}
-        self.enabled = torch.cuda.is_available()
+        self.enabled = bool(capture_available and torch.cuda.is_available())
 
     def run(
         self,
