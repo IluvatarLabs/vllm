@@ -19,6 +19,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, List
@@ -28,7 +29,8 @@ from datasets import load_dataset
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
-from vllm.spec_decode import SpeculativeConfig, SpeculativeMethod
+from vllm.v1.metrics.reader import Counter as MetricCounter, Gauge as MetricGauge
+from vllm.v1.metrics.reader import Vector as MetricVector, get_metrics_snapshot
 
 
 DEFAULT_TARGET_MODEL = os.getenv(
@@ -87,6 +89,7 @@ class RunConfig:
     max_new_tokens: int
     warmup_steps: int
     measure_steps: int
+    spec_method: str
     nwor_modes: List[str]
     scv_modes: List[str]
     enable_ncu: bool
@@ -139,11 +142,11 @@ def pick_prompts(config: RunConfig) -> List[str]:
 
 
 def build_engine(config: RunConfig) -> AsyncLLMEngine:
-    speculative_config = SpeculativeConfig(
-        method=SpeculativeMethod.EAGLE,
-        draft_model=config.drafter_model,
-        num_speculative_tokens=config.draft_tokens,
-    )
+    speculative_config = {
+        "method": config.spec_method,
+        "model": config.drafter_model,
+        "num_speculative_tokens": config.draft_tokens,
+    }
     engine_args = AsyncEngineArgs(
         model=config.target_model,
         target_device=os.getenv("VLLM_TARGET_DEVICE", "cuda"),
@@ -181,23 +184,53 @@ def run_batch(
     outputs = [future.result() for future in futures]
     duration = time.time() - start
 
-    scheduler_stats_obj = engine.get_engine_context().scheduler_stats
-    scheduler_stats = asdict(scheduler_stats_obj)
-
     return {
         "nwor_mode": nwor_mode,
         "scv_mode": scv_mode,
         "batch_index": batch_index,
         "latency_s": duration,
-        "scheduler_stats": scheduler_stats,
         "outputs": [output.outputs[0].text if output.outputs else "" for output in outputs],
         "sampling_params": sampling_params.to_dict(),
     }
 
 
-def run_microbenchmark(config: RunConfig) -> list[dict[str, Any]]:
+def snapshot_metrics() -> dict[str, float | list[int]]:
+    totals: dict[str, float | list[int]] = defaultdict(float)
+    for metric in get_metrics_snapshot():
+        if isinstance(metric, MetricCounter):
+            totals[metric.name] += metric.value
+        elif isinstance(metric, MetricGauge):
+            totals[metric.name] += metric.value
+        elif isinstance(metric, MetricVector):
+            if metric.name not in totals:
+                totals[metric.name] = [0] * len(metric.values)
+            current = totals[metric.name]
+            assert isinstance(current, list)
+            for idx, val in enumerate(metric.values):
+                current[idx] += val
+    return totals
+
+
+def diff_metrics(
+    after: dict[str, float | list[int]],
+    before: dict[str, float | list[int]],
+) -> dict[str, float]:
+    diff: dict[str, float] = {}
+    keys = set(before.keys()) | set(after.keys())
+    for name in keys:
+        after_val = after.get(name)
+        before_val = before.get(name)
+        if isinstance(after_val, list) or isinstance(before_val, list):
+            # Skip vector metrics for now.
+            continue
+        diff[name] = float(after_val or 0.0) - float(before_val or 0.0)
+    return diff
+
+
+def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tuple[str, str], dict[str, float]]]:
     prompts = pick_prompts(config)
     results: list[dict[str, Any]] = []
+    metrics_delta: dict[tuple[str, str], dict[str, float]] = {}
 
     for scv_mode in config.scv_modes:
         os.environ["VLLM_SCV_MODE"] = scv_mode or "off"
@@ -213,6 +246,8 @@ def run_microbenchmark(config: RunConfig) -> list[dict[str, Any]]:
                 prompt_offset += config.num_requests
                 run_batch(engine, warm_prompts, config, nwor_mode, -1, scv_mode)
 
+            metrics_before = snapshot_metrics()
+
             for batch_idx in range(config.batches):
                 start = prompt_offset + batch_idx * config.num_requests
                 end = start + config.num_requests
@@ -222,9 +257,13 @@ def run_microbenchmark(config: RunConfig) -> list[dict[str, Any]]:
                 )
                 results.append(result)
 
+            metrics_after = snapshot_metrics()
+            delta = diff_metrics(metrics_after, metrics_before)
+            metrics_delta[(scv_mode, nwor_mode)] = delta
+
             engine.shutdown()
 
-    return results
+    return results, metrics_delta
 
 
 def parse_args() -> RunConfig:
@@ -251,6 +290,11 @@ def parse_args() -> RunConfig:
         "--scv-modes",
         default="off",
         help="Comma-separated list of SCV modes to benchmark (default: off)",
+    )
+    parser.add_argument(
+        "--spec-method",
+        default="eagle",
+        help="Speculative method to use (default: eagle).",
     )
     parser.add_argument(
         "--enable-ncu",
@@ -292,6 +336,7 @@ def parse_args() -> RunConfig:
         max_new_tokens=args.max_new_tokens,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
+        spec_method=args.spec_method,
         nwor_modes=nwor_modes or ["off"],
         scv_modes=scv_modes or ["off"],
         enable_ncu=args.enable_ncu,
@@ -304,6 +349,7 @@ def parse_args() -> RunConfig:
 
 def summarize_results(
     results: list[dict[str, Any]],
+    metrics_delta: dict[tuple[str, str], dict[str, float]],
     ncu_metrics: dict[tuple[str, str], dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     summary: dict[tuple[str, str], dict[str, Any]] = {}
@@ -314,29 +360,11 @@ def summarize_results(
             key,
             {
                 "latencies": [],
-                "nwor_committed": 0,
-                "nwor_rejected": 0,
-                "nwor_tokens_staged": 0,
-                "spec_num_drafts": 0,
-                "spec_num_draft_tokens": 0,
-                "spec_num_accepted_tokens": 0,
                 "batches": 0,
             },
         )
         entry["latencies"].append(result["latency_s"])
         entry["batches"] += 1
-        stats = result.get("scheduler_stats") or {}
-        nwor_stats = stats.get("nwor_stats") or {}
-        entry["nwor_committed"] += int(nwor_stats.get("tokens_committed", 0))
-        entry["nwor_rejected"] += int(nwor_stats.get("tokens_rejected", 0))
-        entry["nwor_tokens_staged"] += int(nwor_stats.get("tokens_staged", 0))
-
-        spec_stats = stats.get("spec_decoding_stats") or {}
-        entry["spec_num_drafts"] += int(spec_stats.get("num_drafts", 0))
-        entry["spec_num_draft_tokens"] += int(spec_stats.get("num_draft_tokens", 0))
-        entry["spec_num_accepted_tokens"] += int(
-            spec_stats.get("num_accepted_tokens", 0)
-        )
 
     summary_output = []
     for (scv_mode, nwor_mode), entry in summary.items():
@@ -349,15 +377,17 @@ def summarize_results(
             p50 = latencies[0] if latencies else 0.0
             p95 = p50
 
-        committed = entry["nwor_committed"]
-        staged = entry["nwor_tokens_staged"]
+        metrics = metrics_delta.get((scv_mode, nwor_mode), {})
+        committed = int(metrics.get("vllm:nwor_committed_tokens", 0))
+        rejected = int(metrics.get("vllm:nwor_rejected_tokens", 0))
+        staged = committed + rejected
         writes_saved_pct = (
             (1 - committed / staged) * 100.0 if staged > 0 else 0.0
         )
 
-        spec_drafts = entry["spec_num_drafts"]
-        spec_draft_tokens = entry["spec_num_draft_tokens"]
-        spec_accepted_tokens = entry["spec_num_accepted_tokens"]
+        spec_drafts = int(metrics.get("vllm:spec_decode_num_drafts", 0))
+        spec_draft_tokens = int(metrics.get("vllm:spec_decode_num_draft_tokens", 0))
+        spec_accepted_tokens = int(metrics.get("vllm:spec_decode_num_accepted_tokens", 0))
         avg_acceptance_per_window = (
             spec_accepted_tokens / spec_drafts if spec_drafts > 0 else 0.0
         )
@@ -558,14 +588,14 @@ def parse_ncu_csv(path: Path, metric_names: list[str]) -> dict[str, float]:
 
 def main() -> None:
     config = parse_args()
-    results = run_microbenchmark(config)
+    results, metrics_delta = run_microbenchmark(config)
     ncu_metrics_map: dict[tuple[str, str], dict[str, float]] | None = None
     output_json = Path(config.output_path)
 
     if config.enable_ncu and not config.profile_only:
         ncu_metrics_map = run_ncu_profiles(config, output_json)
 
-    summary = summarize_results(results, ncu_metrics=ncu_metrics_map)
+    summary = summarize_results(results, metrics_delta, ncu_metrics=ncu_metrics_map)
 
     with output_json.open("w", encoding="utf-8") as f:
         json.dump(
