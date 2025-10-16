@@ -125,7 +125,7 @@ def test_build_acceptance_mask_matches_expected():
     )
 
     runner = GPUModelRunner.__new__(GPUModelRunner)
-    mask, counts = runner._build_nwor_acceptance_mask(metadata, sampled)
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
     expected = torch.tensor([True, False, True], dtype=torch.bool)
     assert torch.equal(mask.cpu(), expected)
     assert counts == [1, 1]
@@ -203,7 +203,7 @@ def test_scv_vectorized_mask_matches_reference():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner._scv_mode = "adaptive"
 
-    mask, counts = runner._build_nwor_acceptance_mask(metadata, sampled)
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
     assert mask.tolist() == [True, True, False, False]
     assert counts == [2]
 

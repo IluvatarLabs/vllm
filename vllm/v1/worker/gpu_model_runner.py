@@ -2294,8 +2294,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if spec_decode_metadata is None or sampled_token_ids is None:
                 manager.cancel_and_flush("missing_spec_metadata")
             else:
-                mask, accepted_counts = self._build_nwor_acceptance_mask(
-                    spec_decode_metadata, sampled_token_ids
+                need_mask = self._scv_enabled()
+                accepted_counts, _ = self._compute_nwor_acceptance(
+                    spec_decode_metadata, sampled_token_ids, return_mask=need_mask
                 )
                 if accepted_counts is None:
                     manager.cancel_and_flush("accept_mask_construction_failed")
@@ -2314,19 +2315,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if pending is not None and self._latest_nwor_window_metrics is None:
             self._latest_nwor_window_metrics = pending
 
-    def _build_nwor_acceptance_mask(
+    def _compute_nwor_acceptance(
         self,
         spec_decode_metadata: SpecDecodeMetadata,
         sampled_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, list[int] | None]:
+        *,
+        return_mask: bool = False,
+    ) -> tuple[list[int] | None, torch.Tensor | None]:
         num_draft_tokens = spec_decode_metadata.num_draft_tokens
         total_tokens = sum(int(n) for n in num_draft_tokens)
         if total_tokens <= 0:
-            return None, [0 for _ in num_draft_tokens]
+            return [0 for _ in num_draft_tokens], None
 
         target_device = spec_decode_metadata.draft_token_ids.device
         work_device = sampled_token_ids.device
 
+        mask: torch.Tensor | None = None
         if self._scv_enabled():
             mask = self._scv_vectorized_mask(
                 spec_decode_metadata, sampled_token_ids, total_tokens, work_device
@@ -2342,16 +2346,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     slice_view = mask[start : start + count]
                     accepted_counts.append(int(slice_view.sum().item()))
                     start += count
-                if mask.device != target_device:
+                if return_mask and mask.device != target_device:
                     mask = mask.to(device=target_device)
-                return mask, accepted_counts
+                if not return_mask:
+                    mask = None
+                return accepted_counts, mask
 
         draft_ids = spec_decode_metadata.draft_token_ids
         if draft_ids.device != work_device:
             draft_ids = draft_ids.to(device=work_device)
         draft_ids = draft_ids.to(dtype=sampled_token_ids.dtype, copy=False)
 
-        mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+        if return_mask:
+            mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+        else:
+            mask_work = None
         accepted_counts = []
 
         start = 0
@@ -2370,7 +2379,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             draft_slice = draft_ids[start:end]
             comparison = (row == draft_slice)
             prefix = torch.cumprod(comparison.to(torch.int32), dim=0)
-            mask_work[start:end] = prefix.to(torch.bool)
+            if mask_work is not None:
+                mask_work[start:end] = prefix.to(torch.bool)
             # number of accepted tokens is the sum of prefix entries (prefix remains 1 until mismatch)
             accepted_counts.append(int(prefix.sum().item()))
             start = end
@@ -2378,9 +2388,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if start != total_tokens:
             return None, None
 
+        if not return_mask:
+            return accepted_counts, None
+        assert mask_work is not None
         if mask_work.device == target_device:
-            return mask_work, accepted_counts
-        return mask_work.to(device=target_device), accepted_counts
+            return accepted_counts, mask_work
+        return accepted_counts, mask_work.to(device=target_device)
 
     def _scv_vectorized_mask(
         self,
