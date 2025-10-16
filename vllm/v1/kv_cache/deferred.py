@@ -149,7 +149,7 @@ def _slice_scale_segment(
 class DeferredWriteManager:
     """Stages KV writes until acceptance is known."""
 
-    SUPPORTED_MODES = {"stage", "immediate"}
+    SUPPORTED_MODES = {"stage", "immediate", "off"}
 
     def __init__(self, *, mode: str = "stage") -> None:
         self._window_active = False
@@ -467,10 +467,10 @@ class DeferredWriteManager:
 
     def _validate_mode(self, mode: str) -> str:
         normalized = mode.lower()
-        if normalized not in self.SUPPORTED_MODES:
-            logger.warning("NWOR: unsupported mode '%s', defaulting to 'stage'", mode)
-            return "stage"
-        return normalized
+        if normalized in self.SUPPORTED_MODES:
+            return normalized
+        logger.warning("NWOR: unsupported mode '%s', defaulting to 'stage'", mode)
+        return "stage"
 
     def pop_last_window_metrics(self) -> dict[str, int | str] | None:
         metrics = self._last_window_metrics

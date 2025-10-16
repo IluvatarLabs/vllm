@@ -2262,6 +2262,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         set_global_deferred_manager(None)
 
         if envs.VLLM_DISABLE_NWOR:
+            self._deferred_write_manager.finish_step()
             self._latest_nwor_window_metrics = None
             return
 
@@ -2269,6 +2270,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._latest_nwor_window_metrics = None
 
         if self._deferred_write_manager.get_mode() != "stage":
+            self._deferred_write_manager.finish_step()
             return
 
         if self.speculative_config is None or spec_decode_metadata is None:

@@ -86,6 +86,7 @@ class RunConfig:
     top_p: float
     prompt_count: int
     prompt_shuffle_seed: int
+    max_model_len: int | None
     max_new_tokens: int
     warmup_steps: int
     measure_steps: int
@@ -149,10 +150,11 @@ def build_engine(config: RunConfig) -> AsyncLLMEngine:
     }
     engine_args = AsyncEngineArgs(
         model=config.target_model,
-        target_device=os.getenv("VLLM_TARGET_DEVICE", "cuda"),
         tensor_parallel_size=1,
         speculative_config=speculative_config,
     )
+    if config.max_model_len is not None:
+        engine_args.max_model_len = config.max_model_len
     return AsyncLLMEngine.from_engine_args(engine_args)
 
 
@@ -278,6 +280,7 @@ def parse_args() -> RunConfig:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--prompt-count", type=int, default=100)
     parser.add_argument("--prompt-shuffle-seed", type=int, default=1234)
+    parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
@@ -333,6 +336,7 @@ def parse_args() -> RunConfig:
         top_p=args.top_p,
         prompt_count=args.prompt_count,
         prompt_shuffle_seed=args.prompt_shuffle_seed,
+        max_model_len=args.max_model_len,
         max_new_tokens=args.max_new_tokens,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
@@ -503,6 +507,10 @@ def config_to_args(
         str(config.prompt_count),
         "--prompt-shuffle-seed",
         str(config.prompt_shuffle_seed),
+    ]
+    if config.max_model_len is not None:
+        args.extend(["--max-model-len", str(config.max_model_len)])
+    args.extend([
         "--max-new-tokens",
         str(config.max_new_tokens),
         "--warmup-steps",
@@ -515,7 +523,7 @@ def config_to_args(
         ",".join(override_modes and [override_modes[0]] or config.scv_modes),
         "--output",
         output_path,
-    ]
+    ])
     if profile_only:
         args.append("--profile-only")
     return args

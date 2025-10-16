@@ -199,6 +199,12 @@ def test_nwor_immediate_mode_skips_window():
     assert manager.get_mode() == "immediate"
 
 
+def test_nwor_off_mode_skips_window():
+    manager = DeferredWriteManager(mode="off")
+    assert not manager.begin_window([3])
+    assert manager.get_mode() == "off"
+
+
 def test_scv_vectorized_mask_matches_reference():
     metadata = _make_metadata([1, 2, 3, 4], [4])
     sampled = torch.tensor([[1, 2, 0, 4]], dtype=torch.int32)
