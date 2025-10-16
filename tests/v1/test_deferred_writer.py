@@ -6,7 +6,10 @@ import torch
 
 from vllm.v1.kv_cache.deferred import DeferredWriteManager, ShouldFallback
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+try:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+except RuntimeError as exc:  # e.g., torch.cuda init failure on CPU-only envs
+    pytest.skip(f"GPUModelRunner unavailable: {exc}", allow_module_level=True)
 
 
 def _make_metadata(draft_token_ids: list[int], per_request: list[int]) -> SpecDecodeMetadata:
