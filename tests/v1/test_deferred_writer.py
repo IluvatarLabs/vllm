@@ -51,8 +51,7 @@ def test_deferred_manager_commit_partial_acceptance():
         writer=writer,
     )
 
-    mask = torch.tensor([True, False])
-    manager.commit(mask)
+    manager.commit([1])
 
     assert len(writes) == 1
     committed_key, committed_slots = writes[0]
@@ -126,9 +125,10 @@ def test_build_acceptance_mask_matches_expected():
     )
 
     runner = GPUModelRunner.__new__(GPUModelRunner)
-    mask = runner._build_nwor_acceptance_mask(metadata, sampled)
+    mask, counts = runner._build_nwor_acceptance_mask(metadata, sampled)
     expected = torch.tensor([True, False, True], dtype=torch.bool)
     assert torch.equal(mask.cpu(), expected)
+    assert counts == [1, 1]
 
 
 def test_nwor_disabled_env(monkeypatch):
@@ -174,7 +174,7 @@ def test_fp8_staging_slices_quant_scales():
         writer=writer,
     )
 
-    manager.commit(torch.tensor([True, False]))
+    manager.commit([1])
 
     assert len(recorded) == 1
     committed_key, committed_value, slots, committed_k_scale = recorded[0]
@@ -203,8 +203,9 @@ def test_scv_vectorized_mask_matches_reference():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner._scv_mode = "adaptive"
 
-    mask = runner._build_nwor_acceptance_mask(metadata, sampled)
+    mask, counts = runner._build_nwor_acceptance_mask(metadata, sampled)
     assert mask.tolist() == [True, True, False, False]
+    assert counts == [2]
 
 
 def test_commit_failure_triggers_fallback_metrics():
@@ -234,7 +235,7 @@ def test_commit_failure_triggers_fallback_metrics():
     )
 
     with pytest.raises(ShouldFallback):
-        manager.commit(torch.tensor([True]))
+        manager.commit([1])
 
     window_metrics = manager.pop_last_window_metrics()
     assert window_metrics is not None
