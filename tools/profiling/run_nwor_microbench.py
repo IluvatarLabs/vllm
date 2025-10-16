@@ -83,6 +83,8 @@ class RunConfig:
     max_new_tokens: int
     warmup_steps: int
     measure_steps: int
+    nwor_modes: List[str]
+    scv_modes: List[str]
     output_path: str
 
 
@@ -180,18 +182,24 @@ def run_microbenchmark(config: RunConfig) -> list[dict[str, Any]]:
     prompts = pick_prompts(config)
     results: list[dict[str, Any]] = []
 
-    for nwor_mode in ("off", "stage"):
-        os.environ["VLLM_NWOR_MODE"] = nwor_mode
-        engine = build_engine(config)
+    for scv_mode in config.scv_modes:
+        os.environ["VLLM_SCV_MODE"] = scv_mode or "off"
 
-        for batch_idx in range(config.batches):
-            start = batch_idx * config.num_requests
-            end = start + config.num_requests
-            batch_prompts = prompts[start:end]
-            result = run_batch(engine, batch_prompts, config, nwor_mode, batch_idx)
-            results.append(result)
+        for nwor_mode in config.nwor_modes:
+            os.environ["VLLM_NWOR_MODE"] = nwor_mode or "off"
+            engine = build_engine(config)
 
-        engine.shutdown()
+            for batch_idx in range(config.batches):
+                start = batch_idx * config.num_requests
+                end = start + config.num_requests
+                batch_prompts = prompts[start:end]
+                result = run_batch(
+                    engine, batch_prompts, config, nwor_mode, batch_idx
+                )
+                result["scv_mode"] = scv_mode
+                results.append(result)
+
+            engine.shutdown()
 
     return results
 
@@ -211,8 +219,21 @@ def parse_args() -> RunConfig:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
+    parser.add_argument(
+        "--nwor-modes",
+        default="off,stage",
+        help="Comma-separated list of NWOR modes to benchmark (default: off,stage)",
+    )
+    parser.add_argument(
+        "--scv-modes",
+        default="off",
+        help="Comma-separated list of SCV modes to benchmark (default: off)",
+    )
     parser.add_argument("--output", default="nwor_microbench.json")
     args = parser.parse_args()
+
+    nwor_modes = [mode.strip() for mode in args.nwor_modes.split(",") if mode.strip()]
+    scv_modes = [mode.strip() for mode in args.scv_modes.split(",") if mode.strip()]
 
     return RunConfig(
         target_model=args.target_model,
@@ -228,6 +249,8 @@ def parse_args() -> RunConfig:
         max_new_tokens=args.max_new_tokens,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
+        nwor_modes=nwor_modes or ["off"],
+        scv_modes=scv_modes or ["off"],
         output_path=args.output,
     )
 
