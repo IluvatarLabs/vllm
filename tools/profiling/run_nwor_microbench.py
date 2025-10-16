@@ -302,7 +302,10 @@ def parse_args() -> RunConfig:
     )
 
 
-def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_results(
+    results: list[dict[str, Any]],
+    ncu_metrics: dict[tuple[str, str], dict[str, float]] | None = None,
+) -> dict[str, Any]:
     summary: dict[tuple[str, str], dict[str, Any]] = {}
 
     for result in results:
@@ -364,6 +367,7 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             else 0.0
         )
 
+        metrics_extra = (ncu_metrics or {}).get((scv_mode, nwor_mode), {})
         summary_output.append(
             {
                 "scv_mode": scv_mode,
@@ -380,6 +384,7 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "spec_num_accepted_tokens": spec_accepted_tokens,
                 "spec_avg_accepted_per_window": avg_acceptance_per_window,
                 "spec_acceptance_ratio": acceptance_ratio,
+                "ncu_metrics": metrics_extra,
             }
         )
 
@@ -394,19 +399,59 @@ def write_markdown_summary(config: RunConfig, summary: dict[str, Any], path: Pat
     lines.append(json.dumps(config.__dict__, indent=2))
     lines.append("```")
     lines.append("\n## Summary\n")
-    lines.append("| SCV Mode | NWOR Mode | Batches | Avg Latency (s) | P50 (s) | P95 (s) | Tokens Staged | Tokens Committed | Writes Saved % | Avg Accepted/window | Acceptance Ratio |")
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    # Determine optional NCU metric columns
+    metric_names: list[str] = []
     for row in summary["per_mode"]:
-        lines.append(
-            f"| {row['scv_mode']} | {row['nwor_mode']} | {row['batches']} | "
-            f"{row['latency_avg_s']:.4f} | {row['latency_p50_s']:.4f} | {row['latency_p95_s']:.4f} | "
-            f"{row['nwor_tokens_staged']} | {row['nwor_tokens_committed']} | {row['nwor_writes_saved_pct']:.2f} | "
-            f"{row['spec_avg_accepted_per_window']:.2f} | {row['spec_acceptance_ratio']:.2f} |"
-        )
+        for metric_name in row.get("ncu_metrics", {}):
+            if metric_name not in metric_names:
+                metric_names.append(metric_name)
+
+    header_cols = [
+        "SCV Mode",
+        "NWOR Mode",
+        "Batches",
+        "Avg Latency (s)",
+        "P50 (s)",
+        "P95 (s)",
+        "Tokens Staged",
+        "Tokens Committed",
+        "Writes Saved %",
+        "Avg Accepted/window",
+        "Acceptance Ratio",
+    ] + metric_names
+    header = "| " + " | ".join(header_cols) + " |"
+    separator = "| " + " | ".join("---" for _ in header_cols) + " |"
+    lines.append(header)
+    lines.append(separator)
+    for row in summary["per_mode"]:
+        values = [
+            row["scv_mode"],
+            row["nwor_mode"],
+            str(row["batches"]),
+            f"{row['latency_avg_s']:.4f}",
+            f"{row['latency_p50_s']:.4f}",
+            f"{row['latency_p95_s']:.4f}",
+            str(row["nwor_tokens_staged"]),
+            str(row["nwor_tokens_committed"]),
+            f"{row['nwor_writes_saved_pct']:.2f}",
+            f"{row['spec_avg_accepted_per_window']:.2f}",
+            f"{row['spec_acceptance_ratio']:.2f}",
+        ]
+        metrics_extra = row.get("ncu_metrics", {})
+        for name in metric_names:
+            value = metrics_extra.get(name)
+            values.append(f"{value:.3e}" if value is not None else "")
+        lines.append("| " + " | ".join(values) + " |")
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def config_to_args(config: RunConfig, *, output_path: str, profile_only: bool = False) -> list[str]:
+def config_to_args(
+    config: RunConfig,
+    *,
+    output_path: str,
+    profile_only: bool = False,
+    override_modes: tuple[str, str] | None = None,
+) -> list[str]:
     args = [
         "--target-model",
         config.target_model,
@@ -435,9 +480,9 @@ def config_to_args(config: RunConfig, *, output_path: str, profile_only: bool = 
         "--measure-steps",
         str(config.measure_steps),
         "--nwor-modes",
-        ",".join(config.nwor_modes),
+        ",".join(override_modes and [override_modes[1]] or config.nwor_modes),
         "--scv-modes",
-        ",".join(config.scv_modes),
+        ",".join(override_modes and [override_modes[0]] or config.scv_modes),
         "--output",
         output_path,
     ]
@@ -446,50 +491,82 @@ def config_to_args(config: RunConfig, *, output_path: str, profile_only: bool = 
     return args
 
 
-def run_with_profiler(config: RunConfig, profiler: str, base_args: list[str], output_stem: Path) -> None:
+def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, str], dict[str, float]]:
+    metrics_map: dict[tuple[str, str], dict[str, float]] = {}
     script_path = Path(__file__).resolve()
     env = os.environ.copy()
+    metric_names = [m.strip() for m in config.ncu_metrics.split(",") if m.strip()]
 
-    if profiler == "ncu":
-        export_stem = str(output_stem) + ".ncu"
-        cmd = [
-            "nv-nsight-cu-cli",
-            "--metrics",
-            config.ncu_metrics,
-            "--target-processes",
-            "all",
-            "-o",
-            export_stem,
-            sys.executable,
-            str(script_path),
-        ] + base_args
-    elif profiler == "nsys":
-        export_stem = str(output_stem) + ".nsys"
-        cmd = [
-            "nsys",
-            "profile",
-            "-t",
-            "cuda,nvtx,osrt",
-            "-o",
-            export_stem,
-            sys.executable,
-            str(script_path),
-        ] + base_args
-    else:
-        raise ValueError(f"Unsupported profiler: {profiler}")
+    for scv_mode in config.scv_modes:
+        for nwor_mode in config.nwor_modes:
+            suffix = f".{scv_mode or 'off'}-{nwor_mode or 'off'}"
+            csv_path = output_json.with_suffix(f"{suffix}.ncu.csv")
+            rep_path = output_json.with_suffix(f"{suffix}.ncu")
+            profile_json = output_json.with_suffix(f"{suffix}.ncu.json")
+            args = config_to_args(
+                config,
+                output_path=str(profile_json),
+                profile_only=True,
+                override_modes=(scv_mode, nwor_mode),
+            )
+            cmd = [
+                "nv-nsight-cu-cli",
+                "--csv",
+                "--log-file",
+                str(csv_path),
+                "--metrics",
+                ",".join(metric_names),
+                "--target-processes",
+                "all",
+                "-o",
+                str(rep_path),
+                sys.executable,
+                str(script_path),
+            ] + args
+            try:
+                subprocess.run(cmd, check=True, env=env)
+            except FileNotFoundError as exc:
+                print(f"[WARN] nv-nsight-cu-cli not found: {exc}. Skipping NCU collection.")
+                return {}
+            except subprocess.CalledProcessError as exc:
+                print(f"[WARN] nv-nsight-cu-cli failed for modes {scv_mode}/{nwor_mode}: {exc}")
+                continue
 
-    try:
-        subprocess.run(cmd, check=True, env=env)
-    except FileNotFoundError as exc:
-        print(f"[WARN] Profiler '{profiler}' not found: {exc}. Skipping.")
+            metrics = parse_ncu_csv(csv_path, metric_names)
+            metrics_map[(scv_mode, nwor_mode)] = metrics
+    return metrics_map
+
+
+def parse_ncu_csv(path: Path, metric_names: list[str]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    if not path.exists():
+        return metrics
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            name, _unit, value = parts[:3]
+            if name in metric_names:
+                try:
+                    metrics[name] = float(value)
+                except ValueError:
+                    pass
+    return metrics
 
 
 def main() -> None:
     config = parse_args()
     results = run_microbenchmark(config)
-    summary = summarize_results(results)
-
+    ncu_metrics_map: dict[tuple[str, str], dict[str, float]] | None = None
     output_json = Path(config.output_path)
+
+    if config.enable_ncu and not config.profile_only:
+        ncu_metrics_map = run_ncu_profiles(config, output_json)
+
+    summary = summarize_results(results, ncu_metrics=ncu_metrics_map)
+
     with output_json.open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -505,16 +582,32 @@ def main() -> None:
     write_markdown_summary(config, summary, output_md)
     print(f"Wrote benchmark output to {output_json} and {output_md}")
 
-    if not config.profile_only:
-        base_args = config_to_args(
+    if config.enable_nsys and not config.profile_only:
+        # Run Nsight Systems once over all modes
+        script_path = Path(__file__).resolve()
+        env = os.environ.copy()
+        nsys_output = output_json.with_suffix(".nsys")
+        args = config_to_args(
             config,
-            output_path=str(output_json.with_suffix(".profile.json")),
+            output_path=str(output_json.with_suffix(".nsys.json")),
             profile_only=True,
         )
-        if config.enable_ncu:
-            run_with_profiler(config, "ncu", base_args, output_json.with_suffix(""))
-        if config.enable_nsys:
-            run_with_profiler(config, "nsys", base_args, output_json.with_suffix(""))
+        cmd = [
+            "nsys",
+            "profile",
+            "-t",
+            "cuda,nvtx,osrt",
+            "-o",
+            str(nsys_output),
+            sys.executable,
+            str(script_path),
+        ] + args
+        try:
+            subprocess.run(cmd, check=True, env=env)
+        except FileNotFoundError as exc:
+            print(f"[WARN] nsys not found: {exc}. Skipping Nsight Systems collection.")
+        except subprocess.CalledProcessError as exc:
+            print(f"[WARN] nsys failed: {exc}")
 
 
 if __name__ == "__main__":
