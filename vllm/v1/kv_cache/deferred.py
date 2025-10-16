@@ -126,6 +126,26 @@ def _slice_scale(scale: Optional[Tensor], indices: Tensor) -> Optional[Tensor]:
     return scale
 
 
+def _slice_scale_segment(
+    scale: Optional[Tensor],
+    start: int,
+    end: int,
+    entry_length: int,
+) -> Optional[Tensor]:
+    if scale is None:
+        return None
+    if scale.ndim == 0 or scale.shape[0] == 0:
+        return scale
+    length = end - start
+    if length == 0:
+        return scale.new_empty((0,), dtype=scale.dtype, device=scale.device)
+    if scale.shape[0] == entry_length:
+        return scale.narrow(0, start, length)
+    if scale.shape[0] == entry_length + 1:
+        return scale.narrow(0, start, length)
+    return scale
+
+
 class DeferredWriteManager:
     """Stages KV writes until acceptance is known."""
 
@@ -136,6 +156,7 @@ class DeferredWriteManager:
         self._num_draft_tokens: list[int] = []
         self._expected_tokens = 0
         self._staged_tokens = 0
+        self._req_start_offsets: list[int] = []
         self._entries: list[_LayerEntry] = []
         self._fallback_reason: Optional[str] = None
         self._metrics = {
@@ -171,6 +192,12 @@ class DeferredWriteManager:
         total_tokens = sum(int(n) for n in num_draft_tokens)
         if total_tokens <= 0:
             return False
+
+        self._req_start_offsets.clear()
+        running = 0
+        for n in self._num_draft_tokens:
+            self._req_start_offsets.append(running)
+            running += n
 
         if _in_restricted_context():
             self._record_fallback("cuda_graph_capture")
@@ -260,66 +287,124 @@ class DeferredWriteManager:
     # ------------------------------------------------------------------
     # Commit / Fallback
     # ------------------------------------------------------------------
-    def commit(self, accepted_mask: Tensor) -> None:
+    def commit(self, accepted_counts: Sequence[int]) -> None:
         if not self._window_active:
             return
 
-        if accepted_mask.numel() != self._expected_tokens:
-            raise ShouldFallback("accepted_mask_mismatch")
-
-        if accepted_mask.dtype != torch.bool:
-            accepted_mask = accepted_mask.to(dtype=torch.bool)
+        if len(accepted_counts) != len(self._num_draft_tokens):
+            raise ShouldFallback("accepted_counts_mismatch")
 
         committed_total = 0
-        start = 0
+        total_requests = len(self._num_draft_tokens)
+        expected_tokens = self._expected_tokens
+
         for entry in self._entries:
-            end = start + entry.length
-            layer_mask = accepted_mask[start:end]
-            if layer_mask.device != entry.key_source.device:
-                layer_mask = layer_mask.to(device=entry.key_source.device)
-            start = end
+            entry_start = entry.start
+            entry_end = entry_start + entry.length
 
-            if layer_mask.numel() != entry.length:
-                raise ShouldFallback("layer_mask_length_mismatch")
+            accepted_segments: list[tuple[int, int]] = []
+            total_segment_tokens = 0
+            for req_idx in range(total_requests):
+                req_tokens = self._num_draft_tokens[req_idx]
+                if req_tokens == 0:
+                    continue
+                req_start = self._req_start_offsets[req_idx]
+                req_end = req_start + req_tokens
+                if req_end <= entry_start:
+                    continue
+                if req_start >= entry_end:
+                    break
 
-            if not layer_mask.any():
+                accepted = min(int(accepted_counts[req_idx]), req_tokens)
+                if accepted <= 0:
+                    continue
+
+                accepted_end = req_start + accepted
+                seg_start = max(entry_start, req_start)
+                seg_end = min(entry_end, accepted_end)
+                if seg_end <= seg_start:
+                    continue
+
+                local_start = seg_start - entry_start
+                local_end = seg_end - entry_start
+                accepted_segments.append((local_start, local_end))
+                total_segment_tokens += seg_end - seg_start
+
+            if total_segment_tokens == 0:
                 continue
 
-            indices = torch.nonzero(layer_mask, as_tuple=False).squeeze(1)
-            committed_total += int(indices.numel())
+            if total_segment_tokens == entry.length and len(accepted_segments) == 1:
+                segment_start, segment_end = accepted_segments[0]
+                if segment_start == 0 and segment_end == entry.length:
+                    try:
+                        entry.writer(
+                            entry.key_source,
+                            entry.value_source,
+                            entry.key_cache,
+                            entry.value_cache,
+                            _ensure_int32_slots(entry.slot_mapping, entry.slot_mapping.device),
+                            entry.kv_cache_dtype,
+                            entry.k_scale,
+                            entry.v_scale,
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        reason = f"commit_failed:{entry.layer_id}"
+                        self._record_fallback(reason)
+                        self._flush_entries()
+                        self._last_window_metrics = {
+                            "mode": self._mode,
+                            "committed": 0,
+                            "rejected": expected_tokens,
+                            "fallback": 1,
+                            "reason": reason,
+                        }
+                        self._clear_window()
+                        raise ShouldFallback(reason) from exc
+                    committed_total += entry.length
+                    continue
 
-            key_slice = torch.index_select(entry.key_source, 0, indices).contiguous()
-            value_slice = torch.index_select(entry.value_source, 0, indices).contiguous()
-            slot_slice = torch.index_select(entry.slot_mapping, 0, indices)
-            slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
+            for segment_start, segment_end in accepted_segments:
+                length = segment_end - segment_start
+                if length <= 0:
+                    continue
+                key_slice = entry.key_source.narrow(0, segment_start, length)
+                value_slice = entry.value_source.narrow(0, segment_start, length)
+                slot_slice = entry.slot_mapping.narrow(0, segment_start, length)
+                slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
 
-            k_scale_slice = _slice_scale(entry.k_scale, indices)
-            v_scale_slice = _slice_scale(entry.v_scale, indices)
-
-            try:
-                entry.writer(
-                    key_slice,
-                    value_slice,
-                    entry.key_cache,
-                    entry.value_cache,
-                    slot_slice,
-                    entry.kv_cache_dtype,
-                    k_scale_slice,
-                    v_scale_slice,
+                k_scale_slice = _slice_scale_segment(
+                    entry.k_scale, segment_start, segment_end, entry.length
                 )
-            except Exception as exc:  # pragma: no cover - propagate for upstream handling
-                reason = f"commit_failed:{entry.layer_id}"
-                self._record_fallback(reason)
-                self._flush_entries()
-                self._last_window_metrics = {
-                    "mode": self._mode,
-                    "committed": 0,
-                    "rejected": self._expected_tokens,
-                    "fallback": 1,
-                    "reason": reason,
-                }
-                self._clear_window()
-                raise ShouldFallback(reason) from exc
+                v_scale_slice = _slice_scale_segment(
+                    entry.v_scale, segment_start, segment_end, entry.length
+                )
+
+                try:
+                    entry.writer(
+                        key_slice,
+                        value_slice,
+                        entry.key_cache,
+                        entry.value_cache,
+                        slot_slice,
+                        entry.kv_cache_dtype,
+                        k_scale_slice,
+                        v_scale_slice,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    reason = f"commit_failed:{entry.layer_id}"
+                    self._record_fallback(reason)
+                    self._flush_entries()
+                    self._last_window_metrics = {
+                        "mode": self._mode,
+                        "committed": 0,
+                        "rejected": expected_tokens,
+                        "fallback": 1,
+                        "reason": reason,
+                    }
+                    self._clear_window()
+                    raise ShouldFallback(reason) from exc
+
+                committed_total += length
 
         rejected = max(self._expected_tokens - committed_total, 0)
         self._metrics["tokens_committed"] += committed_total
@@ -378,6 +463,7 @@ class DeferredWriteManager:
         self._expected_tokens = 0
         self._staged_tokens = 0
         self._entries.clear()
+        self._req_start_offsets.clear()
 
     def _validate_mode(self, mode: str) -> str:
         normalized = mode.lower()
