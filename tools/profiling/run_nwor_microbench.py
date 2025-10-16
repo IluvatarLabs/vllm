@@ -12,6 +12,7 @@ Environment overrides:
 """
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -26,9 +27,7 @@ from typing import Any, Iterable, List
 
 from datasets import load_dataset
 
-from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter as MetricCounter, Gauge as MetricGauge
 from vllm.v1.metrics.reader import Vector as MetricVector, get_metrics_snapshot
 
@@ -84,6 +83,7 @@ class RunConfig:
     batches: int
     temperature: float
     top_p: float
+    tensor_parallel_size: int
     prompt_count: int
     prompt_shuffle_seed: int
     max_model_len: int | None
@@ -142,24 +142,24 @@ def pick_prompts(config: RunConfig) -> List[str]:
     return candidates[:total_needed]
 
 
-def build_engine(config: RunConfig) -> AsyncLLMEngine:
+def build_engine(config: RunConfig) -> LLM:
     speculative_config = {
         "method": config.spec_method,
         "model": config.drafter_model,
         "num_speculative_tokens": config.draft_tokens,
     }
-    engine_args = AsyncEngineArgs(
-        model=config.target_model,
-        tensor_parallel_size=1,
-        speculative_config=speculative_config,
-    )
+    llm_kwargs: dict[str, Any] = {
+        "model": config.target_model,
+        "tensor_parallel_size": config.tensor_parallel_size,
+        "speculative_config": speculative_config,
+    }
     if config.max_model_len is not None:
-        engine_args.max_model_len = config.max_model_len
-    return AsyncLLMEngine.from_engine_args(engine_args)
+        llm_kwargs["max_model_len"] = config.max_model_len
+    return LLM(**llm_kwargs)
 
 
 def run_batch(
-    engine: AsyncLLMEngine,
+    engine: LLM,
     prompts: Iterable[str],
     config: RunConfig,
     nwor_mode: str,
@@ -172,27 +172,27 @@ def run_batch(
         max_tokens=config.max_new_tokens,
     )
 
+    prompt_list = list(prompts)
     start = time.time()
-    futures = []
-    for i, prompt in enumerate(prompts):
-        request_id = f"nwor-run-{batch_index}-{nwor_mode}-{i}"
-        futures.append(
-            engine.generate(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-            )
-        )
-    outputs = [future.result() for future in futures]
+    request_outputs = engine.generate(prompt_list, sampling_params=sampling_params, use_tqdm=False)
     duration = time.time() - start
+
+    texts = [
+        output.outputs[0].text if output.outputs else ""
+        for output in request_outputs
+    ]
 
     return {
         "nwor_mode": nwor_mode,
         "scv_mode": scv_mode,
         "batch_index": batch_index,
         "latency_s": duration,
-        "outputs": [output.outputs[0].text if output.outputs else "" for output in outputs],
-        "sampling_params": sampling_params.to_dict(),
+        "outputs": texts,
+        "sampling_params": {
+            "temperature": sampling_params.temperature,
+            "top_p": sampling_params.top_p,
+            "max_tokens": sampling_params.max_tokens,
+        },
     }
 
 
@@ -263,7 +263,9 @@ def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tu
             delta = diff_metrics(metrics_after, metrics_before)
             metrics_delta[(scv_mode, nwor_mode)] = delta
 
-            engine.shutdown()
+            # Explicitly delete engine to free GPU memory before next iteration
+            del engine
+            gc.collect()
 
     return results, metrics_delta
 
@@ -278,6 +280,7 @@ def parse_args() -> RunConfig:
     parser.add_argument("--batches", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--prompt-count", type=int, default=100)
     parser.add_argument("--prompt-shuffle-seed", type=int, default=1234)
     parser.add_argument("--max-model-len", type=int, default=None)
@@ -334,6 +337,7 @@ def parse_args() -> RunConfig:
         batches=args.batches,
         temperature=args.temperature,
         top_p=args.top_p,
+        tensor_parallel_size=args.tensor_parallel_size,
         prompt_count=args.prompt_count,
         prompt_shuffle_seed=args.prompt_shuffle_seed,
         max_model_len=args.max_model_len,
@@ -503,6 +507,8 @@ def config_to_args(
         str(config.temperature),
         "--top-p",
         str(config.top_p),
+        "--tensor-parallel-size",
+        str(config.tensor_parallel_size),
         "--prompt-count",
         str(config.prompt_count),
         "--prompt-shuffle-seed",
