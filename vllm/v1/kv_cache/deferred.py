@@ -193,6 +193,7 @@ class DeferredWriteManager:
         if total_tokens <= 0:
             return False
 
+        self._num_draft_tokens = [int(n) for n in num_draft_tokens]
         self._req_start_offsets.clear()
         running = 0
         for n in self._num_draft_tokens:
@@ -204,7 +205,6 @@ class DeferredWriteManager:
             return False
 
         self._window_active = True
-        self._num_draft_tokens = [int(n) for n in num_draft_tokens]
         self._expected_tokens = total_tokens
         self._staged_tokens = 0
         self._entries.clear()
