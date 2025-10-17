@@ -2406,6 +2406,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> torch.Tensor | None:
         draft_ids = spec_decode_metadata.draft_token_ids
         max_spec_len = spec_decode_metadata.max_spec_len
+
+        # Host-side validation before CUDA operations
+        if sampled_token_ids.ndim != 2:
+            logger.error(
+                "SCV: Expected sampled_token_ids to be 2-D, got shape %s. "
+                "Falling back to non-SCV path.",
+                sampled_token_ids.shape
+            )
+            return None
+
+        num_cols = sampled_token_ids.shape[1]
+        if num_cols <= 0:
+            logger.error(
+                "SCV: sampled_token_ids has %d columns. "
+                "Falling back to non-SCV path.",
+                num_cols
+            )
+            return None
+
+        # Log warning if columns < expected spec length (not an error, just unexpected)
+        expected_cols = max_spec_len + 1
+        if num_cols < expected_cols:
+            logger.warning_once(
+                "SCV: sampled_token_ids has %d columns, expected at least %d. "
+                "Clamping will be applied.",
+                num_cols, expected_cols
+            )
+
         num_draft_tensor = torch.tensor(
             spec_decode_metadata.num_draft_tokens,
             device=device,
@@ -2458,21 +2486,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         max_spec_len: int,
         total_tokens: int,
     ) -> torch.Tensor:
+        """Compute acceptance mask for speculative decoding verification.
+
+        Assumes host-side validation has already been performed.
+        """
         device = draft_ids.device
         indices = torch.arange(total_tokens, device=device, dtype=torch.int32)
         req_idx = torch.bucketize(indices, cu_num_draft_tokens)
         prev_cu = torch.cat([cu_num_draft_tokens.new_zeros(1), cu_num_draft_tokens[:-1]])
         pos_in_req = indices - prev_cu[req_idx]
 
-        if sampled_token_ids.ndim != 2:
-            raise RuntimeError(
-                "Expected sampled_token_ids to be 2-D tensor, "
-                f"got shape {sampled_token_ids.shape}"
-            )
+        # Clamp indices and track which are within bounds
         max_cols = sampled_token_ids.shape[1]
-        if max_cols <= 0:
-            raise RuntimeError("sampled_token_ids has no columns.")
-
         pos_clamped = torch.clamp(pos_in_req, max=max_cols - 1)
         gathered = sampled_token_ids[req_idx, pos_clamped]
         within_bounds = pos_in_req < max_cols
