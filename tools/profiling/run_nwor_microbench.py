@@ -237,7 +237,11 @@ def diff_metrics(
         if isinstance(after_val, list) or isinstance(before_val, list):
             # Skip vector metrics for now.
             continue
-        diff[name] = float(after_val or 0.0) - float(before_val or 0.0)
+        base_value = float(after_val or 0.0) - float(before_val or 0.0)
+        diff[name] = base_value
+        if name.endswith("_total"):
+            base_name = name[: -len("_total")]
+            diff.setdefault(base_name, base_value)
     return diff
 
 
