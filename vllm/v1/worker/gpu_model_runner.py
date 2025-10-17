@@ -581,6 +581,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
         return self._scv_mode != "off"
 
+    @contextmanager
+    def _scv_nvtx_range(self, name: str):
+        nvtx_mod = None
+        if getattr(self, "_scv_profile", False) and torch.cuda.is_available():
+            try:
+                from torch.cuda import nvtx as nvtx_mod  # type: ignore
+                nvtx_mod.range_push(name)
+            except (ImportError, AttributeError, RuntimeError):
+                nvtx_mod = None
+        try:
+            yield
+        finally:
+            if nvtx_mod is not None:
+                try:
+                    nvtx_mod.range_pop()
+                except RuntimeError:
+                    pass
+
     def _handle_scv_graph_failure(self, reason: str) -> None:
         if self._scv_capture_available and (self._scv_debug or self._nwor_debug):
             logger.warning(
@@ -2587,9 +2605,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 executor = SCVGraphExecutor(device)
                 self._scv_graph_executor = executor
             try:
-                mask = executor.run(
-                    spec_decode_metadata, sampled_token_ids, total_tokens
-                )
+                with self._scv_nvtx_range("scv_compute_mask"):
+                    mask = executor.run(
+                        spec_decode_metadata, sampled_token_ids, total_tokens
+                    )
             except RuntimeError as exc:
                 self._handle_scv_graph_failure(str(exc))
             else:
@@ -2629,20 +2648,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         max_spec_len: int,
         total_tokens: int,
     ) -> torch.Tensor:
-        use_nvtx = False
-        nvtx_mod = None
-        if self._scv_profile and torch.cuda.is_available():
-            try:
-                from torch.cuda import nvtx as nvtx_mod  # type: ignore
-            except (ImportError, AttributeError):
-                nvtx_mod = None
-            if nvtx_mod is not None:
-                try:
-                    nvtx_mod.range_push("scv_compute_mask")
-                    use_nvtx = True
-                except RuntimeError:
-                    use_nvtx = False
-        try:
+        with self._scv_nvtx_range("scv_compute_mask"):
             return self._scv_compute_mask(
                 draft_ids,
                 num_draft_tokens,
@@ -2651,12 +2657,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 max_spec_len,
                 total_tokens,
             )
-        finally:
-            if use_nvtx:
-                try:
-                    nvtx_mod.range_pop()  # type: ignore[union-attr]
-                except RuntimeError:
-                    pass
 
     @staticmethod
     def _scv_compute_mask(
