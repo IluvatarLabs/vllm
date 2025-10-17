@@ -275,7 +275,7 @@ def test_scv_mask_invalid_shape_falls_back():
     counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
 
     # Reference path should still compute correctly
-    assert counts == [1]  # Only first token matches before shape error
+    assert counts == [2]
 
 
 def test_commit_failure_triggers_fallback_metrics():

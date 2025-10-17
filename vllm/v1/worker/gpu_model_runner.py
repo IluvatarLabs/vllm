@@ -166,6 +166,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _parse_debug_flag(env_name: str) -> bool:
+    value = os.getenv(env_name)
+    if value is None:
+        return False
+    value = value.strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -512,7 +520,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._deferred_write_manager = DeferredWriteManager(mode=envs.VLLM_NWOR_MODE)
         self._latest_nwor_window_metrics: dict[str, int | str] | None = None
         self._scv_mode = envs.VLLM_SCV_MODE.lower()
-        self._nwor_debug = bool(int(os.getenv("VLLM_NWOR_DEBUG", "0")))
+        self._nwor_debug = _parse_debug_flag("VLLM_NWOR_DEBUG")
 
         # Log NWOR/SCV configuration on init
         if self.speculative_config:
@@ -2419,6 +2427,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             mask_work = None
         accepted_counts = []
 
+        if sampled_token_ids.ndim == 0:
+            zero_counts = [0 for _ in num_draft_tokens]
+            if return_mask:
+                empty_mask = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+                return zero_counts, empty_mask.to(device=target_device)
+            return zero_counts, None
+
+        if sampled_token_ids.ndim == 1:
+            sampled_token_ids = sampled_token_ids.unsqueeze(0)
+        elif sampled_token_ids.ndim > 2:
+            leading = sampled_token_ids.shape[0]
+            sampled_token_ids = sampled_token_ids.reshape(leading, -1)
+
         start = 0
         for req_idx, draft_count in enumerate(num_draft_tokens):
             draft_count = int(draft_count)
@@ -2426,19 +2447,35 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 accepted_counts.append(0)
                 continue
             end = start + draft_count
-            row = sampled_token_ids[req_idx, :draft_count]
+            if req_idx >= sampled_token_ids.shape[0]:
+                row = sampled_token_ids.new_empty((0,), dtype=sampled_token_ids.dtype)
+            else:
+                row = sampled_token_ids[req_idx]
             if row.device != work_device:
                 row = row.to(device=work_device)
             if row.dtype != draft_ids.dtype:
                 row = row.to(dtype=draft_ids.dtype)
+            if row.ndim == 0:
+                row = row.unsqueeze(0)
+            elif row.ndim > 1:
+                row = row.reshape(-1)
 
-            draft_slice = draft_ids[start:end]
-            comparison = (row == draft_slice)
-            prefix = torch.cumprod(comparison.to(torch.int32), dim=0)
+            row_len = int(row.shape[0])
+            valid_len = min(row_len, draft_count)
+
+            prefix_full = torch.zeros(draft_count, dtype=torch.bool, device=work_device)
+            if valid_len > 0:
+                row_slice = row[:valid_len]
+                draft_slice = draft_ids[start : start + valid_len]
+                comparison = row_slice == draft_slice
+                prefix_valid = torch.cumprod(
+                    comparison.to(torch.int32), dim=0
+                ).to(torch.bool)
+                prefix_full[:valid_len] = prefix_valid
+
             if mask_work is not None:
-                mask_work[start:end] = prefix.to(torch.bool)
-            # number of accepted tokens is the sum of prefix entries (prefix remains 1 until mismatch)
-            accepted_counts.append(int(prefix.sum().item()))
+                mask_work[start:end] = prefix_full
+            accepted_counts.append(int(prefix_full.sum().item()))
             start = end
 
         if start != total_tokens:
