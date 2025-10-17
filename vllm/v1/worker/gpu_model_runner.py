@@ -2464,8 +2464,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         prev_cu = torch.cat([cu_num_draft_tokens.new_zeros(1), cu_num_draft_tokens[:-1]])
         pos_in_req = indices - prev_cu[req_idx]
 
-        gathered = sampled_token_ids[req_idx, pos_in_req]
-        comparison = gathered == draft_ids
+        if sampled_token_ids.ndim != 2:
+            raise RuntimeError(
+                "Expected sampled_token_ids to be 2-D tensor, "
+                f"got shape {sampled_token_ids.shape}"
+            )
+        max_cols = sampled_token_ids.shape[1]
+        if max_cols <= 0:
+            raise RuntimeError("sampled_token_ids has no columns.")
+
+        pos_clamped = torch.clamp(pos_in_req, max=max_cols - 1)
+        gathered = sampled_token_ids[req_idx, pos_clamped]
+        within_bounds = pos_in_req < max_cols
+        comparison = within_bounds & (gathered == draft_ids)
 
         max_val = max_spec_len + 1
         values = torch.where(
