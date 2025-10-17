@@ -278,6 +278,51 @@ def test_scv_mask_invalid_shape_falls_back():
     assert counts == [2]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_scv_graph_inplace_matches_reference():
+    metadata = _make_metadata([10, 20, 30, 40], [4])
+    sampled = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.int32, device="cuda")
+
+    runner_ref = GPUModelRunner.__new__(GPUModelRunner)
+    runner_ref._scv_mode = "off"
+    counts_ref, mask_ref = runner_ref._compute_nwor_acceptance(
+        metadata, sampled.cpu(), return_mask=True
+    )
+
+    runner_graph = GPUModelRunner.__new__(GPUModelRunner)
+    runner_graph._scv_mode = "graph"
+    runner_graph._scv_capture_available = True
+    runner_graph._scv_graph_cache = {}
+    runner_graph._scv_graph_failures = {}
+    counts_graph, mask_graph = runner_graph._compute_nwor_acceptance(
+        metadata, sampled, return_mask=True
+    )
+
+    assert counts_graph == counts_ref
+    assert torch.equal(mask_graph.cpu(), mask_ref.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_scv_graph_different_cu_patterns():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._scv_mode = "graph"
+    runner._scv_capture_available = True
+    runner._scv_graph_cache = {}
+    runner._scv_graph_failures = {}
+
+    metadata1 = _make_metadata([10, 20, 30, 40], [4])
+    sampled1 = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.int32, device="cuda")
+    runner._compute_nwor_acceptance(metadata1, sampled1, return_mask=True)
+
+    metadata2 = _make_metadata([10, 20, 30, 40], [2, 2])
+    sampled2 = torch.tensor(
+        [[10, 20, 50], [30, 40, 60]], dtype=torch.int32, device="cuda"
+    )
+    runner._compute_nwor_acceptance(metadata2, sampled2, return_mask=True)
+
+    assert len(runner._scv_graph_cache) == 2
+
+
 def test_commit_failure_triggers_fallback_metrics():
     manager = DeferredWriteManager()
     assert manager.begin_window([1])
