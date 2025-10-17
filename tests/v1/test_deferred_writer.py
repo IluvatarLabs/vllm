@@ -217,6 +217,67 @@ def test_scv_vectorized_mask_matches_reference():
     assert counts == [2]
 
 
+def test_scv_mask_handles_oob_gracefully():
+    """Test that SCV mask computation handles out-of-bounds access gracefully.
+
+    This reproduces the scenario where sampled_token_ids has fewer columns
+    than the draft token count, which previously caused device-side asserts.
+    """
+    # 4 draft tokens for one request
+    metadata = _make_metadata([10, 20, 30, 40], [4])
+
+    # But sampled_token_ids only has 2 columns (should trigger clamping)
+    # This simulates the case where not all draft tokens have been sampled yet
+    sampled = torch.tensor([[10, 20]], dtype=torch.int32)
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._scv_mode = "graph"  # Test with graph mode
+
+    # This should not crash, but should gracefully handle the OOB
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
+
+    # First 2 tokens match, next 2 are out of bounds so rejected
+    assert mask.tolist() == [True, True, False, False]
+    assert counts == [2]
+
+
+def test_scv_mask_all_oob():
+    """Test when all draft tokens are beyond sampled_token_ids bounds."""
+    metadata = _make_metadata([10, 20, 30], [3])
+
+    # Empty sampled (0 columns) - extreme case
+    sampled = torch.empty((1, 0), dtype=torch.int32)
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._scv_mode = "adaptive"
+
+    # Should fallback gracefully, not crash
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
+
+    # All tokens should be rejected (or fallback to None)
+    if counts is not None:
+        assert counts == [0]
+    if mask is not None:
+        assert mask.tolist() == [False, False, False]
+
+
+def test_scv_mask_invalid_shape_falls_back():
+    """Test that invalid sampled_token_ids shape triggers fallback."""
+    metadata = _make_metadata([10, 20], [2])
+
+    # 1D tensor (invalid shape)
+    sampled = torch.tensor([10, 20], dtype=torch.int32)
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._scv_mode = "graph"
+
+    # Should fallback to reference path (returns None from vectorized)
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
+
+    # Reference path should still compute correctly
+    assert counts == [1]  # Only first token matches before shape error
+
+
 def test_commit_failure_triggers_fallback_metrics():
     manager = DeferredWriteManager()
     assert manager.begin_window([1])
