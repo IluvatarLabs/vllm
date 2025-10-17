@@ -174,6 +174,30 @@ def _parse_debug_flag(env_name: str) -> bool:
     value = value.strip().lower()
     return value in {"1", "true", "yes", "on"}
 
+
+def _probe_scv_capture(enabled_mode: str, device: torch.device, scv_debug: bool) -> bool:
+    if enabled_mode != "graph":
+        return True
+    if not torch.cuda.is_available():
+        if scv_debug:
+            logger.warning(
+                "SCV: CUDA graphs unavailable on this device; using vectorized path."
+            )
+        return False
+    try:
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            torch.empty(0, device=device)
+        return True
+    except RuntimeError as exc:
+        if scv_debug:
+            logger.warning(
+                "SCV: Unable to initialize CUDA graph capture (%s); using vectorized path.",
+                exc,
+            )
+        return False
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -521,6 +545,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._latest_nwor_window_metrics: dict[str, int | str] | None = None
         self._scv_mode = envs.VLLM_SCV_MODE.lower()
         self._nwor_debug = _parse_debug_flag("VLLM_NWOR_DEBUG")
+        self._scv_debug = _parse_debug_flag("VLLM_SCV_DEBUG")
+
+        self._scv_capture_available = _probe_scv_capture(
+            self._scv_mode, device, self._scv_debug
+        )
 
         # Log NWOR/SCV configuration on init
         if self.speculative_config:
@@ -544,7 +573,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self._scv_mode not in ("off", "graph", "adaptive"):
             logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
             self._scv_mode = "off"
+        if self._scv_mode == "graph" and not getattr(self, "_scv_capture_available", True):
+            if self._scv_debug:
+                logger.debug(
+                    "SCV: Graph capture unavailable; falling back to vectorized acceptance."
+                )
         return self._scv_mode != "off"
+
+    def _handle_scv_graph_failure(self, reason: str) -> None:
+        if self._scv_capture_available and (self._scv_debug or self._nwor_debug):
+            logger.warning(
+                "SCV: disabling CUDA graph capture (%s); using vectorized acceptance path.",
+                reason,
+            )
+        self._scv_capture_available = False
+        self._scv_graph_executor = None
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2537,18 +2580,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         cu = spec_decode_metadata.cu_num_draft_tokens.to(device=device)
 
-        if hasattr(self, "_scv_mode") and self._scv_mode == "graph":
+        if self._scv_mode == "graph" and self._scv_capture_available:
             executor = getattr(self, "_scv_graph_executor", None)
             if executor is None:
                 executor = SCVGraphExecutor(device)
                 self._scv_graph_executor = executor
-            mask = executor.run(
-                spec_decode_metadata, sampled_token_ids, total_tokens
-            )
-            if mask is not None:
-                return mask
+            try:
+                mask = executor.run(
+                    spec_decode_metadata, sampled_token_ids, total_tokens
+                )
+            except RuntimeError as exc:
+                self._handle_scv_graph_failure(str(exc))
+            else:
+                if mask is not None:
+                    return mask
+                if not executor.enabled:
+                    self._handle_scv_graph_failure("executor disabled")
 
-        if hasattr(self, "_scv_mode") and self._scv_mode == "adaptive":
+        if self._scv_mode == "adaptive":
             mask = self._scv_compute_mask(
                 draft_ids,
                 num_draft_tensor,
