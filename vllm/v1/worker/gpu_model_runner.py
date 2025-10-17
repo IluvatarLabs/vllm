@@ -546,6 +546,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._scv_mode = envs.VLLM_SCV_MODE.lower()
         self._nwor_debug = _parse_debug_flag("VLLM_NWOR_DEBUG")
         self._scv_debug = _parse_debug_flag("VLLM_SCV_DEBUG")
+        self._scv_profile = _parse_debug_flag("VLLM_SCV_PROFILE")
 
         self._scv_capture_available = _probe_scv_capture(
             self._scv_mode, device, self._scv_debug
@@ -2598,7 +2599,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self._handle_scv_graph_failure("executor disabled")
 
         if self._scv_mode == "adaptive":
-            mask = self._scv_compute_mask(
+            mask = self._profiled_scv_mask(
                 draft_ids,
                 num_draft_tensor,
                 cu,
@@ -2609,7 +2610,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._scv_update_controller(spec_decode_metadata, mask)
             return mask
 
-        mask = self._scv_compute_mask(
+        mask = self._profiled_scv_mask(
             draft_ids,
             num_draft_tensor,
             cu,
@@ -2618,6 +2619,38 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             total_tokens,
         )
         return mask
+
+    def _profiled_scv_mask(
+        self,
+        draft_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        max_spec_len: int,
+        total_tokens: int,
+    ) -> torch.Tensor:
+        use_nvtx = (
+            self._scv_profile
+            and torch.cuda.is_available()
+            and hasattr(torch.cuda, "nvtx")
+        )
+        if use_nvtx:
+            try:
+                torch.cuda.nvtx.range_push("scv_compute_mask")
+            except RuntimeError:
+                use_nvtx = False
+        try:
+            return self._scv_compute_mask(
+                draft_ids,
+                num_draft_tokens,
+                cu_num_draft_tokens,
+                sampled_token_ids,
+                max_spec_len,
+                total_tokens,
+            )
+        finally:
+            if use_nvtx:
+                torch.cuda.nvtx.range_pop()
 
     @staticmethod
     def _scv_compute_mask(
