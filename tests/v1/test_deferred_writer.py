@@ -26,6 +26,21 @@ def _make_metadata(draft_token_ids: list[int], per_request: list[int]) -> SpecDe
     )
 
 
+def _make_mock_runner(scv_mode="off"):
+    """Create a minimal GPUModelRunner for testing.
+
+    Bypasses __init__ but sets required attributes for SCV/NWOR tests.
+    """
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._scv_mode = scv_mode
+    runner._scv_debug = False  # Required by _scv_enabled()
+    runner._scv_capture_available = True  # For graph mode checks
+    runner._scv_graph_executor = None  # For graph capture
+    runner.speculative_config = None  # For NWOR tests
+    runner._deferred_write_manager = DeferredWriteManager()
+    return runner
+
+
 def test_deferred_manager_commit_partial_acceptance():
     manager = DeferredWriteManager()
     assert manager.begin_window([2])
@@ -127,7 +142,7 @@ def test_build_acceptance_mask_matches_expected():
         dtype=torch.int32,
     )
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner = _make_mock_runner(scv_mode="off")
     counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
     expected = torch.tensor([True, False, True], dtype=torch.bool)
     assert torch.equal(mask.cpu(), expected)
@@ -137,9 +152,8 @@ def test_build_acceptance_mask_matches_expected():
 def test_nwor_disabled_env(monkeypatch):
     monkeypatch.setenv("VLLM_DISABLE_NWOR", "1")
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.speculative_config = object()
-    runner._deferred_write_manager = DeferredWriteManager()
+    runner = _make_mock_runner(scv_mode="off")
+    runner.speculative_config = object()  # Override to enable NWOR path
 
     metadata = _make_metadata([1, 2], [2])
     runner._maybe_begin_nwor_window(metadata)
@@ -209,8 +223,7 @@ def test_scv_vectorized_mask_matches_reference():
     metadata = _make_metadata([1, 2, 3, 4], [4])
     sampled = torch.tensor([[1, 2, 0, 4]], dtype=torch.int32)
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner._scv_mode = "adaptive"
+    runner = _make_mock_runner(scv_mode="adaptive")
 
     counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
     assert mask.tolist() == [True, True, False, False]
@@ -230,8 +243,7 @@ def test_scv_mask_handles_oob_gracefully():
     # This simulates the case where not all draft tokens have been sampled yet
     sampled = torch.tensor([[10, 20]], dtype=torch.int32)
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner._scv_mode = "graph"  # Test with graph mode
+    runner = _make_mock_runner(scv_mode="graph")
 
     # This should not crash, but should gracefully handle the OOB
     counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
@@ -248,8 +260,7 @@ def test_scv_mask_all_oob():
     # Empty sampled (0 columns) - extreme case
     sampled = torch.empty((1, 0), dtype=torch.int32)
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner._scv_mode = "adaptive"
+    runner = _make_mock_runner(scv_mode="adaptive")
 
     # Should fallback gracefully, not crash
     counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
@@ -268,8 +279,7 @@ def test_scv_mask_invalid_shape_falls_back():
     # 1D tensor (invalid shape)
     sampled = torch.tensor([10, 20], dtype=torch.int32)
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner._scv_mode = "graph"
+    runner = _make_mock_runner(scv_mode="graph")
 
     # Should fallback to reference path (returns None from vectorized)
     counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
