@@ -29,7 +29,7 @@ from datasets import load_dataset
 
 from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter as MetricCounter, Gauge as MetricGauge
-from vllm.v1.metrics.reader import Vector as MetricVector, get_metrics_snapshot
+from vllm.v1.metrics.reader import Vector as MetricVector
 
 
 DEFAULT_TARGET_MODEL = os.getenv(
@@ -152,6 +152,8 @@ def build_engine(config: RunConfig) -> LLM:
         "model": config.target_model,
         "tensor_parallel_size": config.tensor_parallel_size,
         "speculative_config": speculative_config,
+        # Enable Prometheus stats so NWOR metrics appear in microbench output.
+        "disable_log_stats": False,
     }
     if config.max_model_len is not None:
         llm_kwargs["max_model_len"] = config.max_model_len
@@ -196,9 +198,19 @@ def run_batch(
     }
 
 
-def snapshot_metrics() -> dict[str, float | list[int]]:
+def snapshot_metrics(engine: LLM | None = None) -> dict[str, float | list[int]]:
     totals: dict[str, float | list[int]] = defaultdict(float)
-    for metric in get_metrics_snapshot():
+    metrics = engine.get_metrics() if engine is not None else []
+    if engine is None:
+        # Fallback path if an engine handle is not available.
+        try:
+            from vllm.v1.metrics.reader import get_metrics_snapshot  # type: ignore
+        except ImportError:
+            metrics = []
+        else:
+            metrics = get_metrics_snapshot()
+
+    for metric in metrics:
         if isinstance(metric, MetricCounter):
             totals[metric.name] += metric.value
         elif isinstance(metric, MetricGauge):
@@ -248,7 +260,7 @@ def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tu
                 prompt_offset += config.num_requests
                 run_batch(engine, warm_prompts, config, nwor_mode, -1, scv_mode)
 
-            metrics_before = snapshot_metrics()
+            metrics_before = snapshot_metrics(engine)
 
             for batch_idx in range(config.batches):
                 start = prompt_offset + batch_idx * config.num_requests
@@ -259,7 +271,7 @@ def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tu
                 )
                 results.append(result)
 
-            metrics_after = snapshot_metrics()
+            metrics_after = snapshot_metrics(engine)
             delta = diff_metrics(metrics_after, metrics_before)
             metrics_delta[(scv_mode, nwor_mode)] = delta
 
