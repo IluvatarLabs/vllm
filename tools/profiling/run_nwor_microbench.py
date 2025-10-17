@@ -402,8 +402,18 @@ def summarize_results(
             p95 = p50
 
         metrics = metrics_delta.get((scv_mode, nwor_mode), {})
-        committed = int(metrics.get("vllm:nwor_committed_tokens", 0))
-        rejected = int(metrics.get("vllm:nwor_rejected_tokens", 0))
+        committed = int(
+            metrics.get(
+                "vllm:nwor_committed_tokens",
+                metrics.get("vllm:nwor_committed_tokens_total", 0),
+            )
+        )
+        rejected = int(
+            metrics.get(
+                "vllm:nwor_rejected_tokens",
+                metrics.get("vllm:nwor_rejected_tokens_total", 0),
+            )
+        )
         staged = committed + rejected
         writes_saved_pct = (
             (1 - committed / staged) * 100.0 if staged > 0 else 0.0
