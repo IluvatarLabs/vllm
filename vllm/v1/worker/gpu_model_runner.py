@@ -2629,16 +2629,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         max_spec_len: int,
         total_tokens: int,
     ) -> torch.Tensor:
-        use_nvtx = (
-            self._scv_profile
-            and torch.cuda.is_available()
-            and hasattr(torch.cuda, "nvtx")
-        )
-        if use_nvtx:
+        use_nvtx = False
+        nvtx_mod = None
+        if self._scv_profile and torch.cuda.is_available():
             try:
-                torch.cuda.nvtx.range_push("scv_compute_mask")
-            except RuntimeError:
-                use_nvtx = False
+                from torch.cuda import nvtx as nvtx_mod  # type: ignore
+            except (ImportError, AttributeError):
+                nvtx_mod = None
+            if nvtx_mod is not None:
+                try:
+                    nvtx_mod.range_push("scv_compute_mask")
+                    use_nvtx = True
+                except RuntimeError:
+                    use_nvtx = False
         try:
             return self._scv_compute_mask(
                 draft_ids,
@@ -2650,7 +2653,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         finally:
             if use_nvtx:
-                torch.cuda.nvtx.range_pop()
+                try:
+                    nvtx_mod.range_pop()  # type: ignore[union-attr]
+                except RuntimeError:
+                    pass
 
     @staticmethod
     def _scv_compute_mask(
