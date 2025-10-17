@@ -511,6 +511,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._deferred_write_manager = DeferredWriteManager(mode=envs.VLLM_NWOR_MODE)
         self._latest_nwor_window_metrics: dict[str, int | str] | None = None
         self._scv_mode = envs.VLLM_SCV_MODE.lower()
+        self._nwor_debug = bool(int(os.getenv("VLLM_NWOR_DEBUG", "0")))
+
+        # Log NWOR/SCV configuration on init
+        if self.speculative_config:
+            logger.info(
+                "Spec decode enabled: NWOR_MODE=%s, SCV_MODE=%s, NWOR_DEBUG=%s",
+                envs.VLLM_NWOR_MODE, self._scv_mode, self._nwor_debug
+            )
         self._scv_graph_executor: SCVGraphExecutor | None = None
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
@@ -2262,6 +2270,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         set_global_deferred_manager(None)
 
         if envs.VLLM_DISABLE_NWOR:
+            if self._nwor_debug:
+                logger.debug("NWOR: Disabled via VLLM_DISABLE_NWOR")
             self._deferred_write_manager.finish_step()
             self._latest_nwor_window_metrics = None
             return
@@ -2269,19 +2279,39 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._deferred_write_manager.set_mode(envs.VLLM_NWOR_MODE)
         self._latest_nwor_window_metrics = None
 
-        if self._deferred_write_manager.get_mode() != "stage":
+        current_mode = self._deferred_write_manager.get_mode()
+        if current_mode != "stage":
+            if self._nwor_debug:
+                logger.debug("NWOR: Mode is '%s', not 'stage'. Skipping window.", current_mode)
             self._deferred_write_manager.finish_step()
             return
 
-        if self.speculative_config is None or spec_decode_metadata is None:
+        if self.speculative_config is None:
+            if self._nwor_debug:
+                logger.debug("NWOR: No speculative_config, skipping window")
+            return
+
+        if spec_decode_metadata is None:
+            if self._nwor_debug:
+                logger.debug("NWOR: No spec_decode_metadata this step, skipping window")
             return
 
         num_draft_tokens = spec_decode_metadata.num_draft_tokens
-        if not num_draft_tokens or sum(int(n) for n in num_draft_tokens) <= 0:
+        total_draft = sum(int(n) for n in num_draft_tokens) if num_draft_tokens else 0
+        if total_draft <= 0:
+            if self._nwor_debug:
+                logger.debug("NWOR: No draft tokens (%s), skipping window", num_draft_tokens)
             return
 
+        if self._nwor_debug:
+            logger.info(
+                "NWOR: Beginning window with %d draft tokens across %d requests",
+                total_draft, len(num_draft_tokens)
+            )
         if self._deferred_write_manager.begin_window(num_draft_tokens):
             set_global_deferred_manager(self._deferred_write_manager)
+            if self._nwor_debug:
+                logger.debug("NWOR: Window active, global manager set")
 
     def _finalize_nwor_window(
         self,
@@ -2290,24 +2320,47 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> None:
         manager = self._deferred_write_manager
         if not manager.window_active:
+            if self._nwor_debug:
+                logger.debug("NWOR: Finalize called but window not active")
             return
 
+        if self._nwor_debug:
+            logger.debug("NWOR: Finalizing window")
         try:
             if spec_decode_metadata is None or sampled_token_ids is None:
+                if self._nwor_debug:
+                    logger.warning(
+                        "NWOR: Missing metadata (spec=%s, sampled=%s), canceling window",
+                        spec_decode_metadata is not None, sampled_token_ids is not None
+                    )
                 manager.cancel_and_flush("missing_spec_metadata")
             else:
                 need_mask = self._scv_enabled()
+                if self._nwor_debug:
+                    logger.debug("NWOR: Computing acceptance (SCV=%s)", need_mask)
                 accepted_counts, _ = self._compute_nwor_acceptance(
                     spec_decode_metadata, sampled_token_ids, return_mask=need_mask
                 )
                 if accepted_counts is None:
+                    if self._nwor_debug:
+                        logger.warning("NWOR: Acceptance computation failed, canceling window")
                     manager.cancel_and_flush("accept_mask_construction_failed")
                 else:
+                    if self._nwor_debug:
+                        total_accepted = sum(accepted_counts)
+                        logger.info(
+                            "NWOR: Committing %d accepted tokens (per-req: %s)",
+                            total_accepted, accepted_counts
+                        )
                     manager.commit(accepted_counts)
-        except ShouldFallback:
+        except ShouldFallback as e:
+            if self._nwor_debug:
+                logger.warning("NWOR: Fallback triggered: %s", e)
             pass
         finally:
             self._latest_nwor_window_metrics = manager.pop_last_window_metrics()
+            if self._nwor_debug and self._latest_nwor_window_metrics:
+                logger.debug("NWOR: Metrics: %s", self._latest_nwor_window_metrics)
             set_global_deferred_manager(None)
 
     def _cleanup_nwor(self) -> None:
