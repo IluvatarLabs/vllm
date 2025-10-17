@@ -1,0 +1,898 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "short",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 6,
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8192,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "off",
+      "stage"
+    ],
+    "scv_modes": [
+      "off",
+      "graph",
+      "adaptive"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/scv_baseline.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "off",
+        "nwor_mode": "off",
+        "batches": 6,
+        "latency_avg_s": 0.596481720606486,
+        "latency_p50_s": 0.6059743165969849,
+        "latency_p95_s": 0.6195879578590393,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 0,
+        "spec_num_draft_tokens": 0,
+        "spec_num_accepted_tokens": 0,
+        "spec_avg_accepted_per_window": 0.0,
+        "spec_acceptance_ratio": 0.0,
+        "ncu_metrics": {}
+      },
+      {
+        "scv_mode": "off",
+        "nwor_mode": "stage",
+        "batches": 6,
+        "latency_avg_s": 0.6082625389099121,
+        "latency_p50_s": 0.6198693513870239,
+        "latency_p95_s": 0.6391527056694031,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 0,
+        "spec_num_draft_tokens": 0,
+        "spec_num_accepted_tokens": 0,
+        "spec_avg_accepted_per_window": 0.0,
+        "spec_acceptance_ratio": 0.0,
+        "ncu_metrics": {}
+      },
+      {
+        "scv_mode": "graph",
+        "nwor_mode": "off",
+        "batches": 6,
+        "latency_avg_s": 0.5933754841486613,
+        "latency_p50_s": 0.6057875156402588,
+        "latency_p95_s": 0.6210640668869019,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 0,
+        "spec_num_draft_tokens": 0,
+        "spec_num_accepted_tokens": 0,
+        "spec_avg_accepted_per_window": 0.0,
+        "spec_acceptance_ratio": 0.0,
+        "ncu_metrics": {}
+      },
+      {
+        "scv_mode": "graph",
+        "nwor_mode": "stage",
+        "batches": 6,
+        "latency_avg_s": 0.6078352928161621,
+        "latency_p50_s": 0.6200778484344482,
+        "latency_p95_s": 0.6373215913772583,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 0,
+        "spec_num_draft_tokens": 0,
+        "spec_num_accepted_tokens": 0,
+        "spec_avg_accepted_per_window": 0.0,
+        "spec_acceptance_ratio": 0.0,
+        "ncu_metrics": {}
+      },
+      {
+        "scv_mode": "adaptive",
+        "nwor_mode": "off",
+        "batches": 6,
+        "latency_avg_s": 0.5916917324066162,
+        "latency_p50_s": 0.6031148433685303,
+        "latency_p95_s": 0.6211876273155212,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 0,
+        "spec_num_draft_tokens": 0,
+        "spec_num_accepted_tokens": 0,
+        "spec_avg_accepted_per_window": 0.0,
+        "spec_acceptance_ratio": 0.0,
+        "ncu_metrics": {}
+      },
+      {
+        "scv_mode": "adaptive",
+        "nwor_mode": "stage",
+        "batches": 6,
+        "latency_avg_s": 0.6123782793680826,
+        "latency_p50_s": 0.6255561113357544,
+        "latency_p95_s": 0.6409227848052979,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 0,
+        "spec_num_draft_tokens": 0,
+        "spec_num_accepted_tokens": 0,
+        "spec_avg_accepted_per_window": 0.0,
+        "spec_acceptance_ratio": 0.0,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.6026914119720459,
+      "outputs": [
+        "  It's not about the amount I spend, it's about the amount I consume. 30 cups a day is not going to help anyone. 30",
+        " \n\nExample use case:\n```bash\ndocker-compose up -d\n```\n\nThis will start the container in detached mode, allowing the container to run in the",
+        " I'll do my best to reformat the text in a more readable way. Please provide the text to be reformatted.\n\n## Step 1: Understand the",
+        " (excellent numerous thanks!)\nComment: \"For the past 15 years, I have been teaching English to students in Russia and even in other countries. I",
+        " \u042d\u0442\u043e \u0432\u0441\u0435 \u0432\u043e\u043f\u0440\u043e\u0441\u044b \u043e\u0442\u0432\u0435\u0442\u0430.\n\n\u041e\u043a\u043e\u043d\u0447\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442: \u042d\u0442\u043e \u0432 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043e\u0442 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0445 \u043f\u043e\u0442\u0440\u0435\u0431\u043d\u043e\u0441\u0442\u0435\u0439 \u0438 preferenc\u0438\u0439 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0441\u0442\u0430.\n\n**\u0421",
+        " How can I assist you today?  \nHere's my profile in brief:\nI'm a volunteer chatbot with a passion for learning and helping others.\nMy strengths",
+        " When X and Y are not independent, we have E(XY)=E(X) E(Y).\nAs we've seen, the linearity property of the expected",
+        " \nA h\u0171t\u0151mben van csirkeh\u00fas, tejf\u00f6l, hagyma, paradicsom, paprika, feh"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 1,
+      "latency_s": 0.6209778785705566,
+      "outputs": [
+        "\ngo to a planetarium show\ngo to an observatory\nbuy a book about the stars\nlearn about the solar system\ngo to a planetarium",
+        " Esto significa que el riesgo de accidente de avi\u00f3n es aproximadamente 1 en cada 17 millones de pasajeros.\n\nAdem\u00e1s, las aer",
+        " original.\n\nRenombrar los files de una carpeta y subcarpeta\n=====================================================\n\nEste script busca todos los archivos en el directorio actual",
+        " But to be honest, I'm a bit old-fashioned when it comes to my relationships. I like to think that there's more to a relationship than just sex",
+        "",
+        " \nIf you have any questions or need help with any of the equipment, please don't hesitate to ask.\n\nHere are some popular astrophotography locations worldwide",
+        " Do you have any other questions about LinkedIn or learning to use it effectively?\n\n**Additional Tips:**\n\n*   **Complete your profile**: Make sure your profile is",
+        "  \n\u041e\u043d \u0442\u0430\u043a\u0436\u0435 \u043f\u0440\u0435\u0434\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0435\u0442 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044e \u043e \u043a\u0443\u043b\u044c\u0442\u0443\u0440\u043d\u043e\u0439 \u0437\u043d\u0430\u0447\u0438\u043c\u043e\u0441\u0442\u0438 \u0431\u0430\u043b\u0438\u0439\u0441\u043a\u043e\u0439 \u043a\u0443\u043b\u0438\u043d\u044b \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u0447\u0435\u0441\u043a\u0438\u0445 \u0441\u043e\u0431\u044b\u0442\u0438\u044f\u0445, \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u044b\u0445 \u0441"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 2,
+      "latency_s": 0.6092572212219238,
+      "outputs": [
+        "BT601\u548cBT709\u90fd\u662f\u4e3b\u8272\u4f53\u989c\u8272\u7a7a\u95f4\uff0c\u4f46\u5b83\u4eec\u7684\u53c2\u6570\u914d\u7f6e\u6709\u6240\u4e0d\u540c\u3002\n\n## Step 1: BT601\u548cBT709\u7684",
+        "  This will help narrow down the search.\nBrian Stelter (born 1981) is an American television journalist and author, best known for being the chief",
+        "\ud83d\udc31\n\u3069\u3093\u306a\u732b\u306e\u8a71\u3092\u3057\u307e\u3059\u304b\uff1f \ud83e\udd14\n\u304a\u305d\u3089\u304f\u3001\u732b\u306e\u751f\u6d3b\u3092\u77e5\u308a\u305f\u3044\u306e\u3067\u3059\u304b\uff1f\u732b",
+        " - \u042d\u0442\u043e \u0440\u0430\u0434\u0438\u0443\u0441\u044b \u043a\u0440\u0443\u0433\u0430, \u0440\u0430\u0434\u0438\u0443\u0441 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u0440\u0430\u0432\u0435\u043d 1 \u0438 3. \u0412 \u043f\u0440\u0435\u0434\u0438\u0441\u043b\u043e\u0432\u0438\u0438 \u043e\u043d \u0443\u043f\u043e\u043c\u0438\u043d\u0430\u0435\u0442, \u0447\u0442\u043e \"\u0432 \u0418",
+        ", and punctuation\n\nHere's an example\n```\nAuthorization: Bearer <token>\n```\n\nShould be converted to\n```\nAuthorization: Bearer <",
+        " ### \u76f8\u95dc\u8a9e\n- \u305b\u306b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u305b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u3059\u304d\u3060\uff08\u3059\u304d\uff09\n",
+        "\u3042\u306a\u305f\u304c\u53d7\u3051\u305f\u8cde\u306f\u3069\u3093\u306a\u3082\u306e\u3067\u3059\u304b\uff1f\n\uff08\u9078\u3070\u308c\u305f\u4eba\u306b\u3001\u500b\u4eba\u7684\u306a\u8cea\u554f\u3092\u559c\u3070\u308c\u308b\u3088\u3046\u306b\u6ce8\u610f\u3059\u308b\u3053\u3068",
+        " Los efectos pueden variar dependiendo de la edad de inicio y la frecuencia de los ejercicios, pero aqu\u00ed hay una gu\u00eda general de las"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 3,
+      "latency_s": 0.5849685668945312,
+      "outputs": [
+        " En fin, el sexy se relaciona con el instintos sexuales mientras que la elegancia se relaciona con el aspecto est\u00e9tico. Si se relacion",
+        ".\n\u6700\u7d42\u7684\u306a\u7b54\u3048\u306f\u300c\u304a\u3064\u308a\u3092\u5dee\u3057\u4e0a\u3052\u307e\u3059\u300d\u3067\u3059\u3002",
+        " Si se considera que los intentos de asesinato son inaceptables, entonces la frase se convierte en una declaraci\u00f3n de intenci\u00f3n que con",
+        " \u00bfO tal vez puedes explicarme qu\u00e9 hace que este sea divertido para los hispanohablantes?\nEl chiste es: \u00bfPor qu\u00e9 los car",
+        " Piaget propuso que el desarrollo cognitivo se basa en la interacci\u00f3n entre el individuo y su entorno, y que el conocimiento se",
+        " \n\nUn psic\u00f3pata puede ser dif\u00edcil de reconocer, ya que a menudo se disfrazan como personas normales y pueden tener una",
+        " This will help ensure that your EIN remains valid and active.\n\nHere's the updated response:\n\n**Obtaining an EIN for a New Business: A",
+        ""
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 4,
+      "latency_s": 0.5455770492553711,
+      "outputs": [
+        " The second part of the response should be a summary of the experiment's findings.\n\n## Step 1: Understand the context of RNA's function\nIn the context",
+        " para Windows 10\n\nAqu\u00ed est\u00e1n algunos de los programas m\u00e1s populares:\n\n1.  **Blender**: Es un programa de dise\u00f1o 3D de",
+        " El Counseling es una forma de terapia donde un profesional con licencia en counseling se establece en un papel de escucha y asesoramiento para ayudar",
+        " and then give me a'thinking of a word that comes to mind as you type the first few letters.\n'thinking of a word... oh...",
+        " -l\n```\n\n(Note: I'll provide the output in the format you specified) \n\n```\ntotal 0\ndrwxr-xr-x ",
+        " Selecciona 3 de ellos como nombres de perro que son apropiados para una aplicaci\u00f3n de escritura personalizada para ni\u00f1os.\n  Dime ",
+        " \n\n\u00a1Hasta la pr\u00f3xima!  (Nota: la respuesta es formal y se centra en proporcionar informaci\u00f3n general sobre el tema)",
+        " My advanced language processing abilities are designed to generate human-like responses to a wide range of topics, including complex and nuanced ones like you've presented.\nSo, I"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 5,
+      "latency_s": 0.6154181957244873,
+      "outputs": [
+        " I was wondering the same thing the other day, and I thought, 'I would be a dolphin!'\n\nDolphins are incredibly intelligent, social creatures that",
+        " for the music industry (production and recording), the best step-by-step plan for achieving a career in the music industry (production and recording) would be:\n1",
+        " \u0438 \u0448\u043e\u043a\u043e\u043b\u0430\u0434\u043e\u043c. \u0422\u043e\u0440\u0442\u0438\u043b\u043b\u0430 \u0441 \u043a\u043b\u0443\u0431\u043d\u0438\u043a\u043e\u0439 \u0438 \u0448\u043e\u043a\u043e\u043b\u0430\u0434\u043e\u043c - \u043a\u043b\u0430\u0441\u0441\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u0434\u0435\u0441\u0435\u0440\u0442, \u043a\u043e\u0442\u043e\u0440\u044b\u0439 \u0432 \u043b\u044e\u0431\u043e\u043c \u0441\u0435\u0437",
+        " \u0412 \u00ab\u041c\u0430\u0441\u0442\u0435\u0440\u0435 \u0438 \u041c\u0430\u0440\u0433\u0430\u0440\u0438\u0442\u0435\u00bb \u0411\u0443\u043b\u0433\u0430\u043a\u043e\u0432 \u043f\u043e\u0434\u0430\u043b \u043f\u043e\u0434 \u0443\u0433\u0440\u043e\u0437\u0443 \u0442\u0440\u0430\u0434\u0438\u0446\u0438\u043e\u043d\u043d\u0443\u044e \u0438\u0441\u0442\u043e\u0440\u0438\u0447\u0435\u0441\u043a\u0443\u044e \u0442\u043e\u0447\u043a\u0443 \u0437\u0440\u0435\u043d\u0438\u044f \u043e \u0436\u0438\u0437\u043d\u0438 \u0418",
+        "  It're never too late to change your mind and write something different, after all.  And so, with a sense of excitement and trepidation,",
+        "  \nLa respuesta correcta es: La frase anterior es falsa.  \n\nLa pregunta indica que la frase anterior es falsa o verdadera. Sin embargo,",
+        " Hypixel \u044f\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u043f\u043e\u043f\u0443\u043b\u044f\u0440\u043d\u044b\u043c \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u043c Minecraft \u0434\u043b\u044f \u0438\u0433\u0440\u043e\u043a\u043e\u0432 \u0432\u0441\u0435\u0445 \u0443\u0440\u043e\u0432\u043d\u0435\u0439, \u0433\u0434\u0435 \u043e\u043d\u0438 \u043c\u043e\u0433\u0443\u0442 \u0441\u043e\u0437\u0434\u0430\u0432\u0430\u0442\u044c, \u0438\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u0442\u044c \u0438 \u0440\u0430\u0437\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u0442\u044c \u0441\u0432\u043e\u0438 \u0441\u043e\u0431\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0435",
+        " \nEscribir\u00e9 la respuesta que me diste y t\u00fa la copiar\u00e1s y luego revisaremos juntos.\n\nLa respuesta que me diste fue:\n"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.620377779006958,
+      "outputs": [
+        "  It's not about the amount I spend, it's about the amount I consume. 30 cups a day is not going to help anyone. 30",
+        " \n\nExample use case:\n```bash\ndocker-compose up -d\n```\n\nThis will start the container in detached mode, allowing the container to run in the",
+        " I'll do my best to reformat the text in a more readable way. Please provide the text to be reformatted.\n\n## Step 1: Understand the",
+        " (excellent numerous thanks!)\nComment: \"For the past 15 years, I have been teaching English to students in Russia and even in other countries. I",
+        " \u042d\u0442\u043e \u0432\u0441\u0435 \u0432\u043e\u043f\u0440\u043e\u0441\u044b \u043e\u0442\u0432\u0435\u0442\u0430.\n\n\u041e\u043a\u043e\u043d\u0447\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442: \u042d\u0442\u043e \u0432 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043e\u0442 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0445 \u043f\u043e\u0442\u0440\u0435\u0431\u043d\u043e\u0441\u0442\u0435\u0439 \u0438 preferenc\u0438\u0439 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0441\u0442\u0430.\n\n**\u0421",
+        " How can I assist you today?  \nHere's my profile in brief:\nI'm a volunteer chatbot with a passion for learning and helping others.\nMy strengths",
+        " When X and Y are not independent, we have E(XY)=E(X) E(Y).\nAs we've seen, the linearity property of the expected",
+        " \nA h\u0171t\u0151mben van csirkeh\u00fas, tejf\u00f6l, hagyma, paradicsom, paprika, feh"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 1,
+      "latency_s": 0.6425774097442627,
+      "outputs": [
+        "\ngo to a planetarium show\ngo to an observatory\nbuy a book about the stars\nlearn about the solar system\ngo to a planetarium",
+        " Esto significa que el riesgo de accidente de avi\u00f3n es aproximadamente 1 en cada 17 millones de pasajeros.\n\nAdem\u00e1s, las aer",
+        " original.\n\nRenombrar los files de una carpeta y subcarpeta\n=====================================================\n\nEste script busca todos los archivos en el directorio actual",
+        " But to be honest, I'm a bit old-fashioned when it comes to my relationships. I like to think that there's more to a relationship than just sex",
+        "",
+        " \nIf you have any questions or need help with any of the equipment, please don't hesitate to ask.\n\nHere are some popular astrophotography locations worldwide",
+        " Do you have any other questions about LinkedIn or learning to use it effectively?\n\n**Additional Tips:**\n\n*   **Complete your profile**: Make sure your profile is",
+        "  \n\u041e\u043d \u0442\u0430\u043a\u0436\u0435 \u043f\u0440\u0435\u0434\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0435\u0442 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044e \u043e \u043a\u0443\u043b\u044c\u0442\u0443\u0440\u043d\u043e\u0439 \u0437\u043d\u0430\u0447\u0438\u043c\u043e\u0441\u0442\u0438 \u0431\u0430\u043b\u0438\u0439\u0441\u043a\u043e\u0439 \u043a\u0443\u043b\u0438\u043d\u044b \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u0447\u0435\u0441\u043a\u0438\u0445 \u0441\u043e\u0431\u044b\u0442\u0438\u044f\u0445, \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u044b\u0445 \u0441"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 2,
+      "latency_s": 0.6288785934448242,
+      "outputs": [
+        "BT601\u548cBT709\u90fd\u662f\u4e3b\u8272\u4f53\u989c\u8272\u7a7a\u95f4\uff0c\u4f46\u5b83\u4eec\u7684\u53c2\u6570\u914d\u7f6e\u6709\u6240\u4e0d\u540c\u3002\n\n## Step 1: BT601\u548cBT709\u7684",
+        "  This will help narrow down the search.\nBrian Stelter (born 1981) is an American television journalist and author, best known for being the chief",
+        "\ud83d\udc31\n\u3069\u3093\u306a\u732b\u306e\u8a71\u3092\u3057\u307e\u3059\u304b\uff1f \ud83e\udd14\n\u304a\u305d\u3089\u304f\u3001\u732b\u306e\u751f\u6d3b\u3092\u77e5\u308a\u305f\u3044\u306e\u3067\u3059\u304b\uff1f\u732b",
+        " - \u042d\u0442\u043e \u0440\u0430\u0434\u0438\u0443\u0441\u044b \u043a\u0440\u0443\u0433\u0430, \u0440\u0430\u0434\u0438\u0443\u0441 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u0440\u0430\u0432\u0435\u043d 1 \u0438 3. \u0412 \u043f\u0440\u0435\u0434\u0438\u0441\u043b\u043e\u0432\u0438\u0438 \u043e\u043d \u0443\u043f\u043e\u043c\u0438\u043d\u0430\u0435\u0442, \u0447\u0442\u043e \"\u0432 \u0418",
+        ", and punctuation\n\nHere's an example\n```\nAuthorization: Bearer <token>\n```\n\nShould be converted to\n```\nAuthorization: Bearer <",
+        " ### \u76f8\u95dc\u8a9e\n- \u305b\u306b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u305b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u3059\u304d\u3060\uff08\u3059\u304d\uff09\n",
+        "\u3042\u306a\u305f\u304c\u53d7\u3051\u305f\u8cde\u306f\u3069\u3093\u306a\u3082\u306e\u3067\u3059\u304b\uff1f\n\uff08\u9078\u3070\u308c\u305f\u4eba\u306b\u3001\u500b\u4eba\u7684\u306a\u8cea\u554f\u3092\u559c\u3070\u308c\u308b\u3088\u3046\u306b\u6ce8\u610f\u3059\u308b\u3053\u3068",
+        " Los efectos pueden variar dependiendo de la edad de inicio y la frecuencia de los ejercicios, pero aqu\u00ed hay una gu\u00eda general de las"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 3,
+      "latency_s": 0.6193609237670898,
+      "outputs": [
+        " En fin, el sexy se relaciona con el instintos sexuales mientras que la elegancia se relaciona con el aspecto est\u00e9tico. Si se relacion",
+        "\u30d4 Rates \u306e\u3088\u3046\u306a\u30b3\u30e9\u30dc\u30ec\u30fc\u30b7\u30e7\u30f3\u3092\u3057\u3066\u307f\u307e\u305b\u3093\u304b\uff1f\u307e\u305f\u306f\u3001\u4e00\u822c\u7684\u306a\u30b3\u30df\u30e5\u30cb\u30b1\u30fc\u30b7\u30e7\u30f3\u3067\u3082\u3001",
+        " Si se considera que los intentos de asesinato son inaceptables, entonces la frase se convierte en una declaraci\u00f3n de intenci\u00f3n de realizar",
+        " \u00bfO tal vez puedes explicarme qu\u00e9 hace que este sea divertido para los hispanohablantes?\nEl chiste es: \u00bfPor qu\u00e9 el per",
+        " Piaget propuso que el desarrollo cognitivo se basa en la interacci\u00f3n entre el individuo y su entorno, y que el conocimiento se",
+        " \n\nUn psic\u00f3pata puede ser dif\u00edcil de reconocer, ya que a menudo se disfrazan como personas normales.",
+        " This will help ensure that your EIN remains valid and active.\n\nHere's the updated response:\n\n**Obtaining an EIN for a New Business: A",
+        ""
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 4,
+      "latency_s": 0.5363466739654541,
+      "outputs": [
+        " In other words, what role does RNA play in the process of becoming a functional protein?\nIn eukaryotic cells, the function of RNA is to serve",
+        " para Windows\n\n1.  Blender\n2.  Tinkercad\n3.  Fusion 360\n4.  SketchUp\n5. ",
+        " El consejero es un profesional que ayuda a las personas a resolver problemas y a encontrar nuevas formas de abordar situaciones. En el caso de los",
+        " and then, after a few minutes, I'll ask me a sentence from the random letters that you've generated. and you'll tell you if it's correct",
+        "\n    WARNING: You are attempting to list the contents of a directory that is currently in use.\n    Please wait for the computer to become available.\n\n    After",
+        " (Diez nombres de perro)\nEl perro es un animal que puede ser terrier, pinscher, presa, chihuahua, mal",
+        "",
+        " I can assist with a wide range of topics and provide information on a vast array of subjects, from science and history to entertainment and culture. But I'm afraid"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 5,
+      "latency_s": 0.6020338535308838,
+      "outputs": [
+        " And why?\nI think I would be a fox. Here's why:\n\n1. **Curiosity and intelligence**: Foxes are known for their intelligence and curious",
+        " start with the music production software I will be using to start the learning experience.\n\n## Step 1: Choose Music Production Software\nSelect a digital audio workstation (",
+        " \u0438 \u0441\u043d\u0456\u0433\u043e\u043c: \u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442",
+        " \u00ab\u0415\u0440\u0448\u0430\u043b\u0430\u0438\u043c\u0441\u043a\u0438\u0435\u00bb \u0442\u0430\u043a\u0436\u0435 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u0442 \u044d\u043b\u0435\u043c\u0435\u043d\u0442\u044b \u0444\u0435\u0439\u043b\u0435\u0442\u043e\u043d\u0430, \u0433\u0434\u0435 \u043f\u043e\u0432\u0435\u0441\u0442\u0432\u043e\u0432\u0430\u043d\u0438\u0435 \u043e\u0442\u0440\u0430\u0436\u0430\u0435\u0442 \u0438 \u043f\u0430\u0440\u043e\u0434\u0438\u0438 \u043d\u0430 \u0440\u0430\u0437\u043b\u0438\u0447\u043d\u044b\u0445 \u0438\u0441\u0442\u043e\u0440",
+        " a fantasy world with magical creatures, such as unicorns, dragons, and phoenixes. with royalty and nobility\nIn the Princess of Light, a young",
+        " : La frase anterior fue falsa. Esta oracion es falsa. La frase anterior es Falsa O verdadera? : La frase anterior fue verdadera",
+        " | Minecraft Forum\n\u0421\u0435\u0440\u0432\u0435\u0440 Hypixel - \u044d\u0442\u043e \u043c\u043d\u043e\u0433\u043e\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u0430\u044f \u0438\u0433\u0440\u043e\u0432\u0430\u044f \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430, \u0441\u043e\u0437\u0434\u0430\u043d\u043d\u0430\u044f \u0434\u043b\u044f \u0438\u0433\u0440\u044b Minecraft. \u041e\u043d \u043f\u0440\u0435\u0434\u043d",
+        " tng\nAqu\u00ed est\u00e1 mi respuesta:\n\"Un animal raro,\nCon orejas largas,\nLlaman a la persona rara,\nCon un"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 0,
+      "latency_s": 0.6056628227233887,
+      "outputs": [
+        "  It's not about the amount I spend, it's about the amount I consume. 30 cups a day is not going to help anyone. 30",
+        " \n\nExample use case:\n```bash\ndocker-compose up -d\n```\n\nThis will start the container in detached mode, allowing the container to run in the",
+        " I'll do my best to reformat the text in a more readable way. Please provide the text to be reformatted.\n\n## Step 1: Understand the",
+        " (excellent numerous thanks!)\nComment: \"For the past 15 years, I have been teaching English to students in Russia and even in other countries. I",
+        " \u042d\u0442\u043e \u0432\u0441\u0435 \u0432\u043e\u043f\u0440\u043e\u0441\u044b \u043e\u0442\u0432\u0435\u0442\u0430.\n\n\u041e\u043a\u043e\u043d\u0447\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442: \u042d\u0442\u043e \u0432 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043e\u0442 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0445 \u043f\u043e\u0442\u0440\u0435\u0431\u043d\u043e\u0441\u0442\u0435\u0439 \u0438 preferenc\u0438\u0439 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0441\u0442\u0430.\n\n**\u0421",
+        " How can I assist you today?  \nHere's my profile in brief:\nI'm a volunteer chatbot with a passion for learning and helping others.\nMy strengths",
+        " When X and Y are not independent, we have E(XY)=E(X) E(Y).\nAs we've seen, the linearity property of the expected",
+        " \nA h\u0171t\u0151mben van csirkeh\u00fas, tejf\u00f6l, hagyma, paradicsom, paprika, feh"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 1,
+      "latency_s": 0.6234843730926514,
+      "outputs": [
+        "\ngo to a planetarium show\ngo to an observatory\nbuy a book about the stars\nlearn about the solar system\ngo to a planetarium",
+        " Esto significa que el riesgo de accidente de avi\u00f3n es aproximadamente 1 en cada 17 millones de pasajeros.\n\nAdem\u00e1s, las aer",
+        " original.\n\nRenombrar los files de una carpeta y subcarpeta\n=====================================================\n\nEste script busca todos los archivos en el directorio actual",
+        " But to be honest, I'm a bit old-fashioned when it comes to my relationships. I like to think that there's more to a relationship than just sex",
+        "",
+        " \nIf you have any questions or need help with any of the equipment, please don't hesitate to ask.\n\nHere are some popular astrophotography locations worldwide",
+        " Do you have any other questions about LinkedIn or learning to use it effectively?\n\n**Additional Tips:**\n\n*   **Complete your profile**: Make sure your profile is",
+        "  \n\u041e\u043d \u0442\u0430\u043a\u0436\u0435 \u043f\u0440\u0435\u0434\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0435\u0442 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044e \u043e \u043a\u0443\u043b\u044c\u0442\u0443\u0440\u043d\u043e\u0439 \u0437\u043d\u0430\u0447\u0438\u043c\u043e\u0441\u0442\u0438 \u0431\u0430\u043b\u0438\u0439\u0441\u043a\u043e\u0439 \u043a\u0443\u043b\u0438\u043d\u044b \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u0447\u0435\u0441\u043a\u0438\u0445 \u0441\u043e\u0431\u044b\u0442\u0438\u044f\u0445, \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u044b\u0445 \u0441"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 2,
+      "latency_s": 0.6138031482696533,
+      "outputs": [
+        "BT601\u548cBT709\u90fd\u662f\u4e3b\u8272\u4f53\u989c\u8272\u7a7a\u95f4\uff0c\u4f46\u5b83\u4eec\u7684\u53c2\u6570\u914d\u7f6e\u6709\u6240\u4e0d\u540c\u3002\n\n## Step 1: BT601\u548cBT709\u7684",
+        "  This will help narrow down the search.\nBrian Stelter (born 1981) is an American television journalist and author, best known for being the chief",
+        "\ud83d\udc31\n\u3069\u3093\u306a\u732b\u306e\u8a71\u3092\u3057\u307e\u3059\u304b\uff1f \ud83e\udd14\n\u304a\u305d\u3089\u304f\u3001\u732b\u306e\u751f\u6d3b\u3092\u77e5\u308a\u305f\u3044\u306e\u3067\u3059\u304b\uff1f\u732b",
+        " - \u042d\u0442\u043e \u0440\u0430\u0434\u0438\u0443\u0441\u044b \u043a\u0440\u0443\u0433\u0430, \u0440\u0430\u0434\u0438\u0443\u0441 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u0440\u0430\u0432\u0435\u043d 1 \u0438 3. \u0412 \u043f\u0440\u0435\u0434\u0438\u0441\u043b\u043e\u0432\u0438\u0438 \u043e\u043d \u0443\u043f\u043e\u043c\u0438\u043d\u0430\u0435\u0442, \u0447\u0442\u043e \"\u0432 \u0418",
+        ", and punctuation\n\nHere's an example\n```\nAuthorization: Bearer <token>\n```\n\nShould be converted to\n```\nAuthorization: Bearer <",
+        " ### \u76f8\u95dc\u8a9e\n- \u305b\u306b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u305b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u3059\u304d\u3060\uff08\u3059\u304d\uff09\n",
+        "\u3042\u306a\u305f\u304c\u53d7\u3051\u305f\u8cde\u306f\u3069\u3093\u306a\u3082\u306e\u3067\u3059\u304b\uff1f\n\uff08\u9078\u3070\u308c\u305f\u4eba\u306b\u3001\u500b\u4eba\u7684\u306a\u8cea\u554f\u3092\u559c\u3070\u308c\u308b\u3088\u3046\u306b\u6ce8\u610f\u3059\u308b\u3053\u3068",
+        " Los efectos pueden variar dependiendo de la edad de inicio y la frecuencia de los ejercicios, pero aqu\u00ed hay una gu\u00eda general de las"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 3,
+      "latency_s": 0.6059122085571289,
+      "outputs": [
+        " En fin, el sexy se relaciona con el instintos sexuales mientras que la elegancia se relaciona con el aspecto est\u00e9tico. Si se relacion",
+        "\u30d4 Rates \u306e\u3088\u3046\u306a\u30b3\u30e9\u30dc\u30ec\u30fc\u30b7\u30e7\u30f3\u3092\u3057\u3066\u307f\u307e\u305b\u3093\u304b\uff1f\u307e\u305f\u306f\u3001\u4e00\u822c\u7684\u306a\u30b3\u30df\u30e5\u30cb\u30b1\u30fc\u30b7\u30e7\u30f3\u3067\u3082\u3001",
+        " Si se considera que los intentos de asesinato son inaceptables, entonces la frase se convierte en una declaraci\u00f3n de intenci\u00f3n de realizar",
+        " \u00bfO tal vez puedes explicarme qu\u00e9 hace que este sea divertido para los hispanohablantes?\nEl chiste es: \u00bfPor qu\u00e9 el per",
+        " Piaget propuso que el desarrollo cognitivo se basa en la interacci\u00f3n entre el individuo y su entorno, y que el conocimiento se",
+        " \n\nUn psic\u00f3pata puede ser dif\u00edcil de reconocer, ya que a menudo se disfrazan como personas normales.",
+        " This will help ensure that your EIN remains valid and active.\n\nHere's the updated response:\n\n**Obtaining an EIN for a New Business: A",
+        ""
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 4,
+      "latency_s": 0.5246500968933105,
+      "outputs": [
+        " In other words, what role does RNA play in the process of becoming a functional protein?\nIn eukaryotic cells, the function of RNA is to serve",
+        " para Windows\n\n1.  Blender\n2.  Tinkercad\n3.  Fusion 360\n4.  SketchUp\n5. ",
+        " El consejero es un profesional que ayuda a las personas a resolver problemas y a encontrar nuevas formas de abordar situaciones. En el caso de los",
+        " and then, after a few minutes, I'll ask me a sentence from the random letters that you've generated. and you'll tell you if it's correct",
+        "\n    WARNING: You are attempting to list the contents of a directory that is currently in use.\n    Please wait for the computer to become available.\n\n    After",
+        " (Diez nombres de perro)\nEl perro es un animal que puede ser terrier, pinscher, presa, chihuahua, mal",
+        "",
+        " I can assist with a wide range of topics and provide information on a vast array of subjects, from science and history to entertainment and culture. But I'm afraid"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 5,
+      "latency_s": 0.586740255355835,
+      "outputs": [
+        " And why?\nI think I would be a fox. Here's why:\n\n1. **Curiosity and intelligence**: Foxes are known for their intelligence and curious",
+        " start with the music production software I will be using to start the learning experience.\n\n## Step 1: Choose Music Production Software\nSelect a digital audio workstation (",
+        " \u0438 \u0441\u043d\u0456\u0433\u043e\u043c: \u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442",
+        " \u00ab\u0415\u0440\u0448\u0430\u043b\u0430\u0438\u043c\u0441\u043a\u0438\u0435\u00bb \u0442\u0430\u043a\u0436\u0435 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u0442 \u044d\u043b\u0435\u043c\u0435\u043d\u0442\u044b \u0444\u0435\u0439\u043b\u0435\u0442\u043e\u043d\u0430, \u0433\u0434\u0435 \u043f\u043e\u0432\u0435\u0441\u0442\u0432\u043e\u0432\u0430\u043d\u0438\u0435 \u043e\u0442\u0440\u0430\u0436\u0430\u0435\u0442 \u0438 \u043f\u0430\u0440\u043e\u0434\u0438\u0438 \u043d\u0430 \u0440\u0430\u0437\u043b\u0438\u0447\u043d\u044b\u0445 \u0438\u0441\u0442\u043e\u0440",
+        " a fantasy world with magical creatures, such as unicorns, dragons, and phoenixes. with royalty and nobility\nIn the Princess of Light, a young",
+        " : La frase anterior fue falsa. Esta oracion es falsa. La frase anterior es Falsa O verdadera? : La frase anterior fue verdadera",
+        " | Minecraft Forum\n\u0421\u0435\u0440\u0432\u0435\u0440 Hypixel - \u044d\u0442\u043e \u043c\u043d\u043e\u0433\u043e\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u0430\u044f \u0438\u0433\u0440\u043e\u0432\u0430\u044f \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430, \u0441\u043e\u0437\u0434\u0430\u043d\u043d\u0430\u044f \u0434\u043b\u044f \u0438\u0433\u0440\u044b Minecraft. \u041e\u043d \u043f\u0440\u0435\u0434\u043d",
+        " tng\nAqu\u00ed est\u00e1 mi respuesta:\n\"Un animal raro,\nCon orejas largas,\nLlaman a la persona rara,\nCon un"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 0,
+      "latency_s": 0.6204633712768555,
+      "outputs": [
+        "  It's not about the amount I spend, it's about the amount I consume. 30 cups a day is not going to help anyone. 30",
+        " \n\nExample use case:\n```bash\ndocker-compose up -d\n```\n\nThis will start the container in detached mode, allowing the container to run in the",
+        " I'll do my best to reformat the text in a more readable way. Please provide the text to be reformatted.\n\n## Step 1: Understand the",
+        " (excellent numerous thanks!)\nComment: \"For the past 15 years, I have been teaching English to students in Russia and even in other countries. I",
+        " \u042d\u0442\u043e \u0432\u0441\u0435 \u0432\u043e\u043f\u0440\u043e\u0441\u044b \u043e\u0442\u0432\u0435\u0442\u0430.\n\n\u041e\u043a\u043e\u043d\u0447\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442: \u042d\u0442\u043e \u0432 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043e\u0442 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0445 \u043f\u043e\u0442\u0440\u0435\u0431\u043d\u043e\u0441\u0442\u0435\u0439 \u0438 preferenc\u0438\u0439 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0441\u0442\u0430.\n\n**\u0421",
+        " How can I assist you today?  \nHere's my profile in brief:\nI'm a volunteer chatbot with a passion for learning and helping others.\nMy strengths",
+        " When X and Y are not independent, we have E(XY)=E(X) E(Y).\nAs we've seen, the linearity property of the expected",
+        " \nA h\u0171t\u0151mben van csirkeh\u00fas, tejf\u00f6l, hagyma, paradicsom, paprika, feh"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 1,
+      "latency_s": 0.6408586502075195,
+      "outputs": [
+        "\ngo to a planetarium show\ngo to an observatory\nbuy a book about the stars\nlearn about the solar system\ngo to a planetarium",
+        " Esto significa que el riesgo de accidente de avi\u00f3n es aproximadamente 1 en cada 17 millones de pasajeros.\n\nAdem\u00e1s, las aer",
+        " original.\n\nRenombrar los files de una carpeta y subcarpeta\n=====================================================\n\nEste script busca todos los archivos en el directorio actual",
+        " But to be honest, I'm a bit old-fashioned when it comes to my relationships. I like to think that there's more to a relationship than just sex",
+        "",
+        " \nIf you have any questions or need help with any of the equipment, please don't hesitate to ask.\n\nHere are some popular astrophotography locations worldwide",
+        " Do you have any other questions about LinkedIn or learning to use it effectively?\n\n**Additional Tips:**\n\n*   **Complete your profile**: Make sure your profile is",
+        "  \n\u041e\u043d \u0442\u0430\u043a\u0436\u0435 \u043f\u0440\u0435\u0434\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0435\u0442 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044e \u043e \u043a\u0443\u043b\u044c\u0442\u0443\u0440\u043d\u043e\u0439 \u0437\u043d\u0430\u0447\u0438\u043c\u043e\u0441\u0442\u0438 \u0431\u0430\u043b\u0438\u0439\u0441\u043a\u043e\u0439 \u043a\u0443\u043b\u0438\u043d\u044b \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u0447\u0435\u0441\u043a\u0438\u0445 \u0441\u043e\u0431\u044b\u0442\u0438\u044f\u0445, \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u044b\u0445 \u0441"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 2,
+      "latency_s": 0.6267104148864746,
+      "outputs": [
+        "BT601\u548cBT709\u90fd\u662f\u4e3b\u8272\u4f53\u989c\u8272\u7a7a\u95f4\uff0c\u4f46\u5b83\u4eec\u7684\u53c2\u6570\u914d\u7f6e\u6709\u6240\u4e0d\u540c\u3002\n\n## Step 1: BT601\u548cBT709\u7684",
+        "  This will help narrow down the search.\nBrian Stelter (born 1981) is an American television journalist and author, best known for being the chief",
+        "\ud83d\udc31\n\u3069\u3093\u306a\u732b\u306e\u8a71\u3092\u3057\u307e\u3059\u304b\uff1f \ud83e\udd14\n\u304a\u305d\u3089\u304f\u3001\u732b\u306e\u751f\u6d3b\u3092\u77e5\u308a\u305f\u3044\u306e\u3067\u3059\u304b\uff1f\u732b",
+        " - \u042d\u0442\u043e \u0440\u0430\u0434\u0438\u0443\u0441\u044b \u043a\u0440\u0443\u0433\u0430, \u0440\u0430\u0434\u0438\u0443\u0441 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u0440\u0430\u0432\u0435\u043d 1 \u0438 3. \u0412 \u043f\u0440\u0435\u0434\u0438\u0441\u043b\u043e\u0432\u0438\u0438 \u043e\u043d \u0443\u043f\u043e\u043c\u0438\u043d\u0430\u0435\u0442, \u0447\u0442\u043e \"\u0432 \u0418",
+        ", and punctuation\n\nHere's an example\n```\nAuthorization: Bearer <token>\n```\n\nShould be converted to\n```\nAuthorization: Bearer <",
+        " ### \u76f8\u95dc\u8a9e\n- \u305b\u306b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u305b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u3059\u304d\u3060\uff08\u3059\u304d\uff09\n",
+        "\u3042\u306a\u305f\u304c\u53d7\u3051\u305f\u8cde\u306f\u3069\u3093\u306a\u3082\u306e\u3067\u3059\u304b\uff1f\n\uff08\u9078\u3070\u308c\u305f\u4eba\u306b\u3001\u500b\u4eba\u7684\u306a\u8cea\u554f\u3092\u559c\u3070\u308c\u308b\u3088\u3046\u306b\u6ce8\u610f\u3059\u308b\u3053\u3068",
+        " Los efectos pueden variar dependiendo de la edad de inicio y la frecuencia de los ejercicios, pero aqu\u00ed hay una gu\u00eda general de las"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 3,
+      "latency_s": 0.619692325592041,
+      "outputs": [
+        " En fin, el sexy se relaciona con el instintos sexuales mientras que la elegancia se relaciona con el aspecto est\u00e9tico. Si se relacion",
+        "\u30d4 Rates \u306e\u3088\u3046\u306a\u30b3\u30e9\u30dc\u30ec\u30fc\u30b7\u30e7\u30f3\u3092\u3057\u3066\u307f\u307e\u305b\u3093\u304b\uff1f\u307e\u305f\u306f\u3001\u4e00\u822c\u7684\u306a\u30b3\u30df\u30e5\u30cb\u30b1\u30fc\u30b7\u30e7\u30f3\u3067\u3082\u3001",
+        " Si se considera que los intentos de asesinato son inaceptables, entonces la frase se convierte en una declaraci\u00f3n de intenci\u00f3n de realizar",
+        " \u00bfO tal vez puedes explicarme qu\u00e9 hace que este sea divertido para los hispanohablantes?\nEl chiste es: \u00bfPor qu\u00e9 el per",
+        " Piaget propuso que el desarrollo cognitivo se basa en la interacci\u00f3n entre el individuo y su entorno, y que el conocimiento se",
+        " \n\nUn psic\u00f3pata puede ser dif\u00edcil de reconocer, ya que a menudo se disfrazan como personas normales.",
+        " This will help ensure that your EIN remains valid and active.\n\nHere's the updated response:\n\n**Obtaining an EIN for a New Business: A",
+        ""
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 4,
+      "latency_s": 0.5390241146087646,
+      "outputs": [
+        " In other words, what role does RNA play in the process of becoming a functional protein?\nIn eukaryotic cells, the function of RNA is to serve",
+        " para Windows\n\n1.  Blender\n2.  Tinkercad\n3.  Fusion 360\n4.  SketchUp\n5. ",
+        " El consejero es un profesional que ayuda a las personas a resolver problemas y a encontrar nuevas formas de abordar situaciones. En el caso de los",
+        " and then, after a few minutes, I'll ask me a sentence from the random letters that you've generated. and you'll tell you if it's correct",
+        "\n    WARNING: You are attempting to list the contents of a directory that is currently in use.\n    Please wait for the computer to become available.\n\n    After",
+        " (Diez nombres de perro)\nEl perro es un animal que puede ser terrier, pinscher, presa, chihuahua, mal",
+        "",
+        " I can assist with a wide range of topics and provide information on a vast array of subjects, from science and history to entertainment and culture. But I'm afraid"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 5,
+      "latency_s": 0.6002628803253174,
+      "outputs": [
+        " And why?\nI think I would be a fox. Here's why:\n\n1. **Curiosity and intelligence**: Foxes are known for their intelligence and curious",
+        " start with the music production software I will be using to start the learning experience.\n\n## Step 1: Choose Music Production Software\nSelect a digital audio workstation (",
+        " \u0438 \u0441\u043d\u0456\u0433\u043e\u043c: \u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442",
+        " \u00ab\u0415\u0440\u0448\u0430\u043b\u0430\u0438\u043c\u0441\u043a\u0438\u0435\u00bb \u0442\u0430\u043a\u0436\u0435 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u0442 \u044d\u043b\u0435\u043c\u0435\u043d\u0442\u044b \u0444\u0435\u0439\u043b\u0435\u0442\u043e\u043d\u0430, \u0433\u0434\u0435 \u043f\u043e\u0432\u0435\u0441\u0442\u0432\u043e\u0432\u0430\u043d\u0438\u0435 \u043e\u0442\u0440\u0430\u0436\u0430\u0435\u0442 \u0438 \u043f\u0430\u0440\u043e\u0434\u0438\u0438 \u043d\u0430 \u0440\u0430\u0437\u043b\u0438\u0447\u043d\u044b\u0445 \u0438\u0441\u0442\u043e\u0440",
+        " a fantasy world with magical creatures, such as unicorns, dragons, and phoenixes. with royalty and nobility\nIn the Princess of Light, a young",
+        " : La frase anterior fue falsa. Esta oracion es falsa. La frase anterior es Falsa O verdadera? : La frase anterior fue verdadera",
+        " | Minecraft Forum\n\u0421\u0435\u0440\u0432\u0435\u0440 Hypixel - \u044d\u0442\u043e \u043c\u043d\u043e\u0433\u043e\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u0430\u044f \u0438\u0433\u0440\u043e\u0432\u0430\u044f \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430, \u0441\u043e\u0437\u0434\u0430\u043d\u043d\u0430\u044f \u0434\u043b\u044f \u0438\u0433\u0440\u044b Minecraft. \u041e\u043d \u043f\u0440\u0435\u0434\u043d",
+        " tng\nAqu\u00ed est\u00e1 mi respuesta:\n\"Un animal raro,\nCon orejas largas,\nLlaman a la persona rara,\nCon un"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "adaptive",
+      "batch_index": 0,
+      "latency_s": 0.6035110950469971,
+      "outputs": [
+        "  It's not about the amount I spend, it's about the amount I consume. 30 cups a day is not going to help anyone. 30",
+        " \n\nExample use case:\n```bash\ndocker-compose up -d\n```\n\nThis will start the container in detached mode, allowing the container to run in the",
+        " I'll do my best to reformat the text in a more readable way. Please provide the text to be reformatted.\n\n## Step 1: Understand the",
+        " (excellent numerous thanks!)\nComment: \"For the past 15 years, I have been teaching English to students in Russia and even in other countries. I",
+        " \u042d\u0442\u043e \u0432\u0441\u0435 \u0432\u043e\u043f\u0440\u043e\u0441\u044b \u043e\u0442\u0432\u0435\u0442\u0430.\n\n\u041e\u043a\u043e\u043d\u0447\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442: \u042d\u0442\u043e \u0432 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043e\u0442 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0445 \u043f\u043e\u0442\u0440\u0435\u0431\u043d\u043e\u0441\u0442\u0435\u0439 \u0438 preferenc\u0438\u0439 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0441\u0442\u0430.\n\n**\u0421",
+        " How can I assist you today?  \nHere's my profile in brief:\nI'm a volunteer chatbot with a passion for learning and helping others.\nMy strengths",
+        " When X and Y are not independent, we have E(XY)=E(X) E(Y).\nAs we've seen, the linearity property of the expected",
+        " \nA h\u0171t\u0151mben van csirkeh\u00fas, tejf\u00f6l, hagyma, paradicsom, paprika, feh"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "adaptive",
+      "batch_index": 1,
+      "latency_s": 0.6242275238037109,
+      "outputs": [
+        "\ngo to a planetarium show\ngo to an observatory\nbuy a book about the stars\nlearn about the solar system\ngo to a planetarium",
+        " Esto significa que el riesgo de accidente de avi\u00f3n es aproximadamente 1 en cada 17 millones de pasajeros.\n\nAdem\u00e1s, las aer",
+        " original.\n\nRenombrar los files de una carpeta y subcarpeta\n=====================================================\n\nEste script busca todos los archivos en el directorio actual",
+        " But to be honest, I'm a bit old-fashioned when it comes to my relationships. I like to think that there's more to a relationship than just sex",
+        "",
+        " \nIf you have any questions or need help with any of the equipment, please don't hesitate to ask.\n\nHere are some popular astrophotography locations worldwide",
+        " Do you have any other questions about LinkedIn or learning to use it effectively?\n\n**Additional Tips:**\n\n*   **Complete your profile**: Make sure your profile is",
+        "  \n\u041e\u043d \u0442\u0430\u043a\u0436\u0435 \u043f\u0440\u0435\u0434\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0435\u0442 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044e \u043e \u043a\u0443\u043b\u044c\u0442\u0443\u0440\u043d\u043e\u0439 \u0437\u043d\u0430\u0447\u0438\u043c\u043e\u0441\u0442\u0438 \u0431\u0430\u043b\u0438\u0439\u0441\u043a\u043e\u0439 \u043a\u0443\u043b\u0438\u043d\u044b \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u0447\u0435\u0441\u043a\u0438\u0445 \u0441\u043e\u0431\u044b\u0442\u0438\u044f\u0445, \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u044b\u0445 \u0441"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "adaptive",
+      "batch_index": 2,
+      "latency_s": 0.6120679378509521,
+      "outputs": [
+        "BT601\u548cBT709\u90fd\u662f\u4e3b\u8272\u4f53\u989c\u8272\u7a7a\u95f4\uff0c\u4f46\u5b83\u4eec\u7684\u53c2\u6570\u914d\u7f6e\u6709\u6240\u4e0d\u540c\u3002\n\n## Step 1: BT601\u548cBT709\u7684",
+        "  This will help narrow down the search.\nBrian Stelter (born 1981) is an American television journalist and author, best known for being the chief",
+        "\ud83d\udc31\n\u3069\u3093\u306a\u732b\u306e\u8a71\u3092\u3057\u307e\u3059\u304b\uff1f \ud83e\udd14\n\u304a\u305d\u3089\u304f\u3001\u732b\u306e\u751f\u6d3b\u3092\u77e5\u308a\u305f\u3044\u306e\u3067\u3059\u304b\uff1f\u732b",
+        " - \u042d\u0442\u043e \u0440\u0430\u0434\u0438\u0443\u0441\u044b \u043a\u0440\u0443\u0433\u0430, \u0440\u0430\u0434\u0438\u0443\u0441 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u0440\u0430\u0432\u0435\u043d 1 \u0438 3. \u0412 \u043f\u0440\u0435\u0434\u0438\u0441\u043b\u043e\u0432\u0438\u0438 \u043e\u043d \u0443\u043f\u043e\u043c\u0438\u043d\u0430\u0435\u0442, \u0447\u0442\u043e \"\u0432 \u0418",
+        ", and punctuation\n\nHere's an example\n```\nAuthorization: Bearer <token>\n```\n\nShould be converted to\n```\nAuthorization: Bearer <",
+        " ### \u76f8\u95dc\u8a9e\n- \u305b\u306b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u305b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u3059\u304d\u3060\uff08\u3059\u304d\uff09\n",
+        "\u3042\u306a\u305f\u304c\u53d7\u3051\u305f\u8cde\u306f\u3069\u3093\u306a\u3082\u306e\u3067\u3059\u304b\uff1f\n\uff08\u9078\u3070\u308c\u305f\u4eba\u306b\u3001\u500b\u4eba\u7684\u306a\u8cea\u554f\u3092\u559c\u3070\u308c\u308b\u3088\u3046\u306b\u6ce8\u610f\u3059\u308b\u3053\u3068",
+        " Los efectos pueden variar dependiendo de la edad de inicio y la frecuencia de los ejercicios, pero aqu\u00ed hay una gu\u00eda general de las"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "adaptive",
+      "batch_index": 3,
+      "latency_s": 0.6027185916900635,
+      "outputs": [
+        " En fin, el sexy se relaciona con el instintos sexuales mientras que la elegancia se relaciona con el aspecto est\u00e9tico. Si se relacion",
+        "\u30d4 Rates \u306e\u3088\u3046\u306a\u30b3\u30e9\u30dc\u30ec\u30fc\u30b7\u30e7\u30f3\u3092\u3057\u3066\u307f\u307e\u305b\u3093\u304b\uff1f\u307e\u305f\u306f\u3001\u4e00\u822c\u7684\u306a\u30b3\u30df\u30e5\u30cb\u30b1\u30fc\u30b7\u30e7\u30f3\u3067\u3082\u3001",
+        " Si se considera que los intentos de asesinato son inaceptables, entonces la frase se convierte en una declaraci\u00f3n de intenci\u00f3n de realizar",
+        " \u00bfO tal vez puedes explicarme qu\u00e9 hace que este sea divertido para los hispanohablantes?\nEl chiste es: \u00bfPor qu\u00e9 el per",
+        " Piaget propuso que el desarrollo cognitivo se basa en la interacci\u00f3n entre el individuo y su entorno, y que el conocimiento se",
+        " \n\nUn psic\u00f3pata puede ser dif\u00edcil de reconocer, ya que a menudo se disfrazan como personas normales.",
+        " This will help ensure that your EIN remains valid and active.\n\nHere's the updated response:\n\n**Obtaining an EIN for a New Business: A",
+        ""
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "adaptive",
+      "batch_index": 4,
+      "latency_s": 0.5228486061096191,
+      "outputs": [
+        " In other words, what role does RNA play in the process of becoming a functional protein?\nIn eukaryotic cells, the function of RNA is to serve",
+        " para Windows\n\n1.  Blender\n2.  Tinkercad\n3.  Fusion 360\n4.  SketchUp\n5. ",
+        " El consejero es un profesional que ayuda a las personas a resolver problemas y a encontrar nuevas formas de abordar situaciones. En el caso de los",
+        " and then, after a few minutes, I'll ask me a sentence from the random letters that you've generated. and you'll tell you if it's correct",
+        "\n    WARNING: You are attempting to list the contents of a directory that is currently in use.\n    Please wait for the computer to become available.\n\n    After",
+        " (Diez nombres de perro)\nEl perro es un animal que puede ser terrier, pinscher, presa, chihuahua, mal",
+        "",
+        " I can assist with a wide range of topics and provide information on a vast array of subjects, from science and history to entertainment and culture. But I'm afraid"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "adaptive",
+      "batch_index": 5,
+      "latency_s": 0.5847766399383545,
+      "outputs": [
+        " And why?\nI think I would be a fox. Here's why:\n\n1. **Curiosity and intelligence**: Foxes are known for their intelligence and curious",
+        " start with the music production software I will be using to start the learning experience.\n\n## Step 1: Choose Music Production Software\nSelect a digital audio workstation (",
+        " \u0438 \u0441\u043d\u0456\u0433\u043e\u043c: \u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442",
+        " \u00ab\u0415\u0440\u0448\u0430\u043b\u0430\u0438\u043c\u0441\u043a\u0438\u0435\u00bb \u0442\u0430\u043a\u0436\u0435 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u0442 \u044d\u043b\u0435\u043c\u0435\u043d\u0442\u044b \u0444\u0435\u0439\u043b\u0435\u0442\u043e\u043d\u0430, \u0433\u0434\u0435 \u043f\u043e\u0432\u0435\u0441\u0442\u0432\u043e\u0432\u0430\u043d\u0438\u0435 \u043e\u0442\u0440\u0430\u0436\u0430\u0435\u0442 \u0438 \u043f\u0430\u0440\u043e\u0434\u0438\u0438 \u043d\u0430 \u0440\u0430\u0437\u043b\u0438\u0447\u043d\u044b\u0445 \u0438\u0441\u0442\u043e\u0440",
+        " a fantasy world with magical creatures, such as unicorns, dragons, and phoenixes. with royalty and nobility\nIn the Princess of Light, a young",
+        " : La frase anterior fue falsa. Esta oracion es falsa. La frase anterior es Falsa O verdadera? : La frase anterior fue verdadera",
+        " | Minecraft Forum\n\u0421\u0435\u0440\u0432\u0435\u0440 Hypixel - \u044d\u0442\u043e \u043c\u043d\u043e\u0433\u043e\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u0430\u044f \u0438\u0433\u0440\u043e\u0432\u0430\u044f \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430, \u0441\u043e\u0437\u0434\u0430\u043d\u043d\u0430\u044f \u0434\u043b\u044f \u0438\u0433\u0440\u044b Minecraft. \u041e\u043d \u043f\u0440\u0435\u0434\u043d",
+        " tng\nAqu\u00ed est\u00e1 mi respuesta:\n\"Un animal raro,\nCon orejas largas,\nLlaman a la persona rara,\nCon un"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "adaptive",
+      "batch_index": 0,
+      "latency_s": 0.6234848499298096,
+      "outputs": [
+        "  It's not about the amount I spend, it's about the amount I consume. 30 cups a day is not going to help anyone. 30",
+        " \n\nExample use case:\n```bash\ndocker-compose up -d\n```\n\nThis will start the container in detached mode, allowing the container to run in the",
+        " I'll do my best to reformat the text in a more readable way. Please provide the text to be reformatted.\n\n## Step 1: Understand the",
+        " (excellent numerous thanks!)\nComment: \"For the past 15 years, I have been teaching English to students in Russia and even in other countries. I",
+        " \u042d\u0442\u043e \u0432\u0441\u0435 \u0432\u043e\u043f\u0440\u043e\u0441\u044b \u043e\u0442\u0432\u0435\u0442\u0430.\n\n\u041e\u043a\u043e\u043d\u0447\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442: \u042d\u0442\u043e \u0432 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043e\u0442 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0445 \u043f\u043e\u0442\u0440\u0435\u0431\u043d\u043e\u0441\u0442\u0435\u0439 \u0438 preferenc\u0438\u0439 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0441\u0442\u0430.\n\n**\u0421",
+        " How can I assist you today?  \nHere's my profile in brief:\nI'm a volunteer chatbot with a passion for learning and helping others.\nMy strengths",
+        " When X and Y are not independent, we have E(XY)=E(X) E(Y).\nAs we've seen, the linearity property of the expected",
+        " \nA h\u0171t\u0151mben van csirkeh\u00fas, tejf\u00f6l, hagyma, paradicsom, paprika, feh"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "adaptive",
+      "batch_index": 1,
+      "latency_s": 0.6430082321166992,
+      "outputs": [
+        "\ngo to a planetarium show\ngo to an observatory\nbuy a book about the stars\nlearn about the solar system\ngo to a planetarium",
+        " Esto significa que el riesgo de accidente de avi\u00f3n es aproximadamente 1 en cada 17 millones de pasajeros.\n\nAdem\u00e1s, las aer",
+        " original.\n\nRenombrar los files de una carpeta y subcarpeta\n=====================================================\n\nEste script busca todos los archivos en el directorio actual",
+        " But to be honest, I'm a bit old-fashioned when it comes to my relationships. I like to think that there's more to a relationship than just sex",
+        "",
+        " \nIf you have any questions or need help with any of the equipment, please don't hesitate to ask.\n\nHere are some popular astrophotography locations worldwide",
+        " Do you have any other questions about LinkedIn or learning to use it effectively?\n\n**Additional Tips:**\n\n*   **Complete your profile**: Make sure your profile is",
+        "  \n\u041e\u043d \u0442\u0430\u043a\u0436\u0435 \u043f\u0440\u0435\u0434\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0435\u0442 \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044e \u043e \u043a\u0443\u043b\u044c\u0442\u0443\u0440\u043d\u043e\u0439 \u0437\u043d\u0430\u0447\u0438\u043c\u043e\u0441\u0442\u0438 \u0431\u0430\u043b\u0438\u0439\u0441\u043a\u043e\u0439 \u043a\u0443\u043b\u0438\u043d\u044b \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u0447\u0435\u0441\u043a\u0438\u0445 \u0441\u043e\u0431\u044b\u0442\u0438\u044f\u0445, \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u044b\u0445 \u0441"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "adaptive",
+      "batch_index": 2,
+      "latency_s": 0.6346664428710938,
+      "outputs": [
+        "BT601\u548cBT709\u90fd\u662f\u4e3b\u8272\u4f53\u989c\u8272\u7a7a\u95f4\uff0c\u4f46\u5b83\u4eec\u7684\u53c2\u6570\u914d\u7f6e\u6709\u6240\u4e0d\u540c\u3002\n\n## Step 1: BT601\u548cBT709\u7684",
+        "  This will help narrow down the search.\nBrian Stelter (born 1981) is an American television journalist and author, best known for being the chief",
+        "\ud83d\udc31\n\u3069\u3093\u306a\u732b\u306e\u8a71\u3092\u3057\u307e\u3059\u304b\uff1f \ud83e\udd14\n\u304a\u305d\u3089\u304f\u3001\u732b\u306e\u751f\u6d3b\u3092\u77e5\u308a\u305f\u3044\u306e\u3067\u3059\u304b\uff1f\u732b",
+        " - \u042d\u0442\u043e \u0440\u0430\u0434\u0438\u0443\u0441\u044b \u043a\u0440\u0443\u0433\u0430, \u0440\u0430\u0434\u0438\u0443\u0441 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u0440\u0430\u0432\u0435\u043d 1 \u0438 3. \u0412 \u043f\u0440\u0435\u0434\u0438\u0441\u043b\u043e\u0432\u0438\u0438 \u043e\u043d \u0443\u043f\u043e\u043c\u0438\u043d\u0430\u0435\u0442, \u0447\u0442\u043e \"\u0432 \u0418",
+        ", and punctuation\n\nHere's an example\n```\nAuthorization: Bearer <token>\n```\n\nShould be converted to\n```\nAuthorization: Bearer <",
+        " ### \u76f8\u95dc\u8a9e\n- \u305b\u306b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u305b\u306a\u308b\uff08\u306e\u3080\u308b\uff09\n- \u3059\u304d\u3060\uff08\u3059\u304d\uff09\n",
+        "\u3042\u306a\u305f\u304c\u53d7\u3051\u305f\u8cde\u306f\u3069\u3093\u306a\u3082\u306e\u3067\u3059\u304b\uff1f\n\uff08\u9078\u3070\u308c\u305f\u4eba\u306b\u3001\u500b\u4eba\u7684\u306a\u8cea\u554f\u3092\u559c\u3070\u308c\u308b\u3088\u3046\u306b\u6ce8\u610f\u3059\u308b\u3053\u3068",
+        " Los efectos pueden variar dependiendo de la edad de inicio y la frecuencia de los ejercicios, pero aqu\u00ed hay una gu\u00eda general de las"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "adaptive",
+      "batch_index": 3,
+      "latency_s": 0.6276273727416992,
+      "outputs": [
+        " En fin, el sexy se relaciona con el instintos sexuales mientras que la elegancia se relaciona con el aspecto est\u00e9tico. Si se relacion",
+        "\u30d4 Rates \u306e\u3088\u3046\u306a\u30b3\u30e9\u30dc\u30ec\u30fc\u30b7\u30e7\u30f3\u3092\u3057\u3066\u307f\u307e\u305b\u3093\u304b\uff1f\u307e\u305f\u306f\u3001\u4e00\u822c\u7684\u306a\u30b3\u30df\u30e5\u30cb\u30b1\u30fc\u30b7\u30e7\u30f3\u3067\u3082\u3001",
+        " Si se considera que los intentos de asesinato son inaceptables, entonces la frase se convierte en una declaraci\u00f3n de intenci\u00f3n de realizar",
+        " \u00bfO tal vez puedes explicarme qu\u00e9 hace que este sea divertido para los hispanohablantes?\nEl chiste es: \u00bfPor qu\u00e9 el per",
+        " Piaget propuso que el desarrollo cognitivo se basa en la interacci\u00f3n entre el individuo y su entorno, y que el conocimiento se",
+        " \n\nUn psic\u00f3pata puede ser dif\u00edcil de reconocer, ya que a menudo se disfrazan como personas normales.",
+        " This will help ensure that your EIN remains valid and active.\n\nHere's the updated response:\n\n**Obtaining an EIN for a New Business: A",
+        ""
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "adaptive",
+      "batch_index": 4,
+      "latency_s": 0.5392022132873535,
+      "outputs": [
+        " In other words, what role does RNA play in the process of becoming a functional protein?\nIn eukaryotic cells, the function of RNA is to serve",
+        " para Windows\n\n1.  Blender\n2.  Tinkercad\n3.  Fusion 360\n4.  SketchUp\n5. ",
+        " El consejero es un profesional que ayuda a las personas a resolver problemas y a encontrar nuevas formas de abordar situaciones. En el caso de los",
+        " and then, after a few minutes, I'll ask me a sentence from the random letters that you've generated. and you'll tell you if it's correct",
+        "\n    WARNING: You are attempting to list the contents of a directory that is currently in use.\n    Please wait for the computer to become available.\n\n    After",
+        " (Diez nombres de perro)\nEl perro es un animal que puede ser terrier, pinscher, presa, chihuahua, mal",
+        "",
+        " I can assist with a wide range of topics and provide information on a vast array of subjects, from science and history to entertainment and culture. But I'm afraid"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "adaptive",
+      "batch_index": 5,
+      "latency_s": 0.6062805652618408,
+      "outputs": [
+        " And why?\nI think I would be a fox. Here's why:\n\n1. **Curiosity and intelligence**: Foxes are known for their intelligence and curious",
+        " start with the music production software I will be using to start the learning experience.\n\n## Step 1: Choose Music Production Software\nSelect a digital audio workstation (",
+        " \u0438 \u0441\u043d\u0456\u0433\u043e\u043c: \u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442\u043d\u0430\u044f \u0442\u0435\u043e\u0440\u0438\u044f\n\u0412\u0435\u0441\u0435\u043b\u0430\u044f \u0442\u043e\u0440\u0442",
+        " \u00ab\u0415\u0440\u0448\u0430\u043b\u0430\u0438\u043c\u0441\u043a\u0438\u0435\u00bb \u0442\u0430\u043a\u0436\u0435 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u0442 \u044d\u043b\u0435\u043c\u0435\u043d\u0442\u044b \u0444\u0435\u0439\u043b\u0435\u0442\u043e\u043d\u0430, \u0433\u0434\u0435 \u043f\u043e\u0432\u0435\u0441\u0442\u0432\u043e\u0432\u0430\u043d\u0438\u0435 \u043e\u0442\u0440\u0430\u0436\u0430\u0435\u0442 \u0438 \u043f\u0430\u0440\u043e\u0434\u0438\u0438 \u043d\u0430 \u0440\u0430\u0437\u043b\u0438\u0447\u043d\u044b\u0445 \u0438\u0441\u0442\u043e\u0440",
+        " a fantasy world with magical creatures, such as unicorns, dragons, and phoenixes. with royalty and nobility\nIn the Princess of Light, a young",
+        " : La frase anterior fue falsa. Esta oracion es falsa. La frase anterior es Falsa O verdadera? : La frase anterior fue verdadera",
+        " | Minecraft Forum\n\u0421\u0435\u0440\u0432\u0435\u0440 Hypixel - \u044d\u0442\u043e \u043c\u043d\u043e\u0433\u043e\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u0430\u044f \u0438\u0433\u0440\u043e\u0432\u0430\u044f \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430, \u0441\u043e\u0437\u0434\u0430\u043d\u043d\u0430\u044f \u0434\u043b\u044f \u0438\u0433\u0440\u044b Minecraft. \u041e\u043d \u043f\u0440\u0435\u0434\u043d",
+        " tng\nAqu\u00ed est\u00e1 mi respuesta:\n\"Un animal raro,\nCon orejas largas,\nLlaman a la persona rara,\nCon un"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}
