@@ -5296,6 +5296,7 @@ class SCVGraphExecutor:
             entry.cu_buffer.copy_(cu_tensor)
             if need_capture:
                 entry.capture()
+            # SCV Phase 2: Profile vectorized mask before capture (manual step)
             return entry.run()
         except RuntimeError as exc:
             logger.warning("SCV graph execution disabled: %s", exc)
