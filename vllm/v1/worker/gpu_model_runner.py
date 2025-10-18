@@ -26,6 +26,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
+    CompilationConfig,
     CompilationLevel,
     CUDAGraphMode,
     VllmConfig,
@@ -174,7 +175,12 @@ def _parse_debug_flag(env_name: str) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _probe_scv_capture(enabled_mode: str, device: torch.device, scv_debug: bool) -> bool:
+def _probe_scv_capture(
+    enabled_mode: str,
+    device: torch.device,
+    scv_debug: bool,
+    compilation_config: CompilationConfig | None,
+) -> bool:
     if enabled_mode != "graph":
         return True
     if not torch.cuda.is_available():
@@ -183,6 +189,18 @@ def _probe_scv_capture(enabled_mode: str, device: torch.device, scv_debug: bool)
                 "SCV: CUDA graphs unavailable on this device; using vectorized path."
             )
         return False
+    if (
+        compilation_config is not None
+        and compilation_config.cudagraph_mode is not None
+        and compilation_config.cudagraph_mode.has_full_cudagraphs()
+    ):
+        if scv_debug:
+            logger.warning(
+                "SCV: Full CUDA graph mode active (%s); skipping SCV graph capture.",
+                compilation_config.cudagraph_mode,
+            )
+        return False
+
     try:
         torch.cuda.synchronize(device)
         graph = torch.cuda.CUDAGraph()
@@ -765,7 +783,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ] = {}
 
         self._scv_capture_available = _probe_scv_capture(
-            self._scv_mode, device, self._scv_debug
+            self._scv_mode, device, self._scv_debug, self.compilation_config
         )
 
         # Log NWOR/SCV configuration on init
