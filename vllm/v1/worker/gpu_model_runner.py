@@ -2830,13 +2830,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         if draft_ids.device != device:
             draft_ids = draft_ids.to(device=device)
-        if sampled_token_ids.device != device:
-            sampled_token_ids = sampled_token_ids.to(device=device)
 
         cu = spec_decode_metadata.cu_num_draft_tokens.to(device=device)
         cu_int32 = cu
         if cu.dtype != torch.int32:
-            cu_int32 = cu.to(dtype=torch.int32, device=device)
+            cu_int32 = cu.to(torch.int32)
 
         if self._scv_mode == "graph" and self._scv_capture_available:
             if not hasattr(torch.cuda, "CUDAGraph"):
@@ -2864,18 +2862,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         key[:4],
                     )
                 else:
-                    # Check if we're currently inside a CUDA graph capture
-                    # (e.g., during model warmup). If so, skip SCV graph capture.
-                    is_capturing = torch.cuda.is_current_stream_capturing()
-
                     entry = self._scv_graph_cache.get(key)
                     try:
                         if entry is None:
-                            if is_capturing:
-                                # Cannot capture nested graphs - skip and use vectorized
-                                raise RuntimeError(
-                                    "SCV: Cannot capture graph while already capturing"
-                                )
                             _SCVGraphEntry._evict_entry(self._scv_graph_cache, 32)
                             entry = _SCVGraphEntry(
                                 num_reqs,
@@ -2896,11 +2885,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             )
                             self._scv_graph_cache[key] = entry
                             logger.info("SCV: Graph capture successful for %s", key[:4])
-                        elif is_capturing:
-                            # Entry exists but we're in capture mode - skip replay
-                            raise RuntimeError(
-                                "SCV: Cannot replay graph while capturing"
-                            )
                         mask_buf = entry.replay(
                             draft_ids,
                             cu_int32,
