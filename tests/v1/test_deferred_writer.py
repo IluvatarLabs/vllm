@@ -36,6 +36,8 @@ def _make_mock_runner(scv_mode="off"):
     runner._scv_debug = False  # Required by _scv_enabled()
     runner._scv_capture_available = True  # For graph mode checks
     runner._scv_graph_executor = None  # For graph capture
+    runner._scv_graph_cache = {}  # Required for graph mode
+    runner._scv_graph_failures = {}  # Required for blacklisting
     runner.speculative_config = None  # For NWOR tests
     runner._deferred_write_manager = DeferredWriteManager()
     return runner

@@ -624,4 +624,22 @@ class Platform:
 
 class UnspecifiedPlatform(Platform):
     _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""
+    device_type = "cuda"
+    device_control_env_var = "CUDA_VISIBLE_DEVICES"
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        """Resolve auto worker_cls to GPU worker for UnspecifiedPlatform."""
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.worker_cls == "auto":
+            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
+    @staticmethod
+    def set_device(device: "torch.device") -> None:
+        import torch
+        torch.cuda.set_device(device)
+        _ = torch.zeros(1, device=device)
+
+    @staticmethod
+    def device_id_to_physical_device_id(device_id: int) -> int:
+        return device_id

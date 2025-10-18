@@ -6,7 +6,6 @@ import itertools
 import os
 import time
 from collections import defaultdict
-from dataclasses import dataclass
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -248,6 +247,199 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         return output
+
+
+class _SCVGraphEntry:
+    """CUDA graph entry with zero-allocation replay for SCV mask computation."""
+
+    def __init__(
+        self,
+        num_reqs: int,
+        max_spec_len: int,
+        sample_cols: int,
+        total_tokens: int,
+        cu_tuple: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.device = device
+        self.dtype = dtype
+        self.num_reqs = num_reqs
+        self.total_tokens = total_tokens
+        self.max_spec_len = max_spec_len
+        self.sample_cols = sample_cols
+        self.key = (
+            num_reqs,
+            max_spec_len,
+            sample_cols,
+            total_tokens,
+            cu_tuple,
+            dtype,
+            device,
+        )
+
+        # CUDA graph objects.
+        self.graph = torch.cuda.CUDAGraph()
+
+        # Input buffers.
+        self.draft_buffer = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.num_draft_buffer = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.cu_buffer = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.sampled_buffer = torch.empty(
+            (num_reqs, sample_cols), dtype=dtype, device=device
+        )
+
+        # Intermediate buffers.
+        self.indices_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.req_idx_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.prev_cu_buf = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.pos_in_req_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.pos_clamped_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.flat_index_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.gathered_buf = torch.empty(total_tokens, dtype=dtype, device=device)
+        self.within_bounds_buf = torch.empty(
+            total_tokens, dtype=torch.bool, device=device
+        )
+        self.token_match_buf = torch.empty(
+            total_tokens, dtype=torch.bool, device=device
+        )
+        self.comparison_buf = torch.empty(total_tokens, dtype=torch.bool, device=device)
+        self.not_comparison_buf = torch.empty(
+            total_tokens, dtype=torch.bool, device=device
+        )
+        self.values_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.max_val_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.accepted_buf = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.accepted_eq_max_buf = torch.empty(num_reqs, dtype=torch.bool, device=device)
+        self.accepted_broadcast_buf = torch.empty(
+            total_tokens, dtype=torch.int32, device=device
+        )
+
+        # Output buffer.
+        self.mask_buffer = torch.empty(total_tokens, dtype=torch.bool, device=device)
+
+        self.last_used = time.monotonic()
+
+    def capture(
+        self,
+        draft_ids: torch.Tensor,
+        num_draft_tokens: list[int],
+        cu_num_draft_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        max_spec_len: int,
+        total_tokens: int,
+    ) -> None:
+        """Capture the SCV mask kernel with zero allocations."""
+        with torch.cuda.device(self.device):
+            if cu_num_draft_tokens.dtype != torch.int32:
+                cu_num_draft_tokens = cu_num_draft_tokens.to(torch.int32)
+
+            # Populate buffers.
+            self.num_draft_buffer.copy_(
+                torch.tensor(num_draft_tokens, dtype=torch.int32, device=self.device)
+            )
+            self.draft_buffer.copy_(draft_ids)
+            self.cu_buffer.copy_(cu_num_draft_tokens)
+            self.sampled_buffer.copy_(sampled_token_ids)
+
+            torch.cuda.synchronize()
+
+            GPUModelRunner._scv_compute_mask_inplace(
+                self.draft_buffer,
+                self.num_draft_buffer,
+                self.cu_buffer,
+                self.sampled_buffer,
+                max_spec_len,
+                total_tokens,
+                self.indices_buf,
+                self.req_idx_buf,
+                self.prev_cu_buf,
+                self.pos_in_req_buf,
+                self.pos_clamped_buf,
+                self.flat_index_buf,
+                self.gathered_buf,
+                self.within_bounds_buf,
+                self.token_match_buf,
+                self.comparison_buf,
+                self.not_comparison_buf,
+                self.values_buf,
+                self.max_val_buf,
+                self.accepted_buf,
+                self.accepted_eq_max_buf,
+                self.accepted_broadcast_buf,
+                self.mask_buffer,
+            )
+
+            torch.cuda.synchronize()
+
+            with torch.cuda.graph(self.graph):
+                GPUModelRunner._scv_compute_mask_inplace(
+                    self.draft_buffer,
+                    self.num_draft_buffer,
+                    self.cu_buffer,
+                    self.sampled_buffer,
+                    max_spec_len,
+                    total_tokens,
+                    self.indices_buf,
+                    self.req_idx_buf,
+                    self.prev_cu_buf,
+                    self.pos_in_req_buf,
+                    self.pos_clamped_buf,
+                    self.flat_index_buf,
+                    self.gathered_buf,
+                    self.within_bounds_buf,
+                    self.token_match_buf,
+                    self.comparison_buf,
+                    self.not_comparison_buf,
+                    self.values_buf,
+                    self.max_val_buf,
+                    self.accepted_buf,
+                    self.accepted_eq_max_buf,
+                    self.accepted_broadcast_buf,
+                    self.mask_buffer,
+                )
+
+    def replay(
+        self,
+        draft_ids: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replay the captured graph with new inputs and return a cloned mask."""
+        with torch.cuda.device(self.device):
+            if cu_num_draft_tokens.dtype != torch.int32:
+                cu_num_draft_tokens = cu_num_draft_tokens.to(torch.int32)
+
+            self.draft_buffer.copy_(draft_ids)
+            self.cu_buffer.copy_(cu_num_draft_tokens)
+            self.sampled_buffer.copy_(sampled_token_ids)
+
+            self.graph.replay()
+            self.last_used = time.monotonic()
+
+            torch.cuda.synchronize()
+            return self.mask_buffer.clone()
+
+    @staticmethod
+    def _evict_entry(
+        cache: dict[
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                tuple[int, ...],
+                torch.dtype,
+                torch.device,
+            ],
+            "_SCVGraphEntry",
+        ],
+        max_entries: int,
+    ) -> None:
+        if len(cache) < max_entries:
+            return
+        oldest_key, _ = min(cache.items(), key=lambda item: item[1].last_used)
+        cache.pop(oldest_key, None)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -582,7 +774,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "Spec decode enabled: NWOR_MODE=%s, SCV_MODE=%s, NWOR_DEBUG=%s",
                 envs.VLLM_NWOR_MODE, self._scv_mode, self._nwor_debug
             )
-        self._scv_graph_executor: SCVGraphExecutor | None = None
+        self._scv_graph_executor = None  # Unused legacy field
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -604,212 +796,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "SCV: Graph capture unavailable; falling back to vectorized acceptance."
                 )
         return self._scv_mode != "off"
-
-
-class _SCVGraphEntry:
-    """CUDA graph entry with zero-allocation replay for SCV mask computation."""
-
-    def __init__(
-        self,
-        num_reqs: int,
-        max_spec_len: int,
-        sample_cols: int,
-        total_tokens: int,
-        cu_tuple: tuple[int, ...],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        self.device = device
-        self.dtype = dtype
-        self.num_reqs = num_reqs
-        self.total_tokens = total_tokens
-        self.max_spec_len = max_spec_len
-        self.sample_cols = sample_cols
-        self.key = (
-            num_reqs,
-            max_spec_len,
-            sample_cols,
-            total_tokens,
-            cu_tuple,
-            dtype,
-            device,
-        )
-
-        # CUDA graph objects.
-        self.graph = torch.cuda.CUDAGraph()
-
-        # Input buffers.
-        self.draft_buffer = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        self.num_draft_buffer = torch.empty(num_reqs, dtype=torch.int32, device=device)
-        self.cu_buffer = torch.empty(num_reqs, dtype=torch.int32, device=device)
-        self.sampled_buffer = torch.empty(
-            (num_reqs, sample_cols), dtype=dtype, device=device
-        )
-
-        # Intermediate buffers.
-        self.indices_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        self.req_idx_buf = torch.empty(total_tokens, dtype=torch.int64, device=device)
-        self.prev_cu_buf = torch.empty(num_reqs, dtype=torch.int32, device=device)
-        self.pos_in_req_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        self.pos_clamped_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        self.flat_index_buf = torch.empty(total_tokens, dtype=torch.int64, device=device)
-        self.gathered_buf = torch.empty(total_tokens, dtype=dtype, device=device)
-        self.within_bounds_buf = torch.empty(
-            total_tokens, dtype=torch.bool, device=device
-        )
-        self.token_match_buf = torch.empty(
-            total_tokens, dtype=torch.bool, device=device
-        )
-        self.comparison_buf = torch.empty(total_tokens, dtype=torch.bool, device=device)
-        self.not_comparison_buf = torch.empty(
-            total_tokens, dtype=torch.bool, device=device
-        )
-        self.values_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        self.max_val_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        self.accepted_buf = torch.empty(num_reqs, dtype=torch.int32, device=device)
-        self.accepted_eq_max_buf = torch.empty(num_reqs, dtype=torch.bool, device=device)
-        self.accepted_broadcast_buf = torch.empty(
-            total_tokens, dtype=torch.int32, device=device
-        )
-
-        # Output buffer.
-        self.mask_buffer = torch.empty(total_tokens, dtype=torch.bool, device=device)
-
-        self.last_used = time.monotonic()
-
-    def capture(
-        self,
-        draft_ids: torch.Tensor,
-        num_draft_tokens: list[int],
-        cu_num_draft_tokens: torch.Tensor,
-        sampled_token_ids: torch.Tensor,
-        max_spec_len: int,
-        total_tokens: int,
-    ) -> None:
-        """Capture the SCV mask kernel with zero allocations."""
-        with torch.cuda.device(self.device):
-            if cu_num_draft_tokens.dtype != torch.int32:
-                cu_num_draft_tokens = cu_num_draft_tokens.to(torch.int32)
-
-            if sampled_token_ids.shape[1] != self.sample_cols:
-                raise RuntimeError(
-                    "SCV: sampled_token_ids column count changed between captures"
-                )
-
-            # Populate buffers.
-            self.num_draft_buffer.copy_(
-                torch.tensor(num_draft_tokens, dtype=torch.int32, device=self.device)
-            )
-            self.draft_buffer.copy_(draft_ids)
-            self.cu_buffer.copy_(cu_num_draft_tokens)
-            self.sampled_buffer.copy_(sampled_token_ids)
-
-            torch.cuda.synchronize()
-
-            GPUModelRunner._scv_compute_mask_inplace(
-                self.draft_buffer,
-                self.num_draft_buffer,
-                self.cu_buffer,
-                self.sampled_buffer,
-                max_spec_len,
-                total_tokens,
-                self.indices_buf,
-                self.req_idx_buf,
-                self.prev_cu_buf,
-                self.pos_in_req_buf,
-                self.pos_clamped_buf,
-                self.flat_index_buf,
-                self.gathered_buf,
-                self.within_bounds_buf,
-                self.token_match_buf,
-                self.comparison_buf,
-                self.not_comparison_buf,
-                self.values_buf,
-                self.max_val_buf,
-                self.accepted_buf,
-                self.accepted_eq_max_buf,
-                self.accepted_broadcast_buf,
-                self.mask_buffer,
-            )
-
-            torch.cuda.synchronize()
-
-            with torch.cuda.graph(self.graph):
-                GPUModelRunner._scv_compute_mask_inplace(
-                    self.draft_buffer,
-                    self.num_draft_buffer,
-                    self.cu_buffer,
-                    self.sampled_buffer,
-                    max_spec_len,
-                    total_tokens,
-                    self.indices_buf,
-                    self.req_idx_buf,
-                    self.prev_cu_buf,
-                    self.pos_in_req_buf,
-                    self.pos_clamped_buf,
-                    self.flat_index_buf,
-                    self.gathered_buf,
-                    self.within_bounds_buf,
-                    self.token_match_buf,
-                    self.comparison_buf,
-                    self.not_comparison_buf,
-                    self.values_buf,
-                    self.max_val_buf,
-                    self.accepted_buf,
-                    self.accepted_eq_max_buf,
-                    self.accepted_broadcast_buf,
-                    self.mask_buffer,
-                )
-
-    def replay(
-        self,
-        draft_ids: torch.Tensor,
-        cu_num_draft_tokens: torch.Tensor,
-        sampled_token_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Replay the captured graph with new inputs and return a cloned mask."""
-        with torch.cuda.device(self.device):
-            if cu_num_draft_tokens.dtype != torch.int32:
-                cu_num_draft_tokens = cu_num_draft_tokens.to(torch.int32)
-
-            if sampled_token_ids.shape[1] != self.sample_cols:
-                raise RuntimeError(
-                    "SCV: sampled_token_ids column count changed between captures"
-                )
-
-            self.draft_buffer.copy_(draft_ids)
-            self.cu_buffer.copy_(cu_num_draft_tokens)
-            self.sampled_buffer.copy_(sampled_token_ids)
-
-            self.graph.replay()
-            self.last_used = time.monotonic()
-
-            torch.cuda.synchronize()
-            return self.mask_buffer.clone()
-
-
-    @staticmethod
-    def _evict_entry(
-        cache: dict[
-            tuple[
-                int,
-                int,
-                int,
-                int,
-                tuple[int, ...],
-                torch.dtype,
-                torch.device,
-            ],
-            _SCVGraphEntry,
-        ],
-        max_entries: int,
-    ) -> None:
-        if len(cache) < max_entries:
-            return
-        oldest_key, _ = min(cache.items(), key=lambda item: item[1].last_used)
-        cache.pop(oldest_key, None)
-
-
 
     @contextmanager
     def _scv_nvtx_range(self, name: str):
@@ -2826,15 +2812,13 @@ class _SCVGraphEntry:
         )
         if draft_ids.device != device:
             draft_ids = draft_ids.to(device=device)
-        if not draft_ids.is_contiguous():
-            draft_ids = draft_ids.contiguous()
+        if sampled_token_ids.device != device:
+            sampled_token_ids = sampled_token_ids.to(device=device)
 
         cu = spec_decode_metadata.cu_num_draft_tokens.to(device=device)
-        if not cu.is_contiguous():
-            cu = cu.contiguous()
         cu_int32 = cu
         if cu.dtype != torch.int32:
-            cu_int32 = cu.to(torch.int32)
+            cu_int32 = cu.to(dtype=torch.int32, device=device)
 
         if self._scv_mode == "graph" and self._scv_capture_available:
             if not hasattr(torch.cuda, "CUDAGraph"):
@@ -2862,9 +2846,18 @@ class _SCVGraphEntry:
                         key[:4],
                     )
                 else:
+                    # Check if we're currently inside a CUDA graph capture
+                    # (e.g., during model warmup). If so, skip SCV graph capture.
+                    is_capturing = torch.cuda.is_current_stream_capturing()
+
                     entry = self._scv_graph_cache.get(key)
                     try:
                         if entry is None:
+                            if is_capturing:
+                                # Cannot capture nested graphs - skip and use vectorized
+                                raise RuntimeError(
+                                    "SCV: Cannot capture graph while already capturing"
+                                )
                             _SCVGraphEntry._evict_entry(self._scv_graph_cache, 32)
                             entry = _SCVGraphEntry(
                                 num_reqs,
@@ -2885,6 +2878,11 @@ class _SCVGraphEntry:
                             )
                             self._scv_graph_cache[key] = entry
                             logger.info("SCV: Graph capture successful for %s", key[:4])
+                        elif is_capturing:
+                            # Entry exists but we're in capture mode - skip replay
+                            raise RuntimeError(
+                                "SCV: Cannot replay graph while capturing"
+                            )
                         mask_buf = entry.replay(
                             draft_ids,
                             cu_int32,
@@ -3026,7 +3024,7 @@ class _SCVGraphEntry:
             return
 
         torch.arange(total_tokens, out=indices_buf)
-        torch.bucketize(indices_buf, cu_num_draft_tokens, out=req_idx_buf)
+        torch.bucketize(indices_buf, cu_num_draft_tokens, out_int32=True, out=req_idx_buf)
 
         prev_cu_buf[0] = 0
         if len(cu_num_draft_tokens) > 1:
@@ -5577,126 +5575,3 @@ class _SCVGraphEntry:
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()
-@dataclass
-class _SCVGraphEntry:
-    num_reqs: int
-    max_spec_len: int
-    total_tokens: int
-    sampled_shape: tuple[int, int]
-    sampled_dtype: torch.dtype
-    draft_dtype: torch.dtype
-    device: torch.device
-
-    def __post_init__(self):
-        self.sampled_buffer = torch.empty(
-            self.sampled_shape, device=self.device, dtype=self.sampled_dtype
-        )
-        self.draft_buffer = torch.empty(
-            (self.total_tokens,), device=self.device, dtype=self.draft_dtype
-        )
-        self.num_tokens_buffer = torch.empty(
-            (self.num_reqs,), device=self.device, dtype=torch.int32
-        )
-        self.cu_buffer = torch.empty(
-            (self.num_reqs,), device=self.device, dtype=torch.int32
-        )
-        self.mask_buffer = torch.empty(
-            (self.total_tokens,), device=self.device, dtype=torch.bool
-        )
-        self.graph = torch.cuda.CUDAGraph()
-        self._captured = False
-
-    def capture(self):
-        if self._captured:
-            return
-        mask = GPUModelRunner._scv_compute_mask(
-            self.draft_buffer,
-            self.num_tokens_buffer,
-            self.cu_buffer,
-            self.sampled_buffer,
-            self.max_spec_len,
-            self.total_tokens,
-        )
-        self.mask_buffer.copy_(mask)
-        torch.cuda.synchronize()
-        with torch.cuda.graph(self.graph):
-            mask = GPUModelRunner._scv_compute_mask(
-                self.draft_buffer,
-                self.num_tokens_buffer,
-                self.cu_buffer,
-                self.sampled_buffer,
-                self.max_spec_len,
-                self.total_tokens,
-            )
-            self.mask_buffer.copy_(mask)
-        self._captured = True
-
-    def run(self):
-        if not self._captured:
-            self.capture()
-        self.graph.replay()
-        return self.mask_buffer
-
-
-class SCVGraphExecutor:
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.entries: dict[tuple[Any, ...], _SCVGraphEntry] = {}
-        self.enabled = torch.cuda.is_available()
-
-    def run(
-        self,
-        spec_decode_metadata: SpecDecodeMetadata,
-        sampled_token_ids: torch.Tensor,
-        total_tokens: int,
-    ) -> torch.Tensor | None:
-        if not self.enabled:
-            return None
-        num_reqs = len(spec_decode_metadata.num_draft_tokens)
-        max_spec_len = spec_decode_metadata.max_spec_len
-        key = (
-            num_reqs,
-            max_spec_len,
-            sampled_token_ids.shape[1],
-            total_tokens,
-            sampled_token_ids.dtype,
-        )
-        entry = self.entries.get(key)
-        need_capture = False
-        if entry is None:
-            entry = _SCVGraphEntry(
-                num_reqs=num_reqs,
-                max_spec_len=max_spec_len,
-                total_tokens=total_tokens,
-                sampled_shape=sampled_token_ids[:, :max_spec_len].shape,
-                sampled_dtype=sampled_token_ids.dtype,
-                draft_dtype=spec_decode_metadata.draft_token_ids.dtype,
-                device=self.device,
-            )
-            self.entries[key] = entry
-            need_capture = True
-        try:
-            sampled_view = sampled_token_ids[:, :max_spec_len]
-            entry.sampled_buffer.copy_(sampled_view)
-            draft_ids = spec_decode_metadata.draft_token_ids.to(self.device)
-            entry.draft_buffer.zero_()
-            entry.draft_buffer[: draft_ids.numel()].copy_(draft_ids)
-            num_tokens_tensor = torch.tensor(
-                spec_decode_metadata.num_draft_tokens,
-                device=self.device,
-                dtype=torch.int32,
-            )
-            entry.num_tokens_buffer.copy_(num_tokens_tensor)
-            cu_tensor = spec_decode_metadata.cu_num_draft_tokens.to(
-                device=self.device, dtype=torch.int32
-            )
-            entry.cu_buffer.copy_(cu_tensor)
-            if need_capture:
-                entry.capture()
-            # SCV Phase 2: Profile vectorized mask before capture (manual step)
-            return entry.run()
-        except RuntimeError as exc:
-            logger.warning("SCV graph execution disabled: %s", exc)
-            self.enabled = False
-            self.entries.clear()
-            return None
