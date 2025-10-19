@@ -412,12 +412,16 @@ class DeferredWriteManager:
 
                 committed_total += length
 
-        rejected = max(self._expected_tokens - committed_total, 0)
+        # Calculate accepted/rejected based on acceptance counts, not write counts
+        # (committed_total counts writes across all layers, but accepted_counts
+        # tells us how many draft tokens were actually accepted)
+        accepted_total = sum(accepted_counts)
+        rejected = self._expected_tokens - accepted_total
         self._metrics["tokens_committed"] += committed_total
         self._metrics["tokens_rejected"] += rejected
         self._last_window_metrics = {
             "mode": self._mode,
-            "committed": committed_total,
+            "committed": accepted_total,
             "rejected": rejected,
             "fallback": 0,
         }

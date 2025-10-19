@@ -461,6 +461,9 @@ class _SCVGraphEntry:
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+    # Maximum number of SCV CUDA graph cache entries before eviction
+    _SCV_GRAPH_CACHE_MAX_SIZE = 32
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -803,7 +806,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "Spec decode enabled: NWOR_MODE=%s, SCV_MODE=%s, NWOR_DEBUG=%s",
                 envs.VLLM_NWOR_MODE, self._scv_mode, self._nwor_debug
             )
-        self._scv_graph_executor = None  # Unused legacy field
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -814,8 +816,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def _scv_enabled(self) -> bool:
-        if not hasattr(self, "_scv_mode"):
-            self._scv_mode = envs.VLLM_SCV_MODE.lower()
         if self._scv_mode not in ("off", "graph", "adaptive"):
             logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
             self._scv_mode = "off"
@@ -2696,9 +2696,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         *,
         return_mask: bool = False,
     ) -> tuple[list[int] | None, torch.Tensor | None]:
+        """Compute acceptance counts for draft tokens in speculative decoding.
+
+        Args:
+            spec_decode_metadata: Metadata containing draft tokens and their counts
+            sampled_token_ids: Target model's sampled tokens to compare against
+            return_mask: If True, return acceptance mask along with counts
+
+        Returns:
+            Tuple of (accepted_counts, mask):
+            - accepted_counts: List of accepted token counts per request (None on error)
+            - mask: Boolean acceptance mask if requested (None if not requested or on error)
+        """
         num_draft_tokens = spec_decode_metadata.num_draft_tokens
         total_tokens = sum(int(n) for n in num_draft_tokens)
         if total_tokens <= 0:
+            return [0 for _ in num_draft_tokens], None
+
+        # Validate metadata consistency
+        if spec_decode_metadata.draft_token_ids.shape[0] != total_tokens:
+            logger.error(
+                "NWOR: Inconsistent spec_decode_metadata: draft_token_ids has %d tokens "
+                "but num_draft_tokens sums to %d. Rejecting all draft tokens.",
+                spec_decode_metadata.draft_token_ids.shape[0],
+                total_tokens
+            )
             return [0 for _ in num_draft_tokens], None
 
         target_device = spec_decode_metadata.draft_token_ids.device
@@ -2892,7 +2914,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_reqs = len(spec_decode_metadata.num_draft_tokens)
                 dtype = sampled_token_ids.dtype
                 # Compute cumulative sum on CPU to avoid GPU->CPU sync
-                import itertools
                 cu_tuple = tuple(itertools.accumulate(
                     [0] + list(spec_decode_metadata.num_draft_tokens)
                 ))
@@ -2915,7 +2936,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     entry = self._scv_graph_cache.get(key)
                     try:
                         if entry is None:
-                            _SCVGraphEntry._evict_entry(self._scv_graph_cache, 32)
+                            _SCVGraphEntry._evict_entry(
+                                self._scv_graph_cache, self._SCV_GRAPH_CACHE_MAX_SIZE
+                            )
                             entry = _SCVGraphEntry(
                                 num_reqs,
                                 max_spec_len,
@@ -3148,6 +3171,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             new_k = base_k
 
+        # Safe to mutate: adaptive mode dynamically tunes per-worker speculation depth
         speculative_config.num_speculative_tokens = new_k
 
     def _bookkeeping_sync(
