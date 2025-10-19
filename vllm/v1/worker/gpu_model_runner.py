@@ -786,6 +786,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._scv_mode, device, self._scv_debug, self.compilation_config
         )
 
+        if (
+            self._deferred_write_manager.get_mode() == "stage"
+            and self.compilation_config is not None
+            and getattr(self.compilation_config, "cudagraph_mode", None) is not None
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            logger.warning_once(
+                "NWOR staging disabled: full CUDA graphs are active; using immediate mode."
+            )
+            self._deferred_write_manager.set_mode("immediate")
+
         # Log NWOR/SCV configuration on init
         if self.speculative_config:
             logger.info(
@@ -2720,10 +2731,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         draft_ids = draft_ids.to(dtype=sampled_token_ids.dtype, copy=False)
 
         if return_mask:
-            mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
-        else:
-            mask_work = None
-        accepted_counts = []
+        mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+    else:
+        mask_work = None
+    accepted_counts = []
 
         if sampled_token_ids.ndim == 0:
             zero_counts = [0 for _ in num_draft_tokens]
@@ -3337,6 +3348,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode, batch_descriptor = (
                     self.cudagraph_dispatcher.dispatch(batch_descriptor, use_cascade_attn)
                 )
+
+                if (
+                    spec_decode_metadata is not None
+                    and self._deferred_write_manager.get_mode() == "stage"
+                    and cudagraph_runtime_mode is not CUDAGraphMode.NONE
+                ):
+                    logger.debug_once(
+                        "NWOR: Disabling CUDA graph for spec decode step (mode was %s)",
+                        cudagraph_runtime_mode,
+                    )
+                    cudagraph_runtime_mode = CUDAGraphMode.NONE
 
                 # Set cudagraph mode to none if calc_kv_scales is true.
                 if attn_metadata is not None:
