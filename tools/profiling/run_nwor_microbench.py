@@ -16,6 +16,7 @@ import gc
 import json
 import os
 import random
+import shutil
 import statistics
 import subprocess
 import sys
@@ -579,8 +580,11 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
                 profile_only=True,
                 override_modes=(scv_mode, nwor_mode),
             )
+            # Try ncu first (modern CUDA), fallback to nv-nsight-cu-cli (older)
+            ncu_cmd = "ncu" if shutil.which("ncu") else "nv-nsight-cu-cli"
             cmd = [
-                "nv-nsight-cu-cli",
+                ncu_cmd,
+                "-f",  # Force overwrite existing report files
                 "--csv",
                 "--log-file",
                 str(csv_path),
@@ -596,7 +600,7 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             try:
                 subprocess.run(cmd, check=True, env=env)
             except FileNotFoundError as exc:
-                print(f"[WARN] nv-nsight-cu-cli not found: {exc}. Skipping NCU collection.")
+                print(f"[WARN] {ncu_cmd} not found: {exc}. Skipping NCU collection.")
                 return {}
             except subprocess.CalledProcessError as exc:
                 print(f"[WARN] nv-nsight-cu-cli failed for modes {scv_mode}/{nwor_mode}: {exc}")
