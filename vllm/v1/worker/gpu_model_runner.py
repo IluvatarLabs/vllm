@@ -2896,14 +2896,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             )
                             self._scv_graph_cache[key] = entry
                             logger.info("SCV: Graph capture successful for %s", key[:4])
-                        mask_buf = entry.replay(
-                            draft_ids,
-                            cu_int32,
-                            sampled_token_ids,
-                        )
+                            # Use mask buffer directly from capture, no need to replay
+                            mask_buf = entry.mask_buffer.clone()
+                        else:
+                            # Replay cached entry
+                            mask_buf = entry.replay(
+                                draft_ids,
+                                cu_int32,
+                                sampled_token_ids,
+                            )
                         self._scv_graph_failures.pop(key, None)
                         return mask_buf
-                    except RuntimeError as exc:
+                    except Exception as exc:
                         self._scv_graph_failures[key] = (
                             self._scv_graph_failures.get(key, 0) + 1
                         )
