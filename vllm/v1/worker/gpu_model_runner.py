@@ -2636,12 +2636,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         sampled_token_ids: torch.Tensor | None,
     ) -> None:
         manager = self._deferred_write_manager
+        debug = getattr(self, "_nwor_debug", False)
         if not manager.window_active:
-            if getattr(self, "_nwor_debug", False):
+            if debug:
                 logger.debug("NWOR: Finalize called but window not active")
             return
 
-        debug = getattr(self, "_nwor_debug", False)
         if debug:
             logger.debug("NWOR: Finalizing window")
         try:
@@ -2709,16 +2709,36 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 spec_decode_metadata, sampled_token_ids, total_tokens, work_device
             )
             if mask is not None:
-                accepted_counts: list[int] = []
+                # Batch all sums to minimize GPU-CPU synchronization
+                sum_tensors: list[torch.Tensor | None] = []
                 start = 0
                 for draft_count in num_draft_tokens:
                     count = int(draft_count)
                     if count == 0:
-                        accepted_counts.append(0)
+                        sum_tensors.append(None)
                         continue
                     slice_view = mask[start : start + count]
-                    accepted_counts.append(int(slice_view.sum().item()))
+                    sum_tensors.append(slice_view.sum())
                     start += count
+
+                # Single sync for all non-zero counts
+                valid_sums = [s for s in sum_tensors if s is not None]
+                if valid_sums:
+                    all_counts_tensor = torch.stack(valid_sums).cpu()
+                    counts_list = all_counts_tensor.tolist()
+                else:
+                    counts_list = []
+
+                # Reconstruct accepted_counts with zeros
+                accepted_counts: list[int] = []
+                counts_idx = 0
+                for s in sum_tensors:
+                    if s is None:
+                        accepted_counts.append(0)
+                    else:
+                        accepted_counts.append(int(counts_list[counts_idx]))
+                        counts_idx += 1
+
                 if return_mask and mask.device != target_device:
                     mask = mask.to(device=target_device)
                 if not return_mask:
@@ -2726,15 +2746,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 return accepted_counts, mask
 
         draft_ids = spec_decode_metadata.draft_token_ids
-        if draft_ids.device != work_device:
-            draft_ids = draft_ids.to(device=work_device)
-        draft_ids = draft_ids.to(dtype=sampled_token_ids.dtype, copy=False)
+        # Combine device and dtype conversion in single operation
+        draft_ids = draft_ids.to(device=work_device, dtype=sampled_token_ids.dtype, copy=False)
 
         if return_mask:
             mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
         else:
             mask_work = None
-        accepted_counts = []
+        sum_tensors: list[torch.Tensor | None] = []
 
         if sampled_token_ids.ndim == 0:
             zero_counts = [0 for _ in num_draft_tokens]
@@ -2749,21 +2768,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             leading = sampled_token_ids.shape[0]
             sampled_token_ids = sampled_token_ids.reshape(leading, -1)
 
+        # Hoist device/dtype conversion outside loop (all rows share same device/dtype)
+        sampled_token_ids = sampled_token_ids.to(device=work_device, dtype=draft_ids.dtype)
+
         start = 0
         for req_idx, draft_count in enumerate(num_draft_tokens):
             draft_count = int(draft_count)
             if draft_count == 0:
-                accepted_counts.append(0)
+                sum_tensors.append(None)
                 continue
             end = start + draft_count
             if req_idx >= sampled_token_ids.shape[0]:
                 row = sampled_token_ids.new_empty((0,), dtype=sampled_token_ids.dtype)
             else:
                 row = sampled_token_ids[req_idx]
-            if row.device != work_device:
-                row = row.to(device=work_device)
-            if row.dtype != draft_ids.dtype:
-                row = row.to(dtype=draft_ids.dtype)
             if row.ndim == 0:
                 row = row.unsqueeze(0)
             elif row.ndim > 1:
@@ -2784,11 +2802,29 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             if mask_work is not None:
                 mask_work[start:end] = prefix_full
-            accepted_counts.append(int(prefix_full.sum().item()))
+            sum_tensors.append(prefix_full.sum())
             start = end
 
         if start != total_tokens:
             return None, None
+
+        # Batch all sums to minimize GPU-CPU synchronization
+        valid_sums = [s for s in sum_tensors if s is not None]
+        if valid_sums:
+            all_counts_tensor = torch.stack(valid_sums).cpu()
+            counts_list = all_counts_tensor.tolist()
+        else:
+            counts_list = []
+
+        # Reconstruct accepted_counts with zeros
+        accepted_counts: list[int] = []
+        counts_idx = 0
+        for s in sum_tensors:
+            if s is None:
+                accepted_counts.append(0)
+            else:
+                accepted_counts.append(int(counts_list[counts_idx]))
+                counts_idx += 1
 
         if not return_mask:
             return accepted_counts, None
@@ -2842,10 +2878,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if draft_ids.device != device:
             draft_ids = draft_ids.to(device=device)
 
-        cu = spec_decode_metadata.cu_num_draft_tokens.to(device=device)
-        cu_int32 = cu
-        if cu.dtype != torch.int32:
-            cu_int32 = cu.to(torch.int32)
+        # Combine device and dtype conversion in single operation
+        cu_int32 = spec_decode_metadata.cu_num_draft_tokens.to(device=device, dtype=torch.int32)
 
         if self._scv_mode == "graph" and self._scv_capture_available:
             if not hasattr(torch.cuda, "CUDAGraph"):
@@ -2856,7 +2890,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 num_reqs = len(spec_decode_metadata.num_draft_tokens)
                 dtype = sampled_token_ids.dtype
-                cu_tuple = tuple(cu_int32.cpu().tolist())
+                # Compute cumulative sum on CPU to avoid GPU->CPU sync
+                import itertools
+                cu_tuple = tuple(itertools.accumulate(
+                    [0] + list(spec_decode_metadata.num_draft_tokens)
+                ))
                 key = (
                     num_reqs,
                     max_spec_len,
