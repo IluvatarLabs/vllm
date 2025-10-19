@@ -454,7 +454,7 @@ class _SCVGraphEntry:
         ],
         max_entries: int,
     ) -> None:
-        if len(cache) < max_entries:
+        if not cache or len(cache) < max_entries:
             return
         oldest_key, _ = min(cache.items(), key=lambda item: item[1].last_used)
         cache.pop(oldest_key, None)
@@ -2169,7 +2169,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
-                assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
+                if encoder_output is None:
+                    raise ValueError(f"Encoder cache miss for {mm_hash}.")
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
