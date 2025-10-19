@@ -12,17 +12,17 @@ except RuntimeError as exc:  # e.g., torch.cuda init failure on CPU-only envs
     pytest.skip(f"GPUModelRunner unavailable: {exc}", allow_module_level=True)
 
 
-def _make_metadata(draft_token_ids: list[int], per_request: list[int]) -> SpecDecodeMetadata:
+def _make_metadata(draft_token_ids: list[int], per_request: list[int], device: str = "cpu") -> SpecDecodeMetadata:
     total = len(draft_token_ids)
-    cu = torch.tensor(per_request, dtype=torch.int32)
+    cu = torch.tensor(per_request, dtype=torch.int32, device=device)
     cu = torch.cumsum(cu, dim=0)
     return SpecDecodeMetadata(
-        draft_token_ids=torch.tensor(draft_token_ids, dtype=torch.int32),
+        draft_token_ids=torch.tensor(draft_token_ids, dtype=torch.int32, device=device),
         num_draft_tokens=list(per_request),
         cu_num_draft_tokens=cu,
-        target_logits_indices=torch.zeros(total, dtype=torch.int32),
-        bonus_logits_indices=torch.zeros(len(per_request), dtype=torch.int32),
-        logits_indices=torch.zeros(total + len(per_request), dtype=torch.int32),
+        target_logits_indices=torch.zeros(total, dtype=torch.int32, device=device),
+        bonus_logits_indices=torch.zeros(len(per_request), dtype=torch.int32, device=device),
+        logits_indices=torch.zeros(total + len(per_request), dtype=torch.int32, device=device),
     )
 
 
@@ -34,6 +34,8 @@ def _make_mock_runner(scv_mode="off"):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner._scv_mode = scv_mode
     runner._scv_debug = False  # Required by _scv_enabled()
+    runner._scv_profile = False  # Required by _scv_nvtx_range()
+    runner._nwor_debug = False  # Required by NWOR paths
     runner._scv_capture_available = True  # For graph mode checks
     runner._scv_graph_executor = None  # For graph capture
     runner._scv_graph_cache = {}  # Required for graph mode
@@ -232,6 +234,8 @@ def test_scv_vectorized_mask_matches_reference():
     assert counts == [2]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not hasattr(torch.cuda, "CUDAGraph"), reason="Requires CUDA graphs")
 def test_scv_mask_handles_oob_gracefully():
     """Test that SCV mask computation handles out-of-bounds access gracefully.
 
@@ -239,11 +243,11 @@ def test_scv_mask_handles_oob_gracefully():
     than the draft token count, which previously caused device-side asserts.
     """
     # 4 draft tokens for one request
-    metadata = _make_metadata([10, 20, 30, 40], [4])
+    metadata = _make_metadata([10, 20, 30, 40], [4], device="cuda")
 
     # But sampled_token_ids only has 2 columns (should trigger clamping)
     # This simulates the case where not all draft tokens have been sampled yet
-    sampled = torch.tensor([[10, 20]], dtype=torch.int32)
+    sampled = torch.tensor([[10, 20]], dtype=torch.int32, device="cuda")
 
     runner = _make_mock_runner(scv_mode="graph")
 
@@ -291,23 +295,20 @@ def test_scv_mask_invalid_shape_falls_back():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not hasattr(torch.cuda, "CUDAGraph"), reason="Requires CUDA graphs")
 def test_scv_graph_inplace_matches_reference():
-    metadata = _make_metadata([10, 20, 30, 40], [4])
+    metadata_cpu = _make_metadata([10, 20, 30, 40], [4], device="cpu")
+    metadata_cuda = _make_metadata([10, 20, 30, 40], [4], device="cuda")
     sampled = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.int32, device="cuda")
 
-    runner_ref = GPUModelRunner.__new__(GPUModelRunner)
-    runner_ref._scv_mode = "off"
+    runner_ref = _make_mock_runner(scv_mode="off")
     counts_ref, mask_ref = runner_ref._compute_nwor_acceptance(
-        metadata, sampled.cpu(), return_mask=True
+        metadata_cpu, sampled.cpu(), return_mask=True
     )
 
-    runner_graph = GPUModelRunner.__new__(GPUModelRunner)
-    runner_graph._scv_mode = "graph"
-    runner_graph._scv_capture_available = True
-    runner_graph._scv_graph_cache = {}
-    runner_graph._scv_graph_failures = {}
+    runner_graph = _make_mock_runner(scv_mode="graph")
     counts_graph, mask_graph = runner_graph._compute_nwor_acceptance(
-        metadata, sampled, return_mask=True
+        metadata_cuda, sampled, return_mask=True
     )
 
     assert counts_graph == counts_ref
@@ -315,18 +316,15 @@ def test_scv_graph_inplace_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not hasattr(torch.cuda, "CUDAGraph"), reason="Requires CUDA graphs")
 def test_scv_graph_different_cu_patterns():
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner._scv_mode = "graph"
-    runner._scv_capture_available = True
-    runner._scv_graph_cache = {}
-    runner._scv_graph_failures = {}
+    runner = _make_mock_runner(scv_mode="graph")
 
-    metadata1 = _make_metadata([10, 20, 30, 40], [4])
+    metadata1 = _make_metadata([10, 20, 30, 40], [4], device="cuda")
     sampled1 = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.int32, device="cuda")
     runner._compute_nwor_acceptance(metadata1, sampled1, return_mask=True)
 
-    metadata2 = _make_metadata([10, 20, 30, 40], [2, 2])
+    metadata2 = _make_metadata([10, 20, 30, 40], [2, 2], device="cuda")
     sampled2 = torch.tensor(
         [[10, 20, 50], [30, 40, 60]], dtype=torch.int32, device="cuda"
     )
