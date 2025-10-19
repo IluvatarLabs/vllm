@@ -251,6 +251,12 @@ class DeferredWriteManager:
         if not self._window_active:
             return False
 
+        if _in_restricted_context():
+            logger.warning_once(
+                "NWOR: Graph capture detected during staging; skipping staged writes."
+            )
+            return False
+
         if not (_tensor_has_storage(key) and _tensor_has_storage(value)):
             raise ShouldFallback("kv_slice_without_storage")
 

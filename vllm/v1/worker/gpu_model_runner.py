@@ -2731,10 +2731,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         draft_ids = draft_ids.to(dtype=sampled_token_ids.dtype, copy=False)
 
         if return_mask:
-        mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
-    else:
-        mask_work = None
-    accepted_counts = []
+            mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+        else:
+            mask_work = None
+        accepted_counts = []
 
         if sampled_token_ids.ndim == 0:
             zero_counts = [0 for _ in num_draft_tokens]
