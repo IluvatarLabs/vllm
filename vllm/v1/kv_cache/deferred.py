@@ -112,6 +112,16 @@ def _ensure_int32_slots(slot_mapping: Tensor, device: torch.device) -> Tensor:
 def _slice_scale(
     scale: Optional[Tensor], indices: Tensor, entry_length: int
 ) -> Optional[Tensor]:
+    """Slice scale tensor for quantization.
+
+    Args:
+        scale: Scale tensor to slice (None for non-quantized)
+        indices: Indices to select (must be int64)
+        entry_length: Expected length of the entry
+
+    Returns:
+        Sliced scale tensor or None
+    """
     if scale is None:
         return None
     if scale.ndim == 0:
@@ -122,8 +132,7 @@ def _slice_scale(
         return scale.new_empty((0,), dtype=scale.dtype, device=scale.device)
     first_dim = scale.shape[0]
     target = int(indices.numel())
-    if indices.dtype != torch.int64:
-        indices = indices.to(torch.int64)
+    # Caller guarantees indices.dtype == torch.int64
 
     if first_dim == entry_length:
         return torch.index_select(scale, 0, indices)
@@ -177,6 +186,9 @@ class DeferredWriteManager:
         self._req_start_offsets: list[int] = []
         self._entries: list[_LayerEntry] = []
         self._fallback_reason: Optional[str] = None
+        self._cache_storage_checked = False  # Cache storage check per window
+        self._full_window = True  # Track if all entries cover full window
+        self._debug_validate_mask = os.getenv("VLLM_NWOR_DEBUG_VALIDATE_MASK") == "1"
         self._metrics = {
             "windows": 0,
             "tokens_staged": 0,
@@ -228,6 +240,8 @@ class DeferredWriteManager:
         self._entries.clear()
         self._fallback_reason = None
         self._last_window_metrics = None
+        self._cache_storage_checked = False  # Reset per window
+        self._full_window = True  # Reset: assume full window until proven otherwise
         self._metrics["windows"] += 1
         self._metrics["tokens_staged"] += total_tokens
         return True
@@ -278,8 +292,11 @@ class DeferredWriteManager:
         if not (_tensor_has_storage(key) and _tensor_has_storage(value)):
             raise ShouldFallback("kv_slice_without_storage")
 
-        if not (_tensor_has_storage(key_cache) and _tensor_has_storage(value_cache)):
-            raise ShouldFallback("kv_cache_not_materialized")
+        # Cache storage check: all layers in same forward pass have same cache properties
+        if not self._cache_storage_checked:
+            if not (_tensor_has_storage(key_cache) and _tensor_has_storage(value_cache)):
+                raise ShouldFallback("kv_cache_not_materialized")
+            self._cache_storage_checked = True
 
         slot_mapping = _ensure_int32_slots(slot_mapping, key.device)
 
@@ -307,6 +324,11 @@ class DeferredWriteManager:
         )
         self._entries.append(entry)
         self._layer_staged_tokens[layer_id] = layer_offset + length
+
+        # Track if all entries cover full window (start=0, length=expected_tokens)
+        if self._full_window and (layer_offset != 0 or length != self._expected_tokens):
+            self._full_window = False
+
         return True
 
     # ------------------------------------------------------------------
@@ -351,7 +373,7 @@ class DeferredWriteManager:
                         entry.value_source,
                         entry.key_cache,
                         entry.value_cache,
-                        _ensure_int32_slots(entry.slot_mapping, entry.slot_mapping.device),
+                        entry.slot_mapping,  # Already ensured int32/contiguous at staging
                         entry.kv_cache_dtype,
                         entry.k_scale,
                         entry.v_scale,
@@ -540,7 +562,7 @@ class DeferredWriteManager:
         if mask.device != target_device:
             mask = mask.to(device=target_device)
 
-        if os.getenv("VLLM_NWOR_DEBUG_VALIDATE_MASK") == "1":
+        if self._debug_validate_mask:
             for req_idx, req_tokens in enumerate(self._num_draft_tokens):
                 start = self._req_start_offsets[req_idx]
                 end = start + req_tokens
@@ -581,9 +603,8 @@ class DeferredWriteManager:
         if accepted_indices.dtype != torch.int64:
             accepted_indices = accepted_indices.to(torch.int64)
 
-        full_window = all(
-            entry.start == 0 and entry.length == expected_tokens for entry in self._entries
-        )
+        # Use cached full_window flag computed during staging
+        full_window = self._full_window
 
         for entry in self._entries:
             entry_start = entry.start
