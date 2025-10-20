@@ -2762,6 +2762,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         accepted_counts.append(int(counts_list[counts_idx]))
                         counts_idx += 1
 
+                accepted_total = sum(accepted_counts)
+                if self._scv_mode == "adaptive" and mask is not None:
+                    self._scv_update_controller(
+                        spec_decode_metadata, accepted_total, total_tokens
+                    )
                 if return_mask and mask.device != target_device:
                     mask = mask.to(device=target_device)
                 if not return_mask:
@@ -2982,7 +2987,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         )
 
         if self._scv_mode == "adaptive":
-            mask = self._profiled_scv_mask(
+            return self._profiled_scv_mask(
                 draft_ids,
                 num_draft_tensor,
                 cu_int32,
@@ -2990,10 +2995,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 max_spec_len,
                 total_tokens,
             )
-            self._scv_update_controller(spec_decode_metadata, mask)
-            return mask
 
-        mask = self._profiled_scv_mask(
+        return self._profiled_scv_mask(
             draft_ids,
             num_draft_tensor,
             cu_int32,
@@ -3001,7 +3004,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             max_spec_len,
             total_tokens,
         )
-        return mask
 
     def _profiled_scv_mask(
         self,
@@ -3145,13 +3147,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _scv_update_controller(
         self,
         spec_decode_metadata: SpecDecodeMetadata,
-        mask: torch.Tensor,
+        accepted_total: int,
+        total_tokens: int,
     ) -> None:
         target_ratio = 0.6
         alpha = 0.2
-        accepted = int(mask.sum().item())
-        total = max(mask.numel(), 1)
-        ratio = accepted / total
+        total = max(total_tokens, 1)
+        ratio = accepted_total / total
         prev = getattr(self, "_scv_accept_ratio", target_ratio)
         new_ratio = (1 - alpha) * prev + alpha * ratio
         self._scv_accept_ratio = new_ratio
