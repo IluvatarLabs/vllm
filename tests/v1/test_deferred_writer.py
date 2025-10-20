@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from collections import defaultdict
 
 from vllm.v1.kv_cache.deferred import DeferredWriteManager, ShouldFallback
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -140,6 +141,37 @@ def test_deferred_manager_multiple_layers_full_window():
     assert manager.pop_last_window_metrics() is None
 
 
+def test_fallback_metrics_no_inflation():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([3, 2])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    def writer(*_args, **_kwargs):
+        pass
+
+    for idx in range(32):
+        manager.stage_layer(
+            layer_id=f"layer{idx}",
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp16",
+            k_scale=None,
+            v_scale=None,
+            writer=writer,
+        )
+
+    manager.cancel_and_flush("test")
+    metrics = manager.get_metrics()
+    assert metrics["tokens_fallback"] == 5
+
+
 def test_deferred_manager_global_segments_multi_request():
     manager = DeferredWriteManager()
     assert manager.begin_window([3, 2])
@@ -177,6 +209,54 @@ def test_deferred_manager_global_segments_multi_request():
     for layer_id in ("layer0", "layer1"):
         assert len(writes_per_layer[layer_id]) == 1
         assert torch.equal(writes_per_layer[layer_id][0], expected_slots)
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 3,
+        "rejected": 2,
+        "fallback": 0,
+    }
+
+
+def test_multi_request_partial_acceptance_writes():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([3, 2])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    writes = defaultdict(list)
+
+    def make_writer(layer_id: str):
+        def _writer(key_slice, *_args):
+            writes[layer_id].append(int(key_slice.shape[0]))
+
+        return _writer
+
+    for layer_id in ("layer0", "layer1"):
+        manager.stage_layer(
+            layer_id=layer_id,
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp16",
+            k_scale=None,
+            v_scale=None,
+            writer=make_writer(layer_id),
+        )
+
+    manager.commit([2, 1])
+
+    total_writes = sum(len(v) for v in writes.values())
+    total_tokens = sum(sum(v) for v in writes.values())
+
+    assert total_writes == 4  # 2 layers × 2 segments
+    assert total_tokens == 6  # (2 + 1) tokens per layer
 
     metrics = manager.pop_last_window_metrics()
     assert metrics == {
