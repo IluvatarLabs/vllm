@@ -136,6 +136,44 @@ def test_deferred_manager_multiple_layers_full_window():
         "fallback": 0,
     }
 
+    # Clear for remainder
+    assert manager.pop_last_window_metrics() is None
+
+
+def test_deferred_manager_metrics_on_fallback():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([2])
+
+    key = torch.randn(2, 1, 2)
+    value = torch.randn(2, 1, 2)
+    slot_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    key_cache = torch.empty_like(key)
+    value_cache = torch.empty_like(value)
+
+    def writer(*_args, **_kwargs):
+        raise RuntimeError("forced failure")
+
+    manager.stage_layer(
+        layer_id="layer0",
+        key=key,
+        value=value,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype="fp16",
+        k_scale=None,
+        v_scale=None,
+        writer=writer,
+    )
+
+    with pytest.raises(ShouldFallback):
+        manager.commit([1])
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics is not None
+    assert metrics["fallback"] == 1
+    assert manager._metrics["tokens_fallback"] == 2
+
 
 def test_deferred_manager_cancel_flush_writes_all():
     manager = DeferredWriteManager()

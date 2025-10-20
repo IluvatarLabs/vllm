@@ -468,7 +468,7 @@ class DeferredWriteManager:
         # (committed_total counts writes across all layers, but accepted_counts
         # tells us how many draft tokens were actually accepted)
         rejected = self._expected_tokens - accepted_total
-        self._metrics["tokens_committed"] += committed_total
+        self._metrics["tokens_committed"] += accepted_total
         self._metrics["tokens_rejected"] += rejected
         self._last_window_metrics = {
             "mode": self._mode,
@@ -511,7 +511,7 @@ class DeferredWriteManager:
             except Exception:  # pragma: no cover - log and continue
                 logger.exception("NWOR fallback failed for layer %s", entry.layer_id)
         if self._entries:
-            flushed_tokens = self._expected_tokens or sum(e.length for e in self._entries)
+            flushed_tokens = self._expected_tokens
             self._metrics["tokens_fallback"] += flushed_tokens
 
     def _record_fallback(self, reason: str) -> None:
