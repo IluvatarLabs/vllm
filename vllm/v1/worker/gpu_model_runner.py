@@ -3,9 +3,9 @@
 
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
-from dataclasses import dataclass
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -26,6 +26,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
+    CompilationConfig,
     CompilationLevel,
     CUDAGraphMode,
     VllmConfig,
@@ -165,6 +166,55 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _parse_debug_flag(env_name: str) -> bool:
+    value = os.getenv(env_name)
+    if value is None:
+        return False
+    value = value.strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _probe_scv_capture(
+    enabled_mode: str,
+    device: torch.device,
+    scv_debug: bool,
+    compilation_config: CompilationConfig | None,
+) -> bool:
+    if enabled_mode != "graph":
+        return True
+    if not torch.cuda.is_available():
+        if scv_debug:
+            logger.warning(
+                "SCV: CUDA graphs unavailable on this device; using vectorized path."
+            )
+        return False
+    if (
+        compilation_config is not None
+        and compilation_config.cudagraph_mode is not None
+        and compilation_config.cudagraph_mode.has_full_cudagraphs()
+    ):
+        if scv_debug:
+            logger.warning(
+                "SCV: Full CUDA graph mode active (%s); skipping SCV graph capture.",
+                compilation_config.cudagraph_mode,
+            )
+        return False
+
+    try:
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            torch.empty(0, device=device)
+        return True
+    except RuntimeError as exc:
+        if scv_debug:
+            logger.warning(
+                "SCV: Unable to initialize CUDA graph capture (%s); using vectorized path.",
+                exc,
+            )
+        return False
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -217,7 +267,203 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         return output
 
 
+class _SCVGraphEntry:
+    """CUDA graph entry with zero-allocation replay for SCV mask computation."""
+
+    def __init__(
+        self,
+        num_reqs: int,
+        max_spec_len: int,
+        sample_cols: int,
+        total_tokens: int,
+        cu_tuple: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.device = device
+        self.dtype = dtype
+        self.num_reqs = num_reqs
+        self.total_tokens = total_tokens
+        self.max_spec_len = max_spec_len
+        self.sample_cols = sample_cols
+        self.key = (
+            num_reqs,
+            max_spec_len,
+            sample_cols,
+            total_tokens,
+            cu_tuple,
+            dtype,
+            device,
+        )
+
+        # CUDA graph objects.
+        self.graph = torch.cuda.CUDAGraph()
+
+        # Input buffers.
+        self.draft_buffer = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.num_draft_buffer = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.cu_buffer = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.sampled_buffer = torch.empty(
+            (num_reqs, sample_cols), dtype=dtype, device=device
+        )
+
+        # Intermediate buffers.
+        self.indices_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.req_idx_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.prev_cu_buf = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.pos_in_req_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.pos_clamped_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.flat_index_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.gathered_buf = torch.empty(total_tokens, dtype=dtype, device=device)
+        self.within_bounds_buf = torch.empty(
+            total_tokens, dtype=torch.bool, device=device
+        )
+        self.token_match_buf = torch.empty(
+            total_tokens, dtype=torch.bool, device=device
+        )
+        self.comparison_buf = torch.empty(total_tokens, dtype=torch.bool, device=device)
+        self.not_comparison_buf = torch.empty(
+            total_tokens, dtype=torch.bool, device=device
+        )
+        self.values_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.max_val_buf = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        self.accepted_buf = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        self.accepted_eq_max_buf = torch.empty(num_reqs, dtype=torch.bool, device=device)
+        self.accepted_broadcast_buf = torch.empty(
+            total_tokens, dtype=torch.int32, device=device
+        )
+
+        # Output buffer.
+        self.mask_buffer = torch.empty(total_tokens, dtype=torch.bool, device=device)
+
+        self.last_used = time.monotonic()
+
+    def capture(
+        self,
+        draft_ids: torch.Tensor,
+        num_draft_tokens: list[int],
+        cu_num_draft_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        max_spec_len: int,
+        total_tokens: int,
+    ) -> None:
+        """Capture the SCV mask kernel with zero allocations."""
+        with torch.cuda.device(self.device):
+            if cu_num_draft_tokens.dtype != torch.int32:
+                cu_num_draft_tokens = cu_num_draft_tokens.to(torch.int32)
+
+            # Populate buffers.
+            self.num_draft_buffer.copy_(
+                torch.tensor(num_draft_tokens, dtype=torch.int32, device=self.device)
+            )
+            self.draft_buffer.copy_(draft_ids)
+            self.cu_buffer.copy_(cu_num_draft_tokens)
+            self.sampled_buffer.copy_(sampled_token_ids)
+
+            torch.cuda.synchronize()
+
+            GPUModelRunner._scv_compute_mask_inplace(
+                self.draft_buffer,
+                self.num_draft_buffer,
+                self.cu_buffer,
+                self.sampled_buffer,
+                max_spec_len,
+                total_tokens,
+                self.indices_buf,
+                self.req_idx_buf,
+                self.prev_cu_buf,
+                self.pos_in_req_buf,
+                self.pos_clamped_buf,
+                self.flat_index_buf,
+                self.gathered_buf,
+                self.within_bounds_buf,
+                self.token_match_buf,
+                self.comparison_buf,
+                self.not_comparison_buf,
+                self.values_buf,
+                self.max_val_buf,
+                self.accepted_buf,
+                self.accepted_eq_max_buf,
+                self.accepted_broadcast_buf,
+                self.mask_buffer,
+            )
+
+            torch.cuda.synchronize()
+
+            with torch.cuda.graph(self.graph):
+                GPUModelRunner._scv_compute_mask_inplace(
+                    self.draft_buffer,
+                    self.num_draft_buffer,
+                    self.cu_buffer,
+                    self.sampled_buffer,
+                    max_spec_len,
+                    total_tokens,
+                    self.indices_buf,
+                    self.req_idx_buf,
+                    self.prev_cu_buf,
+                    self.pos_in_req_buf,
+                    self.pos_clamped_buf,
+                    self.flat_index_buf,
+                    self.gathered_buf,
+                    self.within_bounds_buf,
+                    self.token_match_buf,
+                    self.comparison_buf,
+                    self.not_comparison_buf,
+                    self.values_buf,
+                    self.max_val_buf,
+                    self.accepted_buf,
+                    self.accepted_eq_max_buf,
+                    self.accepted_broadcast_buf,
+                    self.mask_buffer,
+                )
+
+    def replay(
+        self,
+        draft_ids: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replay the captured graph with new inputs and return a cloned mask."""
+        with torch.cuda.device(self.device):
+            if cu_num_draft_tokens.dtype != torch.int32:
+                cu_num_draft_tokens = cu_num_draft_tokens.to(torch.int32)
+
+            self.draft_buffer.copy_(draft_ids)
+            self.cu_buffer.copy_(cu_num_draft_tokens)
+            self.sampled_buffer.copy_(sampled_token_ids)
+
+            self.graph.replay()
+            self.last_used = time.monotonic()
+
+            torch.cuda.synchronize()
+            return self.mask_buffer.clone()
+
+    @staticmethod
+    def _evict_entry(
+        cache: dict[
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                tuple[int, ...],
+                torch.dtype,
+                torch.device,
+            ],
+            "_SCVGraphEntry",
+        ],
+        max_entries: int,
+    ) -> None:
+        if not cache or len(cache) < max_entries:
+            return
+        oldest_key, _ = min(cache.items(), key=lambda item: item[1].last_used)
+        cache.pop(oldest_key, None)
+
+
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+    # Maximum number of SCV CUDA graph cache entries before eviction
+    _SCV_GRAPH_CACHE_MAX_SIZE = 32
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -511,7 +757,55 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._deferred_write_manager = DeferredWriteManager(mode=envs.VLLM_NWOR_MODE)
         self._latest_nwor_window_metrics: dict[str, int | str] | None = None
         self._scv_mode = envs.VLLM_SCV_MODE.lower()
-        self._scv_graph_executor: SCVGraphExecutor | None = None
+        self._nwor_debug = _parse_debug_flag("VLLM_NWOR_DEBUG")
+        self._scv_debug = _parse_debug_flag("VLLM_SCV_DEBUG")
+        self._scv_profile = _parse_debug_flag("VLLM_SCV_PROFILE")
+        self._scv_graph_cache: dict[
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                tuple[int, ...],
+                torch.dtype,
+                torch.device,
+            ],
+            _SCVGraphEntry,
+        ] = {}
+        self._scv_graph_failures: dict[
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                tuple[int, ...],
+                torch.dtype,
+                torch.device,
+            ],
+            int,
+        ] = {}
+
+        self._scv_capture_available = _probe_scv_capture(
+            self._scv_mode, device, self._scv_debug, self.compilation_config
+        )
+
+        if (
+            self._deferred_write_manager.get_mode() == "stage"
+            and self.compilation_config is not None
+            and getattr(self.compilation_config, "cudagraph_mode", None) is not None
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            logger.warning_once(
+                "NWOR staging disabled: full CUDA graphs are active; using immediate mode."
+            )
+            self._deferred_write_manager.set_mode("immediate")
+
+        # Log NWOR/SCV configuration on init
+        if self.speculative_config:
+            logger.info(
+                "Spec decode enabled: NWOR_MODE=%s, SCV_MODE=%s, NWOR_DEBUG=%s",
+                envs.VLLM_NWOR_MODE, self._scv_mode, self._nwor_debug
+            )
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -522,12 +816,42 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def _scv_enabled(self) -> bool:
-        if not hasattr(self, "_scv_mode"):
-            self._scv_mode = envs.VLLM_SCV_MODE.lower()
         if self._scv_mode not in ("off", "graph", "adaptive"):
             logger.warning("SCV: unsupported mode '%s', disabling.", self._scv_mode)
             self._scv_mode = "off"
+        if self._scv_mode == "graph" and not getattr(self, "_scv_capture_available", True):
+            if self._scv_debug:
+                logger.debug(
+                    "SCV: Graph capture unavailable; falling back to vectorized acceptance."
+                )
         return self._scv_mode != "off"
+
+    @contextmanager
+    def _scv_nvtx_range(self, name: str):
+        nvtx_mod = None
+        if getattr(self, "_scv_profile", False) and torch.cuda.is_available():
+            try:
+                from torch.cuda import nvtx as nvtx_mod  # type: ignore
+                nvtx_mod.range_push(name)
+            except (ImportError, AttributeError, RuntimeError):
+                nvtx_mod = None
+        try:
+            yield
+        finally:
+            if nvtx_mod is not None:
+                try:
+                    nvtx_mod.range_pop()
+                except RuntimeError:
+                    pass
+
+    def _handle_scv_graph_failure(self, reason: str) -> None:
+        if self._scv_capture_available and (self._scv_debug or self._nwor_debug):
+            logger.warning(
+                "SCV: disabling CUDA graph capture (%s); using vectorized acceptance path.",
+                reason,
+            )
+        self._scv_capture_available = False
+        self._scv_graph_executor = None
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -1845,7 +2169,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
-                assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
+                if encoder_output is None:
+                    raise ValueError(f"Encoder cache miss for {mm_hash}.")
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
@@ -2260,26 +2585,51 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self, spec_decode_metadata: SpecDecodeMetadata | None
     ) -> None:
         set_global_deferred_manager(None)
+        debug = getattr(self, "_nwor_debug", False)
 
         if envs.VLLM_DISABLE_NWOR:
+            if debug:
+                logger.debug("NWOR: Disabled via VLLM_DISABLE_NWOR")
+            self._deferred_write_manager.finish_step()
             self._latest_nwor_window_metrics = None
             return
 
         self._deferred_write_manager.set_mode(envs.VLLM_NWOR_MODE)
         self._latest_nwor_window_metrics = None
 
-        if self._deferred_write_manager.get_mode() != "stage":
+        current_mode = self._deferred_write_manager.get_mode()
+        if current_mode != "stage":
+            if debug:
+                logger.debug("NWOR: Mode is '%s', not 'stage'. Skipping window.", current_mode)
+            self._deferred_write_manager.finish_step()
             return
 
-        if self.speculative_config is None or spec_decode_metadata is None:
+        if self.speculative_config is None:
+            if debug:
+                logger.debug("NWOR: No speculative_config, skipping window")
+            return
+
+        if spec_decode_metadata is None:
+            if debug:
+                logger.debug("NWOR: No spec_decode_metadata this step, skipping window")
             return
 
         num_draft_tokens = spec_decode_metadata.num_draft_tokens
-        if not num_draft_tokens or sum(int(n) for n in num_draft_tokens) <= 0:
+        total_draft = sum(int(n) for n in num_draft_tokens) if num_draft_tokens else 0
+        if total_draft <= 0:
+            if debug:
+                logger.debug("NWOR: No draft tokens (%s), skipping window", num_draft_tokens)
             return
 
+        if debug:
+            logger.info(
+                "NWOR: Beginning window with %d draft tokens across %d requests",
+                total_draft, len(num_draft_tokens)
+            )
         if self._deferred_write_manager.begin_window(num_draft_tokens):
             set_global_deferred_manager(self._deferred_write_manager)
+            if debug:
+                logger.debug("NWOR: Window active, global manager set")
 
     def _finalize_nwor_window(
         self,
@@ -2287,24 +2637,49 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         sampled_token_ids: torch.Tensor | None,
     ) -> None:
         manager = self._deferred_write_manager
+        debug = getattr(self, "_nwor_debug", False)
         if not manager.window_active:
+            if debug:
+                logger.debug("NWOR: Finalize called but window not active")
             return
 
+        if debug:
+            logger.debug("NWOR: Finalizing window")
         try:
             if spec_decode_metadata is None or sampled_token_ids is None:
+                if debug:
+                    logger.warning(
+                        "NWOR: Missing metadata (spec=%s, sampled=%s), canceling window",
+                        spec_decode_metadata is not None, sampled_token_ids is not None
+                    )
                 manager.cancel_and_flush("missing_spec_metadata")
             else:
-                mask = self._build_nwor_acceptance_mask(
-                    spec_decode_metadata, sampled_token_ids
+                need_mask = self._scv_enabled()
+                if debug:
+                    logger.debug("NWOR: Computing acceptance (SCV=%s)", need_mask)
+                accepted_counts, mask = self._compute_nwor_acceptance(
+                    spec_decode_metadata, sampled_token_ids, return_mask=need_mask
                 )
-                if mask is None:
+                if accepted_counts is None:
+                    if debug:
+                        logger.warning("NWOR: Acceptance computation failed, canceling window")
                     manager.cancel_and_flush("accept_mask_construction_failed")
                 else:
-                    manager.commit(mask)
-        except ShouldFallback:
+                    if debug:
+                        total_accepted = sum(accepted_counts)
+                        logger.info(
+                            "NWOR: Committing %d accepted tokens (per-req: %s)",
+                            total_accepted, accepted_counts
+                        )
+                    manager.commit(accepted_counts, mask)
+        except ShouldFallback as e:
+            if debug:
+                logger.warning("NWOR: Fallback triggered: %s", e)
             pass
         finally:
             self._latest_nwor_window_metrics = manager.pop_last_window_metrics()
+            if debug and self._latest_nwor_window_metrics:
+                logger.debug("NWOR: Metrics: %s", self._latest_nwor_window_metrics)
             set_global_deferred_manager(None)
 
     def _cleanup_nwor(self) -> None:
@@ -2314,59 +2689,177 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if pending is not None and self._latest_nwor_window_metrics is None:
             self._latest_nwor_window_metrics = pending
 
-    def _build_nwor_acceptance_mask(
+    def _compute_nwor_acceptance(
         self,
         spec_decode_metadata: SpecDecodeMetadata,
         sampled_token_ids: torch.Tensor,
-    ) -> torch.Tensor | None:
+        *,
+        return_mask: bool = False,
+    ) -> tuple[list[int] | None, torch.Tensor | None]:
+        """Compute acceptance counts for draft tokens in speculative decoding.
+
+        Args:
+            spec_decode_metadata: Metadata containing draft tokens and their counts
+            sampled_token_ids: Target model's sampled tokens to compare against
+            return_mask: If True, return acceptance mask along with counts
+
+        Returns:
+            Tuple of (accepted_counts, mask):
+            - accepted_counts: List of accepted token counts per request (None on error)
+            - mask: Boolean acceptance mask if requested (None if not requested or on error)
+        """
         num_draft_tokens = spec_decode_metadata.num_draft_tokens
         total_tokens = sum(int(n) for n in num_draft_tokens)
         if total_tokens <= 0:
-            return None
+            return [0 for _ in num_draft_tokens], None
+
+        # Validate metadata consistency
+        if spec_decode_metadata.draft_token_ids.shape[0] != total_tokens:
+            logger.error(
+                "NWOR: Inconsistent spec_decode_metadata: draft_token_ids has %d tokens "
+                "but num_draft_tokens sums to %d. Rejecting all draft tokens.",
+                spec_decode_metadata.draft_token_ids.shape[0],
+                total_tokens
+            )
+            return [0 for _ in num_draft_tokens], None
 
         target_device = spec_decode_metadata.draft_token_ids.device
         work_device = sampled_token_ids.device
 
+        mask: torch.Tensor | None = None
         if self._scv_enabled():
             mask = self._scv_vectorized_mask(
                 spec_decode_metadata, sampled_token_ids, total_tokens, work_device
             )
             if mask is not None:
-                if mask.device != target_device:
+                # Batch all sums to minimize GPU-CPU synchronization
+                sum_tensors: list[torch.Tensor | None] = []
+                start = 0
+                for draft_count in num_draft_tokens:
+                    count = int(draft_count)
+                    if count == 0:
+                        sum_tensors.append(None)
+                        continue
+                    slice_view = mask[start : start + count]
+                    sum_tensors.append(slice_view.sum())
+                    start += count
+
+                # Single sync for all non-zero counts
+                valid_sums = [s for s in sum_tensors if s is not None]
+                if valid_sums:
+                    all_counts_tensor = torch.stack(valid_sums).cpu()
+                    counts_list = all_counts_tensor.tolist()
+                else:
+                    counts_list = []
+
+                # Reconstruct accepted_counts with zeros
+                accepted_counts: list[int] = []
+                counts_idx = 0
+                for s in sum_tensors:
+                    if s is None:
+                        accepted_counts.append(0)
+                    else:
+                        accepted_counts.append(int(counts_list[counts_idx]))
+                        counts_idx += 1
+
+                accepted_total = sum(accepted_counts)
+                if self._scv_mode == "adaptive" and mask is not None:
+                    self._scv_update_controller(
+                        spec_decode_metadata, accepted_total, total_tokens
+                    )
+                if return_mask and mask.device != target_device:
                     mask = mask.to(device=target_device)
-                return mask
+                if not return_mask:
+                    mask = None
+                return accepted_counts, mask
 
         draft_ids = spec_decode_metadata.draft_token_ids
-        if draft_ids.device != work_device:
-            draft_ids = draft_ids.to(device=work_device)
-        draft_ids = draft_ids.to(dtype=sampled_token_ids.dtype, copy=False)
+        # Combine device and dtype conversion in single operation
+        draft_ids = draft_ids.to(device=work_device, dtype=sampled_token_ids.dtype, copy=False)
 
-        mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+        if return_mask:
+            mask_work = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+        else:
+            mask_work = None
+        sum_tensors: list[torch.Tensor | None] = []
+
+        if sampled_token_ids.ndim == 0:
+            zero_counts = [0 for _ in num_draft_tokens]
+            if return_mask:
+                empty_mask = torch.zeros(total_tokens, dtype=torch.bool, device=work_device)
+                return zero_counts, empty_mask.to(device=target_device)
+            return zero_counts, None
+
+        if sampled_token_ids.ndim == 1:
+            sampled_token_ids = sampled_token_ids.unsqueeze(0)
+        elif sampled_token_ids.ndim > 2:
+            leading = sampled_token_ids.shape[0]
+            sampled_token_ids = sampled_token_ids.reshape(leading, -1)
+
+        # Hoist device/dtype conversion outside loop (all rows share same device/dtype)
+        sampled_token_ids = sampled_token_ids.to(device=work_device, dtype=draft_ids.dtype)
 
         start = 0
         for req_idx, draft_count in enumerate(num_draft_tokens):
             draft_count = int(draft_count)
             if draft_count == 0:
+                sum_tensors.append(None)
                 continue
             end = start + draft_count
-            row = sampled_token_ids[req_idx, :draft_count]
-            if row.device != work_device:
-                row = row.to(device=work_device)
-            if row.dtype != draft_ids.dtype:
-                row = row.to(dtype=draft_ids.dtype)
+            if req_idx >= sampled_token_ids.shape[0]:
+                row = sampled_token_ids.new_empty((0,), dtype=sampled_token_ids.dtype)
+            else:
+                row = sampled_token_ids[req_idx]
+            if row.ndim == 0:
+                row = row.unsqueeze(0)
+            elif row.ndim > 1:
+                row = row.reshape(-1)
 
-            draft_slice = draft_ids[start:end]
-            comparison = (row == draft_slice)
-            prefix = torch.cumprod(comparison.to(torch.int32), dim=0)
-            mask_work[start:end] = prefix.to(torch.bool)
+            row_len = int(row.shape[0])
+            valid_len = min(row_len, draft_count)
+
+            prefix_full = torch.zeros(draft_count, dtype=torch.bool, device=work_device)
+            if valid_len > 0:
+                row_slice = row[:valid_len]
+                draft_slice = draft_ids[start : start + valid_len]
+                comparison = row_slice == draft_slice
+                prefix_valid = torch.cumprod(
+                    comparison.to(torch.int32), dim=0
+                ).to(torch.bool)
+                prefix_full[:valid_len] = prefix_valid
+
+            if mask_work is not None:
+                mask_work[start:end] = prefix_full
+            sum_tensors.append(prefix_full.sum())
             start = end
 
         if start != total_tokens:
-            return None
+            return None, None
 
+        # Batch all sums to minimize GPU-CPU synchronization
+        valid_sums = [s for s in sum_tensors if s is not None]
+        if valid_sums:
+            all_counts_tensor = torch.stack(valid_sums).cpu()
+            counts_list = all_counts_tensor.tolist()
+        else:
+            counts_list = []
+
+        # Reconstruct accepted_counts with zeros
+        accepted_counts: list[int] = []
+        counts_idx = 0
+        for s in sum_tensors:
+            if s is None:
+                accepted_counts.append(0)
+            else:
+                accepted_counts.append(int(counts_list[counts_idx]))
+                counts_idx += 1
+
+        if not return_mask:
+            return accepted_counts, None
+        assert mask_work is not None
         if mask_work.device == target_device:
-            return mask_work
-        return mask_work.to(device=target_device)
+            return accepted_counts, mask_work
+        return accepted_counts, mask_work.to(device=target_device)
 
     def _scv_vectorized_mask(
         self,
@@ -2377,6 +2870,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> torch.Tensor | None:
         draft_ids = spec_decode_metadata.draft_token_ids
         max_spec_len = spec_decode_metadata.max_spec_len
+
+        # Host-side validation before CUDA operations
+        if sampled_token_ids.ndim != 2:
+            logger.error(
+                "SCV: Expected sampled_token_ids to be 2-D, got shape %s. "
+                "Falling back to non-SCV path.",
+                sampled_token_ids.shape
+            )
+            return None
+
+        num_cols = sampled_token_ids.shape[1]
+        if num_cols <= 0:
+            logger.error(
+                "SCV: sampled_token_ids has %d columns. "
+                "Falling back to non-SCV path.",
+                num_cols
+            )
+            return None
+
+        # Log warning if columns < expected spec length (not an error, just unexpected)
+        expected_cols = max_spec_len + 1
+        if num_cols < expected_cols:
+            logger.warning_once(
+                "SCV: sampled_token_ids has %d columns, expected at least %d. "
+                "Clamping will be applied.",
+                num_cols, expected_cols
+            )
+
         num_draft_tensor = torch.tensor(
             spec_decode_metadata.num_draft_tokens,
             device=device,
@@ -2385,40 +2906,123 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if draft_ids.device != device:
             draft_ids = draft_ids.to(device=device)
 
-        cu = spec_decode_metadata.cu_num_draft_tokens.to(device=device)
+        # Combine device and dtype conversion in single operation
+        cu_int32 = spec_decode_metadata.cu_num_draft_tokens.to(device=device, dtype=torch.int32)
 
-        if hasattr(self, "_scv_mode") and self._scv_mode == "graph":
-            executor = getattr(self, "_scv_graph_executor", None)
-            if executor is None:
-                executor = SCVGraphExecutor(device)
-                self._scv_graph_executor = executor
-            mask = executor.run(
-                spec_decode_metadata, sampled_token_ids, total_tokens
-            )
-            if mask is not None:
-                return mask
+        if self._scv_mode == "graph" and self._scv_capture_available:
+            if not hasattr(torch.cuda, "CUDAGraph"):
+                logger.warning_once(
+                    "SCV: Graph capture requires CUDA graph support; "
+                    "falling back to vectorized path."
+                )
+            else:
+                num_reqs = len(spec_decode_metadata.num_draft_tokens)
+                dtype = sampled_token_ids.dtype
+                # Compute cumulative sum on CPU to avoid GPU->CPU sync
+                cu_tuple = tuple(itertools.accumulate(
+                    [0] + list(spec_decode_metadata.num_draft_tokens)
+                ))
+                key = (
+                    num_reqs,
+                    max_spec_len,
+                    num_cols,
+                    total_tokens,
+                    cu_tuple,
+                    dtype,
+                    device,
+                )
+                if self._scv_graph_failures.get(key, 0) >= 3:
+                    logger.warning_once(
+                        "SCV: Shape %s failed graph capture repeatedly; using "
+                        "vectorized path.",
+                        key[:4],
+                    )
+                else:
+                    entry = self._scv_graph_cache.get(key)
+                    try:
+                        if entry is None:
+                            _SCVGraphEntry._evict_entry(
+                                self._scv_graph_cache, self._SCV_GRAPH_CACHE_MAX_SIZE
+                            )
+                            entry = _SCVGraphEntry(
+                                num_reqs,
+                                max_spec_len,
+                                num_cols,
+                                total_tokens,
+                                cu_tuple,
+                                dtype,
+                                device,
+                            )
+                            entry.capture(
+                                draft_ids,
+                                spec_decode_metadata.num_draft_tokens,
+                                cu_int32,
+                                sampled_token_ids,
+                                max_spec_len,
+                                total_tokens,
+                            )
+                            self._scv_graph_cache[key] = entry
+                            logger.info("SCV: Graph capture successful for %s", key[:4])
+                            # Use mask buffer directly from capture, no need to replay
+                            mask_buf = entry.mask_buffer.clone()
+                        else:
+                            # Replay cached entry
+                            mask_buf = entry.replay(
+                                draft_ids,
+                                cu_int32,
+                                sampled_token_ids,
+                            )
+                        self._scv_graph_failures.pop(key, None)
+                        return mask_buf
+                    except Exception as exc:
+                        self._scv_graph_failures[key] = (
+                            self._scv_graph_failures.get(key, 0) + 1
+                        )
+                        self._scv_graph_cache.pop(key, None)
+                        logger.error(
+                            "SCV: Graph capture/replay failed for %s (%d attempts): %s",
+                            key[:4],
+                            self._scv_graph_failures[key],
+                            exc,
+                        )
 
-        if hasattr(self, "_scv_mode") and self._scv_mode == "adaptive":
-            mask = self._scv_compute_mask(
+        if self._scv_mode == "adaptive":
+            return self._profiled_scv_mask(
                 draft_ids,
                 num_draft_tensor,
-                cu,
+                cu_int32,
                 sampled_token_ids,
                 max_spec_len,
                 total_tokens,
             )
-            self._scv_update_controller(spec_decode_metadata, mask)
-            return mask
 
-        mask = self._scv_compute_mask(
+        return self._profiled_scv_mask(
             draft_ids,
             num_draft_tensor,
-            cu,
+            cu_int32,
             sampled_token_ids,
             max_spec_len,
             total_tokens,
         )
-        return mask
+
+    def _profiled_scv_mask(
+        self,
+        draft_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        max_spec_len: int,
+        total_tokens: int,
+    ) -> torch.Tensor:
+        with self._scv_nvtx_range("scv_compute_mask"):
+            return self._scv_compute_mask(
+                draft_ids,
+                num_draft_tokens,
+                cu_num_draft_tokens,
+                sampled_token_ids,
+                max_spec_len,
+                total_tokens,
+            )
 
     @staticmethod
     def _scv_compute_mask(
@@ -2429,14 +3033,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         max_spec_len: int,
         total_tokens: int,
     ) -> torch.Tensor:
+        """Compute acceptance mask for speculative decoding verification.
+
+        Assumes host-side validation has already been performed.
+        """
         device = draft_ids.device
         indices = torch.arange(total_tokens, device=device, dtype=torch.int32)
         req_idx = torch.bucketize(indices, cu_num_draft_tokens)
         prev_cu = torch.cat([cu_num_draft_tokens.new_zeros(1), cu_num_draft_tokens[:-1]])
         pos_in_req = indices - prev_cu[req_idx]
 
-        gathered = sampled_token_ids[req_idx, pos_in_req]
-        comparison = gathered == draft_ids
+        # Clamp indices and track which are within bounds
+        max_cols = sampled_token_ids.shape[1]
+        pos_clamped = torch.clamp(pos_in_req, max=max_cols - 1)
+        gathered = sampled_token_ids[req_idx, pos_clamped]
+        within_bounds = pos_in_req < max_cols
+        comparison = within_bounds & (gathered == draft_ids)
 
         max_val = max_spec_len + 1
         values = torch.where(
@@ -2461,16 +3073,87 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         mask_flat = pos_in_req < accepted_broadcast
         return mask_flat
 
+    @staticmethod
+    def _scv_compute_mask_inplace(
+        draft_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        max_spec_len: int,
+        total_tokens: int,
+        indices_buf: torch.Tensor,
+        req_idx_buf: torch.Tensor,
+        prev_cu_buf: torch.Tensor,
+        pos_in_req_buf: torch.Tensor,
+        pos_clamped_buf: torch.Tensor,
+        flat_index_buf: torch.Tensor,
+        gathered_buf: torch.Tensor,
+        within_bounds_buf: torch.Tensor,
+        token_match_buf: torch.Tensor,
+        comparison_buf: torch.Tensor,
+        not_comparison_buf: torch.Tensor,
+        values_buf: torch.Tensor,
+        max_val_buf: torch.Tensor,
+        accepted_buf: torch.Tensor,
+        accepted_eq_max_buf: torch.Tensor,
+        accepted_broadcast_buf: torch.Tensor,
+        mask_buf: torch.Tensor,
+    ) -> None:
+        max_cols = sampled_token_ids.shape[1]
+        if max_cols == 0:
+            mask_buf.fill_(False)
+            return
+
+        torch.arange(total_tokens, out=indices_buf)
+        torch.bucketize(indices_buf, cu_num_draft_tokens, out_int32=True, out=req_idx_buf)
+
+        prev_cu_buf[0] = 0
+        if len(cu_num_draft_tokens) > 1:
+            prev_cu_buf[1:].copy_(cu_num_draft_tokens[:-1])
+
+        torch.index_select(prev_cu_buf, 0, req_idx_buf, out=pos_in_req_buf)
+        torch.sub(indices_buf, pos_in_req_buf, out=pos_in_req_buf)
+
+        torch.clamp(pos_in_req_buf, max=max_cols - 1, out=pos_clamped_buf)
+
+        torch.mul(req_idx_buf, max_cols, out=flat_index_buf)
+        torch.add(flat_index_buf, pos_clamped_buf, out=flat_index_buf)
+
+        flat_sampled = sampled_token_ids.view(-1)
+        torch.index_select(flat_sampled, 0, flat_index_buf, out=gathered_buf)
+
+        torch.lt(pos_in_req_buf, max_cols, out=within_bounds_buf)
+        torch.eq(gathered_buf, draft_ids, out=token_match_buf)
+        torch.logical_and(within_bounds_buf, token_match_buf, out=comparison_buf)
+        torch.logical_not(comparison_buf, out=not_comparison_buf)
+
+        max_val = max_spec_len + 1
+        torch.add(pos_in_req_buf, 1, out=values_buf)
+        max_val_buf.fill_(max_val)
+        torch.where(not_comparison_buf, values_buf, max_val_buf, out=values_buf)
+
+        accepted_buf.fill_(max_val)
+        accepted_buf.scatter_reduce_(0, req_idx_buf, values_buf, reduce="amin")
+
+        torch.eq(accepted_buf, max_val, out=accepted_eq_max_buf)
+        torch.sub(accepted_buf, 1, out=accepted_buf)
+        torch.where(
+            accepted_eq_max_buf, num_draft_tokens, accepted_buf, out=accepted_buf
+        )
+
+        torch.index_select(accepted_buf, 0, req_idx_buf, out=accepted_broadcast_buf)
+        torch.lt(pos_in_req_buf, accepted_broadcast_buf, out=mask_buf)
+
     def _scv_update_controller(
         self,
         spec_decode_metadata: SpecDecodeMetadata,
-        mask: torch.Tensor,
+        accepted_total: int,
+        total_tokens: int,
     ) -> None:
         target_ratio = 0.6
         alpha = 0.2
-        accepted = int(mask.sum().item())
-        total = max(mask.numel(), 1)
-        ratio = accepted / total
+        total = max(total_tokens, 1)
+        ratio = accepted_total / total
         prev = getattr(self, "_scv_accept_ratio", target_ratio)
         new_ratio = (1 - alpha) * prev + alpha * ratio
         self._scv_accept_ratio = new_ratio
@@ -2490,6 +3173,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             new_k = base_k
 
+        # Safe to mutate: adaptive mode dynamically tunes per-worker speculation depth
         speculative_config.num_speculative_tokens = new_k
 
     def _bookkeeping_sync(
@@ -2733,6 +3417,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode, batch_descriptor = (
                     self.cudagraph_dispatcher.dispatch(batch_descriptor, use_cascade_attn)
                 )
+
+                if (
+                    spec_decode_metadata is not None
+                    and self._deferred_write_manager.get_mode() == "stage"
+                    and cudagraph_runtime_mode is not CUDAGraphMode.NONE
+                ):
+                    logger.debug_once(
+                        "NWOR: Disabling CUDA graph for spec decode step (mode was %s)",
+                        cudagraph_runtime_mode,
+                    )
+                    cudagraph_runtime_mode = CUDAGraphMode.NONE
 
                 # Set cudagraph mode to none if calc_kv_scales is true.
                 if attn_metadata is not None:
@@ -4973,125 +5668,3 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()
-@dataclass
-class _SCVGraphEntry:
-    num_reqs: int
-    max_spec_len: int
-    total_tokens: int
-    sampled_shape: tuple[int, int]
-    sampled_dtype: torch.dtype
-    draft_dtype: torch.dtype
-    device: torch.device
-
-    def __post_init__(self):
-        self.sampled_buffer = torch.empty(
-            self.sampled_shape, device=self.device, dtype=self.sampled_dtype
-        )
-        self.draft_buffer = torch.empty(
-            (self.total_tokens,), device=self.device, dtype=self.draft_dtype
-        )
-        self.num_tokens_buffer = torch.empty(
-            (self.num_reqs,), device=self.device, dtype=torch.int32
-        )
-        self.cu_buffer = torch.empty(
-            (self.num_reqs,), device=self.device, dtype=torch.int32
-        )
-        self.mask_buffer = torch.empty(
-            (self.total_tokens,), device=self.device, dtype=torch.bool
-        )
-        self.graph = torch.cuda.CUDAGraph()
-        self._captured = False
-
-    def capture(self):
-        if self._captured:
-            return
-        mask = GPUModelRunner._scv_compute_mask(
-            self.draft_buffer,
-            self.num_tokens_buffer,
-            self.cu_buffer,
-            self.sampled_buffer,
-            self.max_spec_len,
-            self.total_tokens,
-        )
-        self.mask_buffer.copy_(mask)
-        torch.cuda.synchronize()
-        with torch.cuda.graph(self.graph):
-            mask = GPUModelRunner._scv_compute_mask(
-                self.draft_buffer,
-                self.num_tokens_buffer,
-                self.cu_buffer,
-                self.sampled_buffer,
-                self.max_spec_len,
-                self.total_tokens,
-            )
-            self.mask_buffer.copy_(mask)
-        self._captured = True
-
-    def run(self):
-        if not self._captured:
-            self.capture()
-        self.graph.replay()
-        return self.mask_buffer
-
-
-class SCVGraphExecutor:
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.entries: dict[tuple[Any, ...], _SCVGraphEntry] = {}
-        self.enabled = torch.cuda.is_available()
-
-    def run(
-        self,
-        spec_decode_metadata: SpecDecodeMetadata,
-        sampled_token_ids: torch.Tensor,
-        total_tokens: int,
-    ) -> torch.Tensor | None:
-        if not self.enabled:
-            return None
-        num_reqs = len(spec_decode_metadata.num_draft_tokens)
-        max_spec_len = spec_decode_metadata.max_spec_len
-        key = (
-            num_reqs,
-            max_spec_len,
-            sampled_token_ids.shape[1],
-            total_tokens,
-            sampled_token_ids.dtype,
-        )
-        entry = self.entries.get(key)
-        need_capture = False
-        if entry is None:
-            entry = _SCVGraphEntry(
-                num_reqs=num_reqs,
-                max_spec_len=max_spec_len,
-                total_tokens=total_tokens,
-                sampled_shape=sampled_token_ids[:, :max_spec_len].shape,
-                sampled_dtype=sampled_token_ids.dtype,
-                draft_dtype=spec_decode_metadata.draft_token_ids.dtype,
-                device=self.device,
-            )
-            self.entries[key] = entry
-            need_capture = True
-        try:
-            sampled_view = sampled_token_ids[:, :max_spec_len]
-            entry.sampled_buffer.copy_(sampled_view)
-            draft_ids = spec_decode_metadata.draft_token_ids.to(self.device)
-            entry.draft_buffer.zero_()
-            entry.draft_buffer[: draft_ids.numel()].copy_(draft_ids)
-            num_tokens_tensor = torch.tensor(
-                spec_decode_metadata.num_draft_tokens,
-                device=self.device,
-                dtype=torch.int32,
-            )
-            entry.num_tokens_buffer.copy_(num_tokens_tensor)
-            cu_tensor = spec_decode_metadata.cu_num_draft_tokens.to(
-                device=self.device, dtype=torch.int32
-            )
-            entry.cu_buffer.copy_(cu_tensor)
-            if need_capture:
-                entry.capture()
-            return entry.run()
-        except RuntimeError as exc:
-            logger.warning("SCV graph execution disabled: %s", exc)
-            self.enabled = False
-            self.entries.clear()
-            return None

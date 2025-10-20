@@ -3,24 +3,48 @@
 
 import pytest
 import torch
+from collections import defaultdict
+from typing import Any
 
 from vllm.v1.kv_cache.deferred import DeferredWriteManager, ShouldFallback
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+try:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+except RuntimeError as exc:  # e.g., torch.cuda init failure on CPU-only envs
+    pytest.skip(f"GPUModelRunner unavailable: {exc}", allow_module_level=True)
 
 
-def _make_metadata(draft_token_ids: list[int], per_request: list[int]) -> SpecDecodeMetadata:
+def _make_metadata(draft_token_ids: list[int], per_request: list[int], device: str = "cpu") -> SpecDecodeMetadata:
     total = len(draft_token_ids)
-    cu = torch.tensor(per_request, dtype=torch.int32)
+    cu = torch.tensor(per_request, dtype=torch.int32, device=device)
     cu = torch.cumsum(cu, dim=0)
     return SpecDecodeMetadata(
-        draft_token_ids=torch.tensor(draft_token_ids, dtype=torch.int32),
+        draft_token_ids=torch.tensor(draft_token_ids, dtype=torch.int32, device=device),
         num_draft_tokens=list(per_request),
         cu_num_draft_tokens=cu,
-        target_logits_indices=torch.zeros(total, dtype=torch.int32),
-        bonus_logits_indices=torch.zeros(len(per_request), dtype=torch.int32),
-        logits_indices=torch.zeros(total + len(per_request), dtype=torch.int32),
+        target_logits_indices=torch.zeros(total, dtype=torch.int32, device=device),
+        bonus_logits_indices=torch.zeros(len(per_request), dtype=torch.int32, device=device),
+        logits_indices=torch.zeros(total + len(per_request), dtype=torch.int32, device=device),
     )
+
+
+def _make_mock_runner(scv_mode="off"):
+    """Create a minimal GPUModelRunner for testing.
+
+    Bypasses __init__ but sets required attributes for SCV/NWOR tests.
+    """
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._scv_mode = scv_mode
+    runner._scv_debug = False  # Required by _scv_enabled()
+    runner._scv_profile = False  # Required by _scv_nvtx_range()
+    runner._nwor_debug = False  # Required by NWOR paths
+    runner._scv_capture_available = True  # For graph mode checks
+    runner._scv_graph_executor = None  # For graph capture
+    runner._scv_graph_cache = {}  # Required for graph mode
+    runner._scv_graph_failures = {}  # Required for blacklisting
+    runner.speculative_config = None  # For NWOR tests
+    runner._deferred_write_manager = DeferredWriteManager()
+    return runner
 
 
 def test_deferred_manager_commit_partial_acceptance():
@@ -51,8 +75,7 @@ def test_deferred_manager_commit_partial_acceptance():
         writer=writer,
     )
 
-    mask = torch.tensor([True, False])
-    manager.commit(mask)
+    manager.commit([1])
 
     assert len(writes) == 1
     committed_key, committed_slots = writes[0]
@@ -65,6 +88,384 @@ def test_deferred_manager_commit_partial_acceptance():
         "rejected": 1,
         "fallback": 0,
     }
+
+
+def test_deferred_manager_multiple_layers_full_window():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([2, 3])
+
+    writes_per_layer: dict[str, list[torch.Tensor]] = {"layer0": [], "layer1": []}
+
+    def make_writer(layer_id: str):
+        def _writer(key, value, key_cache, value_cache, slot_mapping, *_args):
+            writes_per_layer[layer_id].append(slot_mapping.clone())
+
+        return _writer
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    for layer_id in ("layer0", "layer1"):
+        manager.stage_layer(
+            layer_id=layer_id,
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp16",
+            k_scale=None,
+            v_scale=None,
+            writer=make_writer(layer_id),
+        )
+
+    manager.commit([2, 0])
+
+    assert len(writes_per_layer["layer0"]) == 1
+    assert len(writes_per_layer["layer1"]) == 1
+
+    expected_slots = torch.tensor([0, 1], dtype=torch.int32)
+    assert torch.equal(writes_per_layer["layer0"][0], expected_slots)
+    assert torch.equal(writes_per_layer["layer1"][0], expected_slots)
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 2,
+        "rejected": 3,
+        "fallback": 0,
+    }
+
+    # Clear for remainder
+    assert manager.pop_last_window_metrics() is None
+
+
+def test_fallback_metrics_no_inflation():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([3, 2])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    def writer(*_args, **_kwargs):
+        pass
+
+    for idx in range(32):
+        manager.stage_layer(
+            layer_id=f"layer{idx}",
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp16",
+            k_scale=None,
+            v_scale=None,
+            writer=writer,
+        )
+
+    manager.cancel_and_flush("test")
+    metrics = manager.get_metrics()
+    assert metrics["tokens_fallback"] == 5
+
+
+def test_deferred_manager_global_segments_multi_request():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([3, 2])
+
+    writes_per_layer: dict[str, list[torch.Tensor]] = {"layer0": [], "layer1": []}
+
+    def make_writer(layer_id: str):
+        def _writer(key, value, key_cache, value_cache, slot_mapping, *_args):
+            writes_per_layer[layer_id].append(slot_mapping.clone())
+
+        return _writer
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    for layer_id in ("layer0", "layer1"):
+        manager.stage_layer(
+            layer_id=layer_id,
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp16",
+            k_scale=None,
+            v_scale=None,
+            writer=make_writer(layer_id),
+        )
+
+    manager.commit([2, 1])
+
+    expected_slots = torch.tensor([0, 1, 3], dtype=torch.int32)
+    for layer_id in ("layer0", "layer1"):
+        assert len(writes_per_layer[layer_id]) == 1
+        assert torch.equal(writes_per_layer[layer_id][0], expected_slots)
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 3,
+        "rejected": 2,
+        "fallback": 0,
+    }
+
+
+def test_multi_request_partial_acceptance_writes():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([3, 2])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    writes = defaultdict(list)
+
+    def make_writer(layer_id: str):
+        def _writer(key_slice, *_args):
+            writes[layer_id].append(int(key_slice.shape[0]))
+
+        return _writer
+
+    for layer_id in ("layer0", "layer1"):
+        manager.stage_layer(
+            layer_id=layer_id,
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp16",
+            k_scale=None,
+            v_scale=None,
+            writer=make_writer(layer_id),
+        )
+
+    manager.commit([2, 1])
+
+    total_writes = sum(len(v) for v in writes.values())
+    total_tokens = sum(sum(v) for v in writes.values())
+
+    assert total_writes == 4  # 2 layers × 2 segments
+    assert total_tokens == 6  # (2 + 1) tokens per layer
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 3,
+        "rejected": 2,
+        "fallback": 0,
+    }
+
+
+def test_commit_with_mask_full_acceptance():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([5])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    writes = []
+
+    def writer(
+        key_slice,
+        value_slice,
+        key_cache,
+        value_cache,
+        slot_slice,
+        kv_cache_dtype,
+        k_scale_slice,
+        v_scale_slice,
+    ):
+        writes.append(int(key_slice.shape[0]))
+
+    manager.stage_layer(
+        layer_id="layer0",
+        key=key,
+        value=value,
+        key_cache=cache,
+        value_cache=cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype="fp16",
+        k_scale=None,
+        v_scale=None,
+        writer=writer,
+    )
+
+    mask = torch.ones(5, dtype=torch.bool)
+    manager.commit([5], mask)
+
+    assert writes == [5]
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 5,
+        "rejected": 0,
+        "fallback": 0,
+    }
+
+
+def test_commit_with_mask_partial_fp8_scales():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([3, 2])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+    k_scale = torch.linspace(0.1, 0.5, steps=6)  # entry_length + sentinel
+    v_scale = torch.linspace(1.0, 1.5, steps=6)
+
+    captured = {"slots": [], "k_scale": [], "v_scale": []}
+
+    def writer(
+        key_slice,
+        value_slice,
+        key_cache,
+        value_cache,
+        slot_slice,
+        kv_cache_dtype,
+        k_scale_slice,
+        v_scale_slice,
+    ):
+        captured["slots"].append(int(key_slice.shape[0]))
+        captured["k_scale"].append(k_scale_slice.clone() if k_scale_slice is not None else None)
+        captured["v_scale"].append(v_scale_slice.clone() if v_scale_slice is not None else None)
+
+    for layer_id in ("layer0", "layer1"):
+        manager.stage_layer(
+            layer_id=layer_id,
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp8",
+            k_scale=k_scale.clone(),
+            v_scale=v_scale.clone(),
+            writer=writer,
+        )
+
+    mask = torch.tensor([True, True, False, True, False], dtype=torch.bool)
+    manager.commit([2, 1], mask)
+
+    # Each layer should receive a single writer call with 3 tokens (2+1)
+    assert captured["slots"] == [3, 3]
+    for k_s, v_s in zip(captured["k_scale"], captured["v_scale"]):
+        assert k_s is not None and v_s is not None
+        assert k_s.shape[0] == 3 and v_s.shape[0] == 3
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 3,
+        "rejected": 2,
+        "fallback": 0,
+    }
+
+
+def test_commit_with_mask_contiguous_prefix_uses_narrow():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([4])
+
+    slot_mapping = torch.arange(4, dtype=torch.int32)
+    key = torch.randn(4, 1, 2)
+    value = torch.randn(4, 1, 2)
+    cache = torch.empty_like(key)
+
+    flags = {"key_shared": False, "slot_shared": False}
+
+    base_entry_holder: dict[str, Any] = {}
+
+    def writer(
+        key_slice,
+        value_slice,
+        key_cache,
+        value_cache,
+        slot_slice,
+        kv_cache_dtype,
+        k_scale_slice,
+        v_scale_slice,
+    ):
+        base_entry = base_entry_holder["entry"]
+        flags["key_shared"] = key_slice.data_ptr() == base_entry.key_source.data_ptr()
+        flags["slot_shared"] = slot_slice.data_ptr() == base_entry.slot_mapping.data_ptr()
+
+    manager.stage_layer(
+        layer_id="layer0",
+        key=key,
+        value=value,
+        key_cache=cache,
+        value_cache=cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype="fp16",
+        k_scale=None,
+        v_scale=None,
+        writer=writer,
+    )
+
+    base_entry_holder["entry"] = manager._entries[0]
+
+    mask = torch.tensor([True, True, True, False], dtype=torch.bool)
+    manager.commit([3], mask)
+
+    assert flags["key_shared"] is True
+    assert flags["slot_shared"] is True
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 3,
+        "rejected": 1,
+        "fallback": 0,
+    }
+
+
+def test_deferred_manager_metrics_on_fallback():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([2])
+
+    key = torch.randn(2, 1, 2)
+    value = torch.randn(2, 1, 2)
+    slot_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    key_cache = torch.empty_like(key)
+    value_cache = torch.empty_like(value)
+
+    def writer(*_args, **_kwargs):
+        raise RuntimeError("forced failure")
+
+    manager.stage_layer(
+        layer_id="layer0",
+        key=key,
+        value=value,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype="fp16",
+        k_scale=None,
+        v_scale=None,
+        writer=writer,
+    )
+
+    with pytest.raises(ShouldFallback):
+        manager.commit([1])
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics is not None
+    assert metrics["fallback"] == 1
+    assert manager._metrics["tokens_fallback"] == 2
 
 
 def test_deferred_manager_cancel_flush_writes_all():
@@ -125,18 +526,18 @@ def test_build_acceptance_mask_matches_expected():
         dtype=torch.int32,
     )
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    mask = runner._build_nwor_acceptance_mask(metadata, sampled)
+    runner = _make_mock_runner(scv_mode="off")
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
     expected = torch.tensor([True, False, True], dtype=torch.bool)
     assert torch.equal(mask.cpu(), expected)
+    assert counts == [1, 1]
 
 
 def test_nwor_disabled_env(monkeypatch):
     monkeypatch.setenv("VLLM_DISABLE_NWOR", "1")
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.speculative_config = object()
-    runner._deferred_write_manager = DeferredWriteManager()
+    runner = _make_mock_runner(scv_mode="off")
+    runner.speculative_config = object()  # Override to enable NWOR path
 
     metadata = _make_metadata([1, 2], [2])
     runner._maybe_begin_nwor_window(metadata)
@@ -174,7 +575,7 @@ def test_fp8_staging_slices_quant_scales():
         writer=writer,
     )
 
-    manager.commit(torch.tensor([True, False]))
+    manager.commit([1])
 
     assert len(recorded) == 1
     committed_key, committed_value, slots, committed_k_scale = recorded[0]
@@ -196,15 +597,120 @@ def test_nwor_immediate_mode_skips_window():
     assert manager.get_mode() == "immediate"
 
 
+def test_nwor_off_mode_skips_window():
+    manager = DeferredWriteManager(mode="off")
+    assert not manager.begin_window([3])
+    assert manager.get_mode() == "off"
+
+
 def test_scv_vectorized_mask_matches_reference():
     metadata = _make_metadata([1, 2, 3, 4], [4])
     sampled = torch.tensor([[1, 2, 0, 4]], dtype=torch.int32)
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner._scv_mode = "adaptive"
+    runner = _make_mock_runner(scv_mode="adaptive")
 
-    mask = runner._build_nwor_acceptance_mask(metadata, sampled)
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
     assert mask.tolist() == [True, True, False, False]
+    assert counts == [2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not hasattr(torch.cuda, "CUDAGraph"), reason="Requires CUDA graphs")
+def test_scv_mask_handles_oob_gracefully():
+    """Test that SCV mask computation handles out-of-bounds access gracefully.
+
+    This reproduces the scenario where sampled_token_ids has fewer columns
+    than the draft token count, which previously caused device-side asserts.
+    """
+    # 4 draft tokens for one request
+    metadata = _make_metadata([10, 20, 30, 40], [4], device="cuda")
+
+    # But sampled_token_ids only has 2 columns (should trigger clamping)
+    # This simulates the case where not all draft tokens have been sampled yet
+    sampled = torch.tensor([[10, 20]], dtype=torch.int32, device="cuda")
+
+    runner = _make_mock_runner(scv_mode="graph")
+
+    # This should not crash, but should gracefully handle the OOB
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
+
+    # First 2 tokens match, next 2 are out of bounds so rejected
+    assert mask.tolist() == [True, True, False, False]
+    assert counts == [2]
+
+
+def test_scv_mask_all_oob():
+    """Test when all draft tokens are beyond sampled_token_ids bounds."""
+    metadata = _make_metadata([10, 20, 30], [3])
+
+    # Empty sampled (0 columns) - extreme case
+    sampled = torch.empty((1, 0), dtype=torch.int32)
+
+    runner = _make_mock_runner(scv_mode="adaptive")
+
+    # Should fallback gracefully, not crash
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
+
+    # All tokens should be rejected (or fallback to None)
+    if counts is not None:
+        assert counts == [0]
+    if mask is not None:
+        assert mask.tolist() == [False, False, False]
+
+
+def test_scv_mask_invalid_shape_falls_back():
+    """Test that invalid sampled_token_ids shape triggers fallback."""
+    metadata = _make_metadata([10, 20], [2])
+
+    # 1D tensor (invalid shape)
+    sampled = torch.tensor([10, 20], dtype=torch.int32)
+
+    runner = _make_mock_runner(scv_mode="graph")
+
+    # Should fallback to reference path (returns None from vectorized)
+    counts, mask = runner._compute_nwor_acceptance(metadata, sampled, return_mask=True)
+
+    # Reference path should still compute correctly
+    assert counts == [2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not hasattr(torch.cuda, "CUDAGraph"), reason="Requires CUDA graphs")
+def test_scv_graph_inplace_matches_reference():
+    metadata_cpu = _make_metadata([10, 20, 30, 40], [4], device="cpu")
+    metadata_cuda = _make_metadata([10, 20, 30, 40], [4], device="cuda")
+    sampled = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.int32, device="cuda")
+
+    runner_ref = _make_mock_runner(scv_mode="off")
+    counts_ref, mask_ref = runner_ref._compute_nwor_acceptance(
+        metadata_cpu, sampled.cpu(), return_mask=True
+    )
+
+    runner_graph = _make_mock_runner(scv_mode="graph")
+    counts_graph, mask_graph = runner_graph._compute_nwor_acceptance(
+        metadata_cuda, sampled, return_mask=True
+    )
+
+    assert counts_graph == counts_ref
+    assert torch.equal(mask_graph.cpu(), mask_ref.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not hasattr(torch.cuda, "CUDAGraph"), reason="Requires CUDA graphs")
+def test_scv_graph_different_cu_patterns():
+    runner = _make_mock_runner(scv_mode="graph")
+
+    metadata1 = _make_metadata([10, 20, 30, 40], [4], device="cuda")
+    sampled1 = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.int32, device="cuda")
+    runner._compute_nwor_acceptance(metadata1, sampled1, return_mask=True)
+
+    metadata2 = _make_metadata([10, 20, 30, 40], [2, 2], device="cuda")
+    sampled2 = torch.tensor(
+        [[10, 20, 50], [30, 40, 60]], dtype=torch.int32, device="cuda"
+    )
+    runner._compute_nwor_acceptance(metadata2, sampled2, return_mask=True)
+
+    assert len(runner._scv_graph_cache) == 2
 
 
 def test_commit_failure_triggers_fallback_metrics():
@@ -234,7 +740,7 @@ def test_commit_failure_triggers_fallback_metrics():
     )
 
     with pytest.raises(ShouldFallback):
-        manager.commit(torch.tensor([True]))
+        manager.commit([1])
 
     window_metrics = manager.pop_last_window_metrics()
     assert window_metrics is not None
