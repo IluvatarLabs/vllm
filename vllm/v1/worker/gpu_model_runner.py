@@ -2657,7 +2657,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 need_mask = self._scv_enabled()
                 if debug:
                     logger.debug("NWOR: Computing acceptance (SCV=%s)", need_mask)
-                accepted_counts, _ = self._compute_nwor_acceptance(
+                accepted_counts, mask = self._compute_nwor_acceptance(
                     spec_decode_metadata, sampled_token_ids, return_mask=need_mask
                 )
                 if accepted_counts is None:
@@ -2671,7 +2671,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             "NWOR: Committing %d accepted tokens (per-req: %s)",
                             total_accepted, accepted_counts
                         )
-                    manager.commit(accepted_counts)
+                    manager.commit(accepted_counts, mask)
         except ShouldFallback as e:
             if debug:
                 logger.warning("NWOR: Fallback triggered: %s", e)

@@ -267,6 +267,114 @@ def test_multi_request_partial_acceptance_writes():
     }
 
 
+def test_commit_with_mask_full_acceptance():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([5])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    writes = []
+
+    def writer(
+        key_slice,
+        value_slice,
+        key_cache,
+        value_cache,
+        slot_slice,
+        kv_cache_dtype,
+        k_scale_slice,
+        v_scale_slice,
+    ):
+        writes.append(int(key_slice.shape[0]))
+
+    manager.stage_layer(
+        layer_id="layer0",
+        key=key,
+        value=value,
+        key_cache=cache,
+        value_cache=cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype="fp16",
+        k_scale=None,
+        v_scale=None,
+        writer=writer,
+    )
+
+    mask = torch.ones(5, dtype=torch.bool)
+    manager.commit([5], mask)
+
+    assert writes == [5]
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 5,
+        "rejected": 0,
+        "fallback": 0,
+    }
+
+
+def test_commit_with_mask_partial_fp8_scales():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([3, 2])
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+    k_scale = torch.linspace(0.1, 0.5, steps=6)  # entry_length + sentinel
+    v_scale = torch.linspace(1.0, 1.5, steps=6)
+
+    captured = {"slots": [], "k_scale": [], "v_scale": []}
+
+    def writer(
+        key_slice,
+        value_slice,
+        key_cache,
+        value_cache,
+        slot_slice,
+        kv_cache_dtype,
+        k_scale_slice,
+        v_scale_slice,
+    ):
+        captured["slots"].append(int(key_slice.shape[0]))
+        captured["k_scale"].append(k_scale_slice.clone() if k_scale_slice is not None else None)
+        captured["v_scale"].append(v_scale_slice.clone() if v_scale_slice is not None else None)
+
+    for layer_id in ("layer0", "layer1"):
+        manager.stage_layer(
+            layer_id=layer_id,
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp8",
+            k_scale=k_scale.clone(),
+            v_scale=v_scale.clone(),
+            writer=writer,
+        )
+
+    mask = torch.tensor([True, True, False, True, False], dtype=torch.bool)
+    manager.commit([2, 1], mask)
+
+    # Each layer should receive a single writer call with 3 tokens (2+1)
+    assert captured["slots"] == [3, 3]
+    for k_s, v_s in zip(captured["k_scale"], captured["v_scale"]):
+        assert k_s is not None and v_s is not None
+        assert k_s.shape[0] == 3 and v_s.shape[0] == 3
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 3,
+        "rejected": 2,
+        "fallback": 0,
+    }
+
+
 def test_deferred_manager_metrics_on_fallback():
     manager = DeferredWriteManager()
     assert manager.begin_window([2])

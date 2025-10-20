@@ -108,20 +108,37 @@ def _ensure_int32_slots(slot_mapping: Tensor, device: torch.device) -> Tensor:
     return slot_mapping
 
 
-def _slice_scale(scale: Optional[Tensor], indices: Tensor) -> Optional[Tensor]:
+def _slice_scale(
+    scale: Optional[Tensor], indices: Tensor, entry_length: int
+) -> Optional[Tensor]:
     if scale is None:
         return None
     if scale.ndim == 0:
         return scale
     if scale.shape[0] == 0:
         return scale
+    if indices.numel() == 0:
+        return scale.new_empty((0,), dtype=scale.dtype, device=scale.device)
     first_dim = scale.shape[0]
     target = int(indices.numel())
+    if indices.dtype != torch.int64:
+        indices = indices.to(torch.int64)
+
+    if first_dim == entry_length:
+        return torch.index_select(scale, 0, indices)
+
+    if first_dim == entry_length + 1:
+        base = scale[:-1]
+        return torch.index_select(base, 0, indices)
+
     if first_dim == target:
         return torch.index_select(scale, 0, indices)
-    # Some implementations append an extra sentinel slot; ignore it.
-    if first_dim == target + 1:
-        return torch.index_select(scale[:-1], 0, indices)
+
+    if first_dim == target + 1 and target > 0:
+        base = scale[:-1]
+        if base.shape[0] >= target:
+            return torch.index_select(base, 0, indices)
+
     # Default: return the original scale (per-layer scale etc.).
     return scale
 
@@ -294,7 +311,11 @@ class DeferredWriteManager:
     # ------------------------------------------------------------------
     # Commit / Fallback
     # ------------------------------------------------------------------
-    def commit(self, accepted_counts: Sequence[int]) -> None:
+    def commit(
+        self,
+        accepted_counts: Sequence[int],
+        mask: Optional[torch.Tensor] = None,
+    ) -> None:
         if not self._window_active:
             return
 
@@ -314,6 +335,10 @@ class DeferredWriteManager:
             }
             self._clear_window()
             return
+
+        prepared_mask = self._prepare_commit_mask(
+            mask, accepted_counts, accepted_total, expected_tokens
+        )
 
         if accepted_total >= expected_tokens:
             for entry in self._entries:
@@ -350,6 +375,12 @@ class DeferredWriteManager:
                 "fallback": 0,
             }
             self._clear_window()
+            return
+
+        if prepared_mask is not None:
+            self._commit_with_mask(
+                prepared_mask, accepted_counts, accepted_total, expected_tokens
+            )
             return
 
         global_segments: list[tuple[int, int]] = []
@@ -476,6 +507,143 @@ class DeferredWriteManager:
         self._layer_staged_tokens.clear()
         self._entries.clear()
         self._req_start_offsets.clear()
+
+    def _prepare_commit_mask(
+        self,
+        mask: Optional[torch.Tensor],
+        accepted_counts: Sequence[int],
+        accepted_total: int,
+        expected_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+
+        if mask.dtype != torch.bool or mask.ndim != 1:
+            logger.warning_once("NWOR: Invalid mask provided to commit; ignoring mask path")
+            return None
+
+        if mask.numel() != expected_tokens:
+            logger.warning_once(
+                "NWOR: Mask length %d does not match expected tokens %d; ignoring mask path",
+                mask.numel(),
+                expected_tokens,
+            )
+            return None
+
+        if not self._entries:
+            return mask
+
+        target_device = self._entries[0].key_source.device
+        if mask.device != target_device:
+            mask = mask.to(device=target_device)
+
+        if __debug__:
+            for req_idx, req_tokens in enumerate(self._num_draft_tokens):
+                start = self._req_start_offsets[req_idx]
+                end = start + req_tokens
+                clamped_count = min(int(accepted_counts[req_idx]), req_tokens)
+                actual = int(mask[start:end].sum().item())
+                assert (
+                    actual == clamped_count
+                ), f"NWOR mask/count mismatch for request {req_idx}: {actual} != {clamped_count}"
+
+            actual_total = int(mask.sum().item())
+            assert (
+                actual_total == accepted_total
+            ), f"NWOR mask total mismatch: {actual_total} != {accepted_total}"
+
+        return mask
+
+    def _commit_with_mask(
+        self,
+        mask: torch.Tensor,
+        accepted_counts: Sequence[int],
+        accepted_total: int,
+        expected_tokens: int,
+    ) -> None:
+        if mask.numel() == 0:
+            self._metrics["tokens_committed"] += 0
+            self._metrics["tokens_rejected"] += expected_tokens
+            self._last_window_metrics = {
+                "mode": self._mode,
+                "committed": 0,
+                "rejected": expected_tokens,
+                "fallback": 0,
+            }
+            self._clear_window()
+            return
+
+        if not mask.any():
+            self._metrics["tokens_committed"] += 0
+            self._metrics["tokens_rejected"] += expected_tokens
+            self._last_window_metrics = {
+                "mode": self._mode,
+                "committed": 0,
+                "rejected": expected_tokens,
+                "fallback": 0,
+            }
+            self._clear_window()
+            return
+
+        accepted_indices = mask.nonzero(as_tuple=False).squeeze(1)
+
+        for entry in self._entries:
+            entry_start = entry.start
+            entry_end = entry_start + entry.length
+
+            entry_indices = accepted_indices[
+                (accepted_indices >= entry_start) & (accepted_indices < entry_end)
+            ]
+
+            if entry_indices.numel() == 0:
+                continue
+
+            local_indices = entry_indices - entry_start
+            local_indices = local_indices.to(torch.int64)
+
+            key_slice = entry.key_source.index_select(0, local_indices)
+            value_slice = entry.value_source.index_select(0, local_indices)
+            slot_slice = entry.slot_mapping.index_select(0, local_indices)
+            slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
+
+            k_scale_slice = _slice_scale(entry.k_scale, local_indices, entry.length)
+            v_scale_slice = _slice_scale(entry.v_scale, local_indices, entry.length)
+
+            try:
+                entry.writer(
+                    key_slice,
+                    value_slice,
+                    entry.key_cache,
+                    entry.value_cache,
+                    slot_slice,
+                    entry.kv_cache_dtype,
+                    k_scale_slice,
+                    v_scale_slice,
+                )
+            except Exception as exc:  # pragma: no cover
+                reason = f"commit_failed:{entry.layer_id}"
+                self._record_fallback(reason)
+                self._flush_entries()
+                self._last_window_metrics = {
+                    "mode": self._mode,
+                    "committed": 0,
+                    "rejected": expected_tokens,
+                    "fallback": 1,
+                    "reason": reason,
+                }
+                self._clear_window()
+                raise ShouldFallback(reason) from exc
+
+        rejected = expected_tokens - accepted_total
+        self._metrics["tokens_committed"] += accepted_total
+        self._metrics["tokens_rejected"] += rejected
+        self._last_window_metrics = {
+            "mode": self._mode,
+            "committed": accepted_total,
+            "rejected": rejected,
+            "fallback": 0,
+        }
+        self._clear_window()
 
     def _validate_mode(self, mode: str) -> str:
         normalized = mode.lower()
