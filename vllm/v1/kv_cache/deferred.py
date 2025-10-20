@@ -155,7 +155,7 @@ class DeferredWriteManager:
         self._window_active = False
         self._num_draft_tokens: list[int] = []
         self._expected_tokens = 0
-        self._staged_tokens = 0
+        self._layer_staged_tokens: dict[str, int] = {}
         self._req_start_offsets: list[int] = []
         self._entries: list[_LayerEntry] = []
         self._fallback_reason: Optional[str] = None
@@ -206,7 +206,6 @@ class DeferredWriteManager:
 
         self._window_active = True
         self._expected_tokens = total_tokens
-        self._staged_tokens = 0
         self._entries.clear()
         self._fallback_reason = None
         self._last_window_metrics = None
@@ -269,12 +268,13 @@ class DeferredWriteManager:
         if length == 0:
             return True
 
-        if self._staged_tokens + length > self._expected_tokens:
+        layer_offset = self._layer_staged_tokens.get(layer_id, 0)
+        if layer_offset + length > self._expected_tokens:
             raise ShouldFallback("staged_tokens_exceed_expected")
 
         entry = _LayerEntry(
             layer_id=layer_id,
-            start=self._staged_tokens,
+            start=layer_offset,
             length=length,
             key_source=key,
             value_source=value,
@@ -287,7 +287,7 @@ class DeferredWriteManager:
             writer=writer,
         )
         self._entries.append(entry)
-        self._staged_tokens += length
+        self._layer_staged_tokens[layer_id] = layer_offset + length
         return True
 
     # ------------------------------------------------------------------
@@ -471,7 +471,7 @@ class DeferredWriteManager:
         self._window_active = False
         self._num_draft_tokens.clear()
         self._expected_tokens = 0
-        self._staged_tokens = 0
+        self._layer_staged_tokens.clear()
         self._entries.clear()
         self._req_start_offsets.clear()
 

@@ -88,6 +88,55 @@ def test_deferred_manager_commit_partial_acceptance():
     }
 
 
+def test_deferred_manager_multiple_layers_full_window():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([2, 3])
+
+    writes_per_layer: dict[str, list[torch.Tensor]] = {"layer0": [], "layer1": []}
+
+    def make_writer(layer_id: str):
+        def _writer(key, value, key_cache, value_cache, slot_mapping, *_args):
+            writes_per_layer[layer_id].append(slot_mapping.clone())
+
+        return _writer
+
+    slot_mapping = torch.arange(5, dtype=torch.int32)
+    key = torch.randn(5, 1, 2)
+    value = torch.randn(5, 1, 2)
+    cache = torch.empty_like(key)
+
+    for layer_id in ("layer0", "layer1"):
+        manager.stage_layer(
+            layer_id=layer_id,
+            key=key,
+            value=value,
+            key_cache=cache,
+            value_cache=cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="fp16",
+            k_scale=None,
+            v_scale=None,
+            writer=make_writer(layer_id),
+        )
+
+    manager.commit([2, 0])
+
+    assert len(writes_per_layer["layer0"]) == 1
+    assert len(writes_per_layer["layer1"]) == 1
+
+    expected_slots = torch.tensor([0, 1], dtype=torch.int32)
+    assert torch.equal(writes_per_layer["layer0"][0], expected_slots)
+    assert torch.equal(writes_per_layer["layer1"][0], expected_slots)
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 2,
+        "rejected": 3,
+        "fallback": 0,
+    }
+
+
 def test_deferred_manager_cancel_flush_writes_all():
     manager = DeferredWriteManager()
     assert manager.begin_window([1, 1])
