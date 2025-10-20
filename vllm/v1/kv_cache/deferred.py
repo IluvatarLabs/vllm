@@ -206,6 +206,7 @@ class DeferredWriteManager:
 
         self._window_active = True
         self._expected_tokens = total_tokens
+        self._layer_staged_tokens.clear()
         self._entries.clear()
         self._fallback_reason = None
         self._last_window_metrics = None
@@ -303,6 +304,57 @@ class DeferredWriteManager:
         committed_total = 0
         total_requests = len(self._num_draft_tokens)
         expected_tokens = self._expected_tokens
+        accepted_total = sum(int(c) for c in accepted_counts)
+
+        if accepted_total <= 0:
+            self._metrics["tokens_rejected"] += expected_tokens
+            self._last_window_metrics = {
+                "mode": self._mode,
+                "committed": 0,
+                "rejected": expected_tokens,
+                "fallback": 0,
+            }
+            self._clear_window()
+            return
+
+        if accepted_total >= expected_tokens:
+            for entry in self._entries:
+                try:
+                    entry.writer(
+                        entry.key_source,
+                        entry.value_source,
+                        entry.key_cache,
+                        entry.value_cache,
+                        _ensure_int32_slots(entry.slot_mapping, entry.slot_mapping.device),
+                        entry.kv_cache_dtype,
+                        entry.k_scale,
+                        entry.v_scale,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    reason = f"commit_failed:{entry.layer_id}"
+                    self._record_fallback(reason)
+                    self._flush_entries()
+                    self._last_window_metrics = {
+                        "mode": self._mode,
+                        "committed": 0,
+                        "rejected": expected_tokens,
+                        "fallback": 1,
+                        "reason": reason,
+                    }
+                    self._clear_window()
+                    raise ShouldFallback(reason) from exc
+                committed_total += entry.length
+
+            self._metrics["tokens_committed"] += committed_total
+            self._metrics["tokens_rejected"] += 0
+            self._last_window_metrics = {
+                "mode": self._mode,
+                "committed": expected_tokens,
+                "rejected": 0,
+                "fallback": 0,
+            }
+            self._clear_window()
+            return
 
         for entry in self._entries:
             entry_start = entry.start
@@ -415,7 +467,6 @@ class DeferredWriteManager:
         # Calculate accepted/rejected based on acceptance counts, not write counts
         # (committed_total counts writes across all layers, but accepted_counts
         # tells us how many draft tokens were actually accepted)
-        accepted_total = sum(accepted_counts)
         rejected = self._expected_tokens - accepted_total
         self._metrics["tokens_committed"] += committed_total
         self._metrics["tokens_rejected"] += rejected
@@ -460,7 +511,7 @@ class DeferredWriteManager:
             except Exception:  # pragma: no cover - log and continue
                 logger.exception("NWOR fallback failed for layer %s", entry.layer_id)
         if self._entries:
-            flushed_tokens = sum(e.length for e in self._entries)
+            flushed_tokens = self._expected_tokens or sum(e.length for e in self._entries)
             self._metrics["tokens_fallback"] += flushed_tokens
 
     def _record_fallback(self, reason: str) -> None:
