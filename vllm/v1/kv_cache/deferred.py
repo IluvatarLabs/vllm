@@ -184,6 +184,9 @@ class DeferredWriteManager:
         self._expected_tokens = 0
         self._layer_staged_tokens: dict[str, int] = {}
         self._req_start_offsets: list[int] = []
+        self._shared_slot_mapping: Optional[Tensor] = None
+        self._shared_slot_mapping_ptr: Optional[int] = None
+        self._restricted_context_active = False
         self._entries: list[_LayerEntry] = []
         self._fallback_reason: Optional[str] = None
         self._cache_storage_checked = False  # Cache storage check per window
@@ -242,6 +245,9 @@ class DeferredWriteManager:
         self._last_window_metrics = None
         self._cache_storage_checked = False  # Reset per window
         self._full_window = True  # Reset: assume full window until proven otherwise
+        self._shared_slot_mapping = None
+        self._shared_slot_mapping_ptr = None
+        self._restricted_context_active = False
         self._metrics["windows"] += 1
         self._metrics["tokens_staged"] += total_tokens
         return True
@@ -298,7 +304,16 @@ class DeferredWriteManager:
                 raise ShouldFallback("kv_cache_not_materialized")
             self._cache_storage_checked = True
 
-        slot_mapping = _ensure_int32_slots(slot_mapping, key.device)
+        if (
+            self._shared_slot_mapping is not None
+            and self._shared_slot_mapping_ptr == slot_mapping.data_ptr()
+        ):
+            slot_mapping = self._shared_slot_mapping
+        else:
+            slot_mapping_converted = _ensure_int32_slots(slot_mapping, key.device)
+            self._shared_slot_mapping = slot_mapping_converted
+            self._shared_slot_mapping_ptr = slot_mapping.data_ptr()
+            slot_mapping = slot_mapping_converted
 
         length = int(slot_mapping.shape[0])
         if length == 0:
@@ -307,6 +322,9 @@ class DeferredWriteManager:
         layer_offset = self._layer_staged_tokens.get(layer_id, 0)
         if layer_offset + length > self._expected_tokens:
             raise ShouldFallback("staged_tokens_exceed_expected")
+
+        if self._full_window and (layer_offset != 0 or length != self._expected_tokens):
+            self._full_window = False
 
         entry = _LayerEntry(
             layer_id=layer_id,
@@ -532,6 +550,9 @@ class DeferredWriteManager:
         self._layer_staged_tokens.clear()
         self._entries.clear()
         self._req_start_offsets.clear()
+        self._shared_slot_mapping = None
+        self._shared_slot_mapping_ptr = None
+        self._restricted_context_active = False
 
     def _prepare_commit_mask(
         self,
@@ -606,6 +627,7 @@ class DeferredWriteManager:
         # Use cached full_window flag computed during staging
         full_window = self._full_window
 
+        shared_slot_slice = None
         for entry in self._entries:
             entry_start = entry.start
             entry_end = entry_start + entry.length
@@ -629,8 +651,13 @@ class DeferredWriteManager:
 
             key_slice = entry.key_source.index_select(0, local_indices)
             value_slice = entry.value_source.index_select(0, local_indices)
-            slot_slice = entry.slot_mapping.index_select(0, local_indices)
-            slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
+            if full_window and shared_slot_slice is not None:
+                slot_slice = shared_slot_slice
+            else:
+                slot_slice = entry.slot_mapping.index_select(0, local_indices)
+                slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
+                if full_window:
+                    shared_slot_slice = slot_slice
 
             k_scale_slice = _slice_scale(entry.k_scale, local_indices, entry.length)
             v_scale_slice = _slice_scale(entry.v_scale, local_indices, entry.length)
