@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
@@ -336,9 +337,11 @@ class DeferredWriteManager:
             self._clear_window()
             return
 
-        prepared_mask = self._prepare_commit_mask(
-            mask, accepted_counts, accepted_total, expected_tokens
-        )
+        prepared_mask = None
+        if mask is not None:
+            prepared_mask = self._prepare_commit_mask(
+                mask, accepted_counts, accepted_total, expected_tokens
+            )
 
         if accepted_total >= expected_tokens:
             for entry in self._entries:
@@ -537,7 +540,7 @@ class DeferredWriteManager:
         if mask.device != target_device:
             mask = mask.to(device=target_device)
 
-        if __debug__:
+        if os.getenv("VLLM_NWOR_DEBUG_VALIDATE_MASK") == "1":
             for req_idx, req_tokens in enumerate(self._num_draft_tokens):
                 start = self._req_start_offsets[req_idx]
                 end = start + req_tokens
@@ -561,45 +564,47 @@ class DeferredWriteManager:
         accepted_total: int,
         expected_tokens: int,
     ) -> None:
-        if mask.numel() == 0:
-            self._metrics["tokens_committed"] += 0
-            self._metrics["tokens_rejected"] += expected_tokens
-            self._last_window_metrics = {
-                "mode": self._mode,
-                "committed": 0,
-                "rejected": expected_tokens,
-                "fallback": 0,
-            }
-            self._clear_window()
-            return
-
-        if not mask.any():
-            self._metrics["tokens_committed"] += 0
-            self._metrics["tokens_rejected"] += expected_tokens
-            self._last_window_metrics = {
-                "mode": self._mode,
-                "committed": 0,
-                "rejected": expected_tokens,
-                "fallback": 0,
-            }
-            self._clear_window()
-            return
-
         accepted_indices = mask.nonzero(as_tuple=False).squeeze(1)
+        if accepted_indices.numel() == 0:
+            rejected = expected_tokens - accepted_total
+            self._metrics["tokens_committed"] += 0
+            self._metrics["tokens_rejected"] += rejected
+            self._last_window_metrics = {
+                "mode": self._mode,
+                "committed": 0,
+                "rejected": rejected,
+                "fallback": 0,
+            }
+            self._clear_window()
+            return
+
+        if accepted_indices.dtype != torch.int64:
+            accepted_indices = accepted_indices.to(torch.int64)
+
+        full_window = all(
+            entry.start == 0 and entry.length == expected_tokens for entry in self._entries
+        )
 
         for entry in self._entries:
             entry_start = entry.start
             entry_end = entry_start + entry.length
 
-            entry_indices = accepted_indices[
-                (accepted_indices >= entry_start) & (accepted_indices < entry_end)
-            ]
+            if full_window:
+                entry_indices = accepted_indices
+            else:
+                entry_indices = accepted_indices[
+                    (accepted_indices >= entry_start) & (accepted_indices < entry_end)
+                ]
 
             if entry_indices.numel() == 0:
                 continue
 
-            local_indices = entry_indices - entry_start
-            local_indices = local_indices.to(torch.int64)
+            if entry_start == 0 and full_window:
+                local_indices = entry_indices
+            else:
+                local_indices = entry_indices - entry_start
+                if local_indices.dtype != torch.int64:
+                    local_indices = local_indices.to(torch.int64)
 
             key_slice = entry.key_source.index_select(0, local_indices)
             value_slice = entry.value_source.index_select(0, local_indices)
