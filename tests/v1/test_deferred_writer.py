@@ -4,6 +4,7 @@
 import pytest
 import torch
 from collections import defaultdict
+from typing import Any
 
 from vllm.v1.kv_cache.deferred import DeferredWriteManager, ShouldFallback
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -371,6 +372,63 @@ def test_commit_with_mask_partial_fp8_scales():
         "mode": "stage",
         "committed": 3,
         "rejected": 2,
+        "fallback": 0,
+    }
+
+
+def test_commit_with_mask_contiguous_prefix_uses_narrow():
+    manager = DeferredWriteManager()
+    assert manager.begin_window([4])
+
+    slot_mapping = torch.arange(4, dtype=torch.int32)
+    key = torch.randn(4, 1, 2)
+    value = torch.randn(4, 1, 2)
+    cache = torch.empty_like(key)
+
+    flags = {"key_shared": False, "slot_shared": False}
+
+    base_entry_holder: dict[str, Any] = {}
+
+    def writer(
+        key_slice,
+        value_slice,
+        key_cache,
+        value_cache,
+        slot_slice,
+        kv_cache_dtype,
+        k_scale_slice,
+        v_scale_slice,
+    ):
+        base_entry = base_entry_holder["entry"]
+        flags["key_shared"] = key_slice.data_ptr() == base_entry.key_source.data_ptr()
+        flags["slot_shared"] = slot_slice.data_ptr() == base_entry.slot_mapping.data_ptr()
+
+    manager.stage_layer(
+        layer_id="layer0",
+        key=key,
+        value=value,
+        key_cache=cache,
+        value_cache=cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype="fp16",
+        k_scale=None,
+        v_scale=None,
+        writer=writer,
+    )
+
+    base_entry_holder["entry"] = manager._entries[0]
+
+    mask = torch.tensor([True, True, True, False], dtype=torch.bool)
+    manager.commit([3], mask)
+
+    assert flags["key_shared"] is True
+    assert flags["slot_shared"] is True
+
+    metrics = manager.pop_last_window_metrics()
+    assert metrics == {
+        "mode": "stage",
+        "committed": 3,
+        "rejected": 1,
         "fallback": 0,
     }
 

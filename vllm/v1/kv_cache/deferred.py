@@ -186,7 +186,7 @@ class DeferredWriteManager:
         self._req_start_offsets: list[int] = []
         self._shared_slot_mapping: Optional[Tensor] = None
         self._shared_slot_mapping_ptr: Optional[int] = None
-        self._restricted_context_active = False
+        self._shared_slot_needs_conversion = True
         self._entries: list[_LayerEntry] = []
         self._fallback_reason: Optional[str] = None
         self._cache_storage_checked = False  # Cache storage check per window
@@ -247,7 +247,7 @@ class DeferredWriteManager:
         self._full_window = True  # Reset: assume full window until proven otherwise
         self._shared_slot_mapping = None
         self._shared_slot_mapping_ptr = None
-        self._restricted_context_active = False
+        self._shared_slot_needs_conversion = True
         self._metrics["windows"] += 1
         self._metrics["tokens_staged"] += total_tokens
         return True
@@ -289,12 +289,6 @@ class DeferredWriteManager:
         if not self._window_active:
             return False
 
-        if _in_restricted_context():
-            logger.warning_once(
-                "NWOR: Graph capture detected during staging; skipping staged writes."
-            )
-            return False
-
         if not (_tensor_has_storage(key) and _tensor_has_storage(value)):
             raise ShouldFallback("kv_slice_without_storage")
 
@@ -310,9 +304,15 @@ class DeferredWriteManager:
         ):
             slot_mapping = self._shared_slot_mapping
         else:
+            original_ptr = slot_mapping.data_ptr()
             slot_mapping_converted = _ensure_int32_slots(slot_mapping, key.device)
             self._shared_slot_mapping = slot_mapping_converted
             self._shared_slot_mapping_ptr = slot_mapping.data_ptr()
+            self._shared_slot_needs_conversion = (
+                slot_mapping_converted.data_ptr() != original_ptr
+                or slot_mapping_converted.dtype != torch.int32
+                or not slot_mapping_converted.is_contiguous()
+            )
             slot_mapping = slot_mapping_converted
 
         length = int(slot_mapping.shape[0])
@@ -552,7 +552,7 @@ class DeferredWriteManager:
         self._req_start_offsets.clear()
         self._shared_slot_mapping = None
         self._shared_slot_mapping_ptr = None
-        self._restricted_context_active = False
+        self._shared_slot_needs_conversion = True
 
     def _prepare_commit_mask(
         self,
@@ -627,6 +627,15 @@ class DeferredWriteManager:
         # Use cached full_window flag computed during staging
         full_window = self._full_window
 
+        contiguous_acceptance = False
+        if full_window and accepted_indices.numel() > 0:
+            if accepted_indices[0].item() == 0:
+                if accepted_indices.numel() == 1:
+                    contiguous_acceptance = True
+                else:
+                    diffs = accepted_indices[1:] - accepted_indices[:-1]
+                    contiguous_acceptance = bool(torch.all(diffs == 1).item())
+
         shared_slot_slice = None
         for entry in self._entries:
             entry_start = entry.start
@@ -642,25 +651,42 @@ class DeferredWriteManager:
             if entry_indices.numel() == 0:
                 continue
 
-            if entry_start == 0 and full_window:
-                local_indices = entry_indices
+            if contiguous_acceptance and full_window and entry_start == 0:
+                num_accepted = accepted_indices.numel()
+                key_slice = entry.key_source.narrow(0, 0, num_accepted)
+                value_slice = entry.value_source.narrow(0, 0, num_accepted)
+                if full_window and shared_slot_slice is not None:
+                    slot_slice = shared_slot_slice
+                else:
+                    slot_slice = entry.slot_mapping.narrow(0, 0, num_accepted)
+                    if self._shared_slot_needs_conversion:
+                        slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
+                    if full_window:
+                        shared_slot_slice = slot_slice
+
+                k_scale_slice = _slice_scale_segment(
+                    entry.k_scale, 0, num_accepted, entry.length
+                )
+                v_scale_slice = _slice_scale_segment(
+                    entry.v_scale, 0, num_accepted, entry.length
+                )
             else:
                 local_indices = entry_indices - entry_start
                 if local_indices.dtype != torch.int64:
                     local_indices = local_indices.to(torch.int64)
 
-            key_slice = entry.key_source.index_select(0, local_indices)
-            value_slice = entry.value_source.index_select(0, local_indices)
-            if full_window and shared_slot_slice is not None:
-                slot_slice = shared_slot_slice
-            else:
-                slot_slice = entry.slot_mapping.index_select(0, local_indices)
-                slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
-                if full_window:
-                    shared_slot_slice = slot_slice
+                key_slice = entry.key_source.index_select(0, local_indices)
+                value_slice = entry.value_source.index_select(0, local_indices)
+                if full_window and shared_slot_slice is not None:
+                    slot_slice = shared_slot_slice
+                else:
+                    slot_slice = entry.slot_mapping.index_select(0, local_indices)
+                    slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
+                    if full_window:
+                        shared_slot_slice = slot_slice
 
-            k_scale_slice = _slice_scale(entry.k_scale, local_indices, entry.length)
-            v_scale_slice = _slice_scale(entry.v_scale, local_indices, entry.length)
+                k_scale_slice = _slice_scale(entry.k_scale, local_indices, entry.length)
+                v_scale_slice = _slice_scale(entry.v_scale, local_indices, entry.length)
 
             try:
                 entry.writer(
