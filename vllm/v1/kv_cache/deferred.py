@@ -301,8 +301,6 @@ class DeferredWriteManager:
         if len(accepted_counts) != len(self._num_draft_tokens):
             raise ShouldFallback("accepted_counts_mismatch")
 
-        committed_total = 0
-        total_requests = len(self._num_draft_tokens)
         expected_tokens = self._expected_tokens
         accepted_total = sum(int(c) for c in accepted_counts)
 
@@ -343,9 +341,7 @@ class DeferredWriteManager:
                     }
                     self._clear_window()
                     raise ShouldFallback(reason) from exc
-                committed_total += entry.length
-
-            self._metrics["tokens_committed"] += committed_total
+            self._metrics["tokens_committed"] += expected_tokens
             self._metrics["tokens_rejected"] += 0
             self._last_window_metrics = {
                 "mode": self._mode,
@@ -356,85 +352,42 @@ class DeferredWriteManager:
             self._clear_window()
             return
 
+        global_segments: list[tuple[int, int]] = []
+        for req_idx, req_tokens in enumerate(self._num_draft_tokens):
+            if req_tokens == 0:
+                continue
+            accepted = min(int(accepted_counts[req_idx]), req_tokens)
+            if accepted <= 0:
+                continue
+            req_start = self._req_start_offsets[req_idx]
+            global_segments.append((req_start, req_start + accepted))
+
         for entry in self._entries:
             entry_start = entry.start
             entry_end = entry_start + entry.length
 
-            accepted_segments: list[tuple[int, int]] = []
-            total_segment_tokens = 0
-            for req_idx in range(total_requests):
-                req_tokens = self._num_draft_tokens[req_idx]
-                if req_tokens == 0:
+            for seg_start, seg_end in global_segments:
+                if seg_end <= entry_start:
                     continue
-                req_start = self._req_start_offsets[req_idx]
-                req_end = req_start + req_tokens
-                if req_end <= entry_start:
-                    continue
-                if req_start >= entry_end:
+                if seg_start >= entry_end:
                     break
 
-                accepted = min(int(accepted_counts[req_idx]), req_tokens)
-                if accepted <= 0:
-                    continue
-
-                accepted_end = req_start + accepted
-                seg_start = max(entry_start, req_start)
-                seg_end = min(entry_end, accepted_end)
-                if seg_end <= seg_start:
-                    continue
-
-                local_start = seg_start - entry_start
-                local_end = seg_end - entry_start
-                accepted_segments.append((local_start, local_end))
-                total_segment_tokens += seg_end - seg_start
-
-            if total_segment_tokens == 0:
-                continue
-
-            if total_segment_tokens == entry.length and len(accepted_segments) == 1:
-                segment_start, segment_end = accepted_segments[0]
-                if segment_start == 0 and segment_end == entry.length:
-                    try:
-                        entry.writer(
-                            entry.key_source,
-                            entry.value_source,
-                            entry.key_cache,
-                            entry.value_cache,
-                            _ensure_int32_slots(entry.slot_mapping, entry.slot_mapping.device),
-                            entry.kv_cache_dtype,
-                            entry.k_scale,
-                            entry.v_scale,
-                        )
-                    except Exception as exc:  # pragma: no cover
-                        reason = f"commit_failed:{entry.layer_id}"
-                        self._record_fallback(reason)
-                        self._flush_entries()
-                        self._last_window_metrics = {
-                            "mode": self._mode,
-                            "committed": 0,
-                            "rejected": expected_tokens,
-                            "fallback": 1,
-                            "reason": reason,
-                        }
-                        self._clear_window()
-                        raise ShouldFallback(reason) from exc
-                    committed_total += entry.length
-                    continue
-
-            for segment_start, segment_end in accepted_segments:
-                length = segment_end - segment_start
+                local_start = max(seg_start, entry_start) - entry_start
+                local_end = min(seg_end, entry_end) - entry_start
+                length = local_end - local_start
                 if length <= 0:
                     continue
-                key_slice = entry.key_source.narrow(0, segment_start, length)
-                value_slice = entry.value_source.narrow(0, segment_start, length)
-                slot_slice = entry.slot_mapping.narrow(0, segment_start, length)
+
+                key_slice = entry.key_source.narrow(0, local_start, length)
+                value_slice = entry.value_source.narrow(0, local_start, length)
+                slot_slice = entry.slot_mapping.narrow(0, local_start, length)
                 slot_slice = _ensure_int32_slots(slot_slice, entry.slot_mapping.device)
 
                 k_scale_slice = _slice_scale_segment(
-                    entry.k_scale, segment_start, segment_end, entry.length
+                    entry.k_scale, local_start, local_start + length, entry.length
                 )
                 v_scale_slice = _slice_scale_segment(
-                    entry.v_scale, segment_start, segment_end, entry.length
+                    entry.v_scale, local_start, local_start + length, entry.length
                 )
 
                 try:
@@ -461,8 +414,6 @@ class DeferredWriteManager:
                     }
                     self._clear_window()
                     raise ShouldFallback(reason) from exc
-
-                committed_total += length
 
         # Calculate accepted/rejected based on acceptance counts, not write counts
         # (committed_total counts writes across all layers, but accepted_counts
