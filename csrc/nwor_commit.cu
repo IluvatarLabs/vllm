@@ -174,8 +174,20 @@ void commit_draft_layer(
     int64_t key_stride = num_heads * head_size;
     int64_t value_stride = num_heads * head_size;
     int64_t block_stride = key_cache.stride(0);
-    int64_t page_stride = key_cache.stride(1);
-    int64_t head_stride = key_cache.stride(2);
+
+    // Strides are layout-dependent:
+    // Flash [blocks, tokens, heads, dim]: stride(1) = token, stride(2) = head
+    // Paged [blocks, heads, tokens, dim]: stride(1) = head, stride(2) = token
+    int64_t page_stride, head_stride;
+    if (key_cache.size(1) == num_heads) {
+        // Paged layout: swap stride indices
+        page_stride = key_cache.stride(2);  // token stride
+        head_stride = key_cache.stride(1);  // head stride
+    } else {
+        // Flash layout: use standard indices
+        page_stride = key_cache.stride(1);  // token stride
+        head_stride = key_cache.stride(2);  // head stride
+    }
 
     // Determine if scales are per-token
     bool scale_is_per_token = (k_scale.numel() > 1);
