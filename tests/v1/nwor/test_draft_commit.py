@@ -12,7 +12,7 @@ Tests all edge cases mentioned in the design review:
 import pytest
 import torch
 
-from vllm.v1.nwor import DraftCommitManager, CacheLayout
+from vllm.v1.nwor import DraftCommitManager
 
 
 @pytest.fixture
@@ -37,25 +37,25 @@ class TestDraftCommitBasic:
         result = manager.begin(0)
         assert result is False
         assert manager.enabled is False
-        assert len(manager.drafts) == 0
+        assert len(manager._drafts) == 0
 
     def test_begin_with_drafts(self, manager):
         """Test begin() with positive draft count."""
         result = manager.begin(10)
         assert result is True
         assert manager.enabled is True
-        assert len(manager.drafts) == 0  # No stages yet
+        assert len(manager._drafts) == 0  # No stages yet
 
     def test_cancel(self, manager):
         """Test cancel() cleans up state."""
         manager.begin(10)
         manager.enabled = True
-        manager.drafts.append(None)  # Mock entry
+        manager._drafts.append(None)  # Mock entry
 
         manager.cancel()
 
         assert manager.enabled is False
-        assert len(manager.drafts) == 0
+        assert len(manager._drafts) == 0
 
     def test_lifecycle(self, manager):
         """Test complete begin/cancel lifecycle."""
@@ -99,9 +99,9 @@ class TestDraftCommitQuantization:
             slot_mapping, None, None, "auto"
         )
 
-        assert len(manager.drafts) == 1
-        assert manager.drafts[0].kv_cache_dtype == "auto"
-        assert manager.drafts[0].key_value_dtype == "fp16"
+        assert len(manager._drafts) == 1
+        assert manager._drafts[0].kv_cache_dtype == "auto"
+        assert manager._drafts[0].key_value_dtype == "fp16"
 
     def test_bf16_fp8_per_layer_scale(self, manager, device):
         """Test BF16 KV with FP8 cache and per-layer (scalar) scale."""
@@ -131,9 +131,9 @@ class TestDraftCommitQuantization:
             slot_mapping, k_scale, v_scale, "fp8"
         )
 
-        assert len(manager.drafts) == 1
-        assert manager.drafts[0].scale_is_per_token is False  # Scalar scale
-        assert manager.drafts[0].key_value_dtype == "bf16"
+        assert len(manager._drafts) == 1
+        assert manager._drafts[0].scale_is_per_token is False  # Scalar scale
+        assert manager._drafts[0].key_value_dtype == "bf16"
 
     def test_fp16_fp8_per_token_scale(self, manager, device):
         """Test FP16 KV with FP8 cache and per-token scales."""
@@ -163,8 +163,8 @@ class TestDraftCommitQuantization:
             slot_mapping, k_scale, v_scale, "fp8"
         )
 
-        assert len(manager.drafts) == 1
-        assert manager.drafts[0].scale_is_per_token is True  # Per-token scales
+        assert len(manager._drafts) == 1
+        assert manager._drafts[0].scale_is_per_token is True  # Per-token scales
 
 
 class TestDraftCommitAcceptance:
@@ -200,7 +200,7 @@ class TestDraftCommitAcceptance:
 
         assert num_committed == 0
         assert manager.enabled is False
-        assert len(manager.drafts) == 0
+        assert len(manager._drafts) == 0
 
     def test_full_acceptance(self, manager, device):
         """Test 100% acceptance - all tokens accepted (contiguous prefix fast path)."""
@@ -232,7 +232,7 @@ class TestDraftCommitAcceptance:
 
         assert num_committed == num_tokens
         assert manager.enabled is False
-        assert len(manager.drafts) == 0
+        assert len(manager._drafts) == 0
 
     def test_partial_acceptance_contiguous_prefix(self, manager, device):
         """Test partial acceptance with contiguous prefix [T, T, F, F]."""
@@ -325,14 +325,14 @@ class TestDraftCommitMultiLayer:
                 slot_mapping, None, None, "auto"
             )
 
-        assert len(manager.drafts) == num_layers
+        assert len(manager._drafts) == num_layers
 
         # Commit all layers
         mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         num_committed = manager.commit(mask)
 
         assert num_committed == num_tokens
-        assert len(manager.drafts) == 0
+        assert len(manager._drafts) == 0
 
 
 class TestDraftCommitCacheLayouts:
@@ -359,7 +359,7 @@ class TestDraftCommitCacheLayouts:
             slot_mapping, None, None, "auto"
         )
 
-        assert manager.drafts[0].layout_enum == CacheLayout.FLASH
+        assert manager._drafts[0].layout_id == 0  # Flash layout
 
     def test_paged_layout(self, manager, device):
         """Test Paged layout [num_blocks, num_heads, block_size, head_size]."""
@@ -382,7 +382,7 @@ class TestDraftCommitCacheLayouts:
             slot_mapping, None, None, "auto"
         )
 
-        assert manager.drafts[0].layout_enum == CacheLayout.PAGED
+        assert manager._drafts[0].layout_id == 1  # Paged layout
 
 
 class TestDraftCommitSafety:
@@ -411,7 +411,7 @@ class TestDraftCommitSafety:
             slot_mapping, None, None, "auto"
         )
 
-        assert len(manager.drafts) == 0  # Nothing staged
+        assert len(manager._drafts) == 0  # Nothing staged
 
     def test_empty_mask(self, manager, device):
         """Test commit with empty mask."""
@@ -447,7 +447,7 @@ class TestDraftCommitSafety:
         )
 
         # Check that stored slot_ref is int32
-        assert manager.drafts[0]._slot_ref.dtype == torch.int32
+        assert manager._drafts[0]._slot_ref.dtype == torch.int32
 
 
 if __name__ == "__main__":
