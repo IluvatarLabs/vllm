@@ -11,6 +11,7 @@
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <algorithm>
 
 #include "cuda_utils.h"
 #include "cuda_compat.h"
@@ -22,6 +23,8 @@
 #else
   #include "quantization/w8a8/fp8/nvidia/quant_utils.cuh"
 #endif
+
+#include "copy_with_scale_op.cuh"
 
 namespace vllm {
 

@@ -14,6 +14,8 @@
   #include "quantization/w8a8/fp8/nvidia/quant_utils.cuh"
 #endif
 
+#include "copy_with_scale_op.cuh"
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -207,20 +209,6 @@ void copy_blocks_mla(std::vector<torch::Tensor> const& kv_caches,
 }
 
 namespace vllm {
-
-// Used to copy/convert one element
-template <typename OutT, typename InT, Fp8KVCacheDataType kv_dt>
-struct CopyWithScaleOp {
-  float scale;
-
-  __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
-    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      dst = static_cast<OutT>(src);
-    } else {
-      dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
-    }
-  }
-};
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_kernel(
