@@ -436,7 +436,11 @@ class _SCVGraphEntry:
             self.last_used = time.monotonic()
 
             torch.cuda.synchronize()
-            return self.mask_buffer.clone()
+            pooled = GPUModelRunner._get_scv_mask_buffer(
+                self.mask_buffer.numel(), self.device
+            )
+            pooled.copy_(self.mask_buffer)
+            return pooled
 
     @staticmethod
     def _evict_entry(
@@ -462,7 +466,10 @@ class _SCVGraphEntry:
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     # Maximum number of SCV CUDA graph cache entries before eviction
-    _SCV_GRAPH_CACHE_MAX_SIZE = 32
+    _SCV_GRAPH_CACHE_MAX_SIZE = 64
+    # SCV mask buffer pool to avoid allocation overhead
+    _scv_mask_pool: dict[tuple[int, torch.device], list[torch.Tensor]] = {}
+    _SCV_MASK_POOL_MAX_PER_SIZE = 4
 
     def __init__(
         self,
@@ -784,6 +791,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ],
             int,
         ] = {}
+        self._scv_pooled_mask_to_return: torch.Tensor | None = None
 
         self._scv_capture_available = _probe_scv_capture(
             self._scv_mode, device, self._scv_debug, self.compilation_config
@@ -2680,6 +2688,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._latest_nwor_window_metrics = manager.pop_last_window_metrics()
             if debug and self._latest_nwor_window_metrics:
                 logger.debug("NWOR: Metrics: %s", self._latest_nwor_window_metrics)
+            # Return pooled SCV mask buffer for reuse
+            if self._scv_pooled_mask_to_return is not None:
+                self._return_scv_mask_buffer(self._scv_pooled_mask_to_return)
+                self._scv_pooled_mask_to_return = None
             set_global_deferred_manager(None)
 
     def _cleanup_nwor(self) -> None:
@@ -2731,6 +2743,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             mask = self._scv_vectorized_mask(
                 spec_decode_metadata, sampled_token_ids, total_tokens, work_device
             )
+            # Track pooled mask for cleanup
+            self._scv_pooled_mask_to_return = mask
             if mask is not None:
                 # Batch all sums to minimize GPU-CPU synchronization
                 sum_tensors: list[torch.Tensor | None] = []
@@ -2767,8 +2781,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self._scv_update_controller(
                         spec_decode_metadata, accepted_total, total_tokens
                     )
-                if return_mask and mask.device != target_device:
-                    mask = mask.to(device=target_device)
                 if not return_mask:
                     mask = None
                 return accepted_counts, mask
@@ -2860,6 +2872,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if mask_work.device == target_device:
             return accepted_counts, mask_work
         return accepted_counts, mask_work.to(device=target_device)
+
+    @classmethod
+    def _get_scv_mask_buffer(cls, size: int, device: torch.device) -> torch.Tensor:
+        """Get a mask buffer from the pool or allocate a new one."""
+        key = (size, device)
+        pool = cls._scv_mask_pool.get(key, [])
+        if pool:
+            return pool.pop()
+        return torch.empty(size, dtype=torch.bool, device=device)
+
+    @classmethod
+    def _return_scv_mask_buffer(cls, mask: torch.Tensor) -> None:
+        """Return a mask buffer to the pool for reuse."""
+        if mask is None:
+            return
+        key = (mask.numel(), mask.device)
+        pool = cls._scv_mask_pool.setdefault(key, [])
+        if len(pool) < cls._SCV_MASK_POOL_MAX_PER_SIZE:
+            pool.append(mask)
 
     def _scv_vectorized_mask(
         self,
@@ -2964,7 +2995,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             self._scv_graph_cache[key] = entry
                             logger.info("SCV: Graph capture successful for %s", key[:4])
                             # Use mask buffer directly from capture, no need to replay
-                            mask_buf = entry.mask_buffer.clone()
+                            mask_buf = self._get_scv_mask_buffer(
+                                entry.mask_buffer.numel(), device
+                            )
+                            mask_buf.copy_(entry.mask_buffer)
                         else:
                             # Replay cached entry
                             mask_buf = entry.replay(

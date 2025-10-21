@@ -579,10 +579,6 @@ class DeferredWriteManager:
         if not self._entries:
             return mask
 
-        target_device = self._entries[0].key_source.device
-        if mask.device != target_device:
-            mask = mask.to(device=target_device)
-
         if self._debug_validate_mask:
             for req_idx, req_tokens in enumerate(self._num_draft_tokens):
                 start = self._req_start_offsets[req_idx]
