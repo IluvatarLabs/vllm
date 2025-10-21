@@ -100,9 +100,18 @@ class DraftCommitManager:
         if not slot_mapping.is_contiguous():
             slot_mapping = slot_mapping.contiguous()
 
-        # Detect layout
-        block_size = key_cache.shape[1] if key_cache.shape[1] <= 256 else key_cache.shape[2]
-        layout_id = 0 if key_cache.shape[1] == block_size else 1
+        # Detect layout using num_heads from key tensor
+        # Flash: [num_blocks, block_size, num_heads, head_size] - dim 2 is num_heads
+        # Paged: [num_blocks, num_heads, block_size, head_size] - dim 1 is num_heads
+        num_heads_from_key = key.shape[1]
+        if key_cache.shape[2] == num_heads_from_key:
+            # Flash layout
+            layout_id = 0
+            block_size = key_cache.shape[1]
+        else:
+            # Paged layout
+            layout_id = 1
+            block_size = key_cache.shape[2]
 
         # Detect per-token scale
         scale_is_per_token = k_scale is not None and k_scale.numel() > 1
@@ -142,6 +151,7 @@ class DraftCommitManager:
     def commit(self, mask: torch.Tensor) -> int:
         """Commit accepted tokens using CUDA kernel."""
         if not self.enabled or not self._drafts:
+            self.cancel()  # Clean up state
             return 0
 
         try:
@@ -153,6 +163,10 @@ class DraftCommitManager:
                 mask = mask.to(device=device)
             if not mask.is_contiguous():
                 mask = mask.contiguous()
+
+            # Check for empty mask
+            if mask.numel() == 0:
+                return 0
 
             # Validate
             num_tokens = self._drafts[0].num_tokens
