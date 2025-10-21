@@ -3001,6 +3001,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 entry.mask_buffer.numel(), device
                             )
                             mask_buf.copy_(entry.mask_buffer)
+                            entry.hit_count = 1  # Mark as used to avoid immediate eviction
                         else:
                             # Replay cached entry
                             mask_buf = entry.replay(
