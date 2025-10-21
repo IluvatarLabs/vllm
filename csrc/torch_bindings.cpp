@@ -2,6 +2,7 @@
 #include "cuda_utils.h"
 #include "ops.h"
 #include "core/registration.h"
+#include "nwor_commit.h"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -689,6 +690,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                        Tensor k_scale, Tensor v_scale) -> ()");
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
+
+  // NWOR: Commit draft KV tensors based on acceptance mask
+  cache_ops.def(
+      "commit_draft_layer(int key_ptr, int value_ptr,"
+      "                   int key_cache_ptr, int value_cache_ptr,"
+      "                   int mask_ptr, int slot_ptr,"
+      "                   int k_scale_ptr, int v_scale_ptr,"
+      "                   bool scale_is_per_token,"
+      "                   int num_tokens, int num_heads, int head_size,"
+      "                   int block_size, int block_stride,"
+      "                   int page_stride, int head_stride,"
+      "                   int layout, str key_value_dtype,"
+      "                   str kv_cache_dtype) -> ()");
+  cache_ops.impl("commit_draft_layer", torch::kCUDA, &commit_draft_layer);
 
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(
