@@ -178,27 +178,21 @@ class DraftCommitManager:
             if num_accepted == 0:
                 return 0
 
-            # Launch kernel for each layer (no scale slicing - kernel handles it)
+            # Launch kernel for each layer (pass Tensors, not pointers)
             for entry in self._drafts:
+                # Use empty tensor if scale is None
+                k_scale = entry._k_scale_ref if entry._k_scale_ref is not None else torch.empty(0, device=device)
+                v_scale = entry._v_scale_ref if entry._v_scale_ref is not None else torch.empty(0, device=device)
+
                 torch.ops._C_cache_ops.commit_draft_layer(
-                    entry.key_ptr,
-                    entry.value_ptr,
-                    entry.key_cache_ptr,
-                    entry.value_cache_ptr,
-                    mask.data_ptr(),
-                    entry.slot_ptr,
-                    entry.k_scale_ptr,
-                    entry.v_scale_ptr,
-                    entry.scale_is_per_token,
-                    entry.num_tokens,
-                    entry.num_heads,
-                    entry.head_size,
-                    entry.block_size,
-                    entry.block_stride,
-                    entry.page_stride,
-                    entry.head_stride,
-                    entry.layout_id,
-                    entry.key_value_dtype,
+                    entry._key_ref,
+                    entry._value_ref,
+                    entry._key_cache_ref,
+                    entry._value_cache_ref,
+                    mask,
+                    entry._slot_ref,
+                    k_scale,
+                    v_scale,
                     entry.kv_cache_dtype,
                 )
 

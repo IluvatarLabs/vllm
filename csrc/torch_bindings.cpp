@@ -693,15 +693,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
 
   // NWOR: Commit draft KV tensors based on acceptance mask
   cache_ops.def(
-      "commit_draft_layer(int key_ptr, int value_ptr,"
-      "                   int key_cache_ptr, int value_cache_ptr,"
-      "                   int mask_ptr, int slot_ptr,"
-      "                   int k_scale_ptr, int v_scale_ptr,"
-      "                   bool scale_is_per_token,"
-      "                   int num_tokens, int num_heads, int head_size,"
-      "                   int block_size, int block_stride,"
-      "                   int page_stride, int head_stride,"
-      "                   int layout, str key_value_dtype,"
+      "commit_draft_layer(Tensor key, Tensor value,"
+      "                   Tensor! key_cache, Tensor! value_cache,"
+      "                   Tensor mask, Tensor slot_mapping,"
+      "                   Tensor k_scale, Tensor v_scale,"
       "                   str kv_cache_dtype) -> ()");
   cache_ops.impl("commit_draft_layer", torch::kCUDA, &commit_draft_layer);
 

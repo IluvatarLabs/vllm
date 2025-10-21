@@ -37,23 +37,13 @@
 //
 // Returns: void (operates in-place on caches)
 void commit_draft_layer(
-    int64_t key_ptr,
-    int64_t value_ptr,
-    int64_t key_cache_ptr,
-    int64_t value_cache_ptr,
-    int64_t mask_ptr,
-    int64_t slot_ptr,
-    int64_t k_scale_ptr,
-    int64_t v_scale_ptr,
-    bool scale_is_per_token,
-    int64_t num_tokens,
-    int64_t num_heads,
-    int64_t head_size,
-    int64_t block_size,
-    int64_t block_stride,
-    int64_t page_stride,
-    int64_t head_stride,
-    int64_t layout,
-    const std::string& key_value_dtype,
+    torch::Tensor& key,
+    torch::Tensor& value,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& mask,
+    torch::Tensor& slot_mapping,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale,
     const std::string& kv_cache_dtype
 );

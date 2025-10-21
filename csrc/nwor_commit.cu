@@ -150,63 +150,56 @@ __global__ void commit_draft_kernel(
 
 // Main entry point with full validation and dispatch
 void commit_draft_layer(
-    int64_t key_ptr,
-    int64_t value_ptr,
-    int64_t key_cache_ptr,
-    int64_t value_cache_ptr,
-    int64_t mask_ptr,
-    int64_t slot_ptr,
-    int64_t k_scale_ptr,
-    int64_t v_scale_ptr,
-    bool scale_is_per_token,
-    int64_t num_tokens,
-    int64_t num_heads,
-    int64_t head_size,
-    int64_t block_size,
-    int64_t block_stride,
-    int64_t page_stride,
-    int64_t head_stride,
-    int64_t layout,
-    const std::string& key_value_dtype,
+    torch::Tensor& key,
+    torch::Tensor& value,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& mask,
+    torch::Tensor& slot_mapping,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale,
     const std::string& kv_cache_dtype
 ) {
-    // Issue #7: TORCH_CHECK for null pointers
-    TORCH_CHECK(key_ptr != 0, "key_ptr is null");
-    TORCH_CHECK(value_ptr != 0, "value_ptr is null");
-    TORCH_CHECK(key_cache_ptr != 0, "key_cache_ptr is null");
-    TORCH_CHECK(value_cache_ptr != 0, "value_cache_ptr is null");
-    TORCH_CHECK(mask_ptr != 0, "mask_ptr is null");
-    TORCH_CHECK(slot_ptr != 0, "slot_ptr is null");
-    TORCH_CHECK(num_tokens > 0, "num_tokens must be positive");
-    TORCH_CHECK(num_heads > 0, "num_heads must be positive");
-    TORCH_CHECK(head_size > 0, "head_size must be positive");
-    TORCH_CHECK(block_size > 0, "block_size must be positive");
+    // Extract tensor dimensions
+    // key/value: [num_tokens, num_heads, head_size]
+    int64_t num_tokens = key.size(0);
+    int64_t num_heads = key.size(1);
+    int64_t head_size = key.size(2);
 
-    // Compute strides for draft tensors
-    // Key/value layout: [num_tokens, num_heads, head_size]
+    // key_cache: either [num_blocks, block_size, num_heads, head_size] (flash)
+    //                or [num_blocks, num_heads, block_size, head_size] (paged)
+    int64_t block_size = (key_cache.size(1) == num_heads) ? key_cache.size(2) : key_cache.size(1);
+
+    // Compute strides
     int64_t key_stride = num_heads * head_size;
     int64_t value_stride = num_heads * head_size;
+    int64_t block_stride = key_cache.stride(0);
+    int64_t page_stride = key_cache.stride(1);
+    int64_t head_stride = key_cache.stride(2);
 
-    // Issue #4: Grid/block dimensions matching reshape_and_cache_flash
-    // Cast int64_t to unsigned int for dim3 constructor
+    // Determine if scales are per-token
+    bool scale_is_per_token = (k_scale.numel() > 1);
+
+    // Extract pointers
+    int64_t key_ptr = reinterpret_cast<int64_t>(key.data_ptr());
+    int64_t value_ptr = reinterpret_cast<int64_t>(value.data_ptr());
+    int64_t key_cache_ptr = reinterpret_cast<int64_t>(key_cache.data_ptr());
+    int64_t value_cache_ptr = reinterpret_cast<int64_t>(value_cache.data_ptr());
+    int64_t mask_ptr = reinterpret_cast<int64_t>(mask.data_ptr());
+    int64_t slot_ptr = reinterpret_cast<int64_t>(slot_mapping.data_ptr());
+    int64_t k_scale_ptr = k_scale.numel() > 0 ? reinterpret_cast<int64_t>(k_scale.data_ptr()) : 0;
+    int64_t v_scale_ptr = v_scale.numel() > 0 ? reinterpret_cast<int64_t>(v_scale.data_ptr()) : 0;
+
+    // Grid/block dimensions
     dim3 grid(static_cast<unsigned int>(num_tokens));
     dim3 block(static_cast<unsigned int>(std::min(num_heads * head_size, static_cast<int64_t>(512))));
 
     // Get CUDA stream
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Issue #3: Convert key_value_dtype string to ScalarType
-    at::ScalarType src_dtype;
-    if (key_value_dtype == "fp16") {
-        src_dtype = at::ScalarType::Half;
-    } else if (key_value_dtype == "bf16") {
-        src_dtype = at::ScalarType::BFloat16;
-    } else if (key_value_dtype == "fp32") {
-        src_dtype = at::ScalarType::Float;
-    } else {
-        TORCH_CHECK(false, "Unsupported key_value_dtype: ", key_value_dtype);
-    }
+    // Get source dtype from tensor
+    at::ScalarType src_dtype = key.scalar_type();
 
-    // Issue #3: Full dtype/cache type dispatch
+    // Dispatch kernel
     DISPATCH_BY_KV_CACHE_DTYPE(src_dtype, kv_cache_dtype, CALL_COMMIT_DRAFT_KERNEL);
 }
