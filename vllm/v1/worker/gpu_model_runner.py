@@ -337,6 +337,7 @@ class _SCVGraphEntry:
         self.mask_buffer = torch.empty(total_tokens, dtype=torch.bool, device=device)
 
         self.last_used = time.monotonic()
+        self.hit_count = 0
 
     def capture(
         self,
@@ -460,8 +461,9 @@ class _SCVGraphEntry:
     ) -> None:
         if not cache or len(cache) < max_entries:
             return
-        oldest_key, _ = min(cache.items(), key=lambda item: item[1].last_used)
-        cache.pop(oldest_key, None)
+        # LFU eviction: evict entry with lowest hit count, break ties by oldest last_used
+        lfu_key, _ = min(cache.items(), key=lambda item: (item[1].hit_count, item[1].last_used))
+        cache.pop(lfu_key, None)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -3006,6 +3008,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 cu_int32,
                                 sampled_token_ids,
                             )
+                        entry.hit_count += 1
                         self._scv_graph_failures.pop(key, None)
                         return mask_buf
                     except Exception as exc:
