@@ -57,6 +57,7 @@ class DraftEntry:
     # Layout (enum, not string) - Issue #2 fix
     layout_enum: int  # CacheLayout enum value
     kv_cache_dtype: str
+    key_value_dtype: str  # NEW: Source dtype ("fp16", "bf16", "fp32")
 
     # Keep alive - ALL tensors needed for fallback - Issue #2 fix
     _key_ref: torch.Tensor
@@ -187,6 +188,14 @@ class DraftCommitManager:
         if k_scale is not None and k_scale.numel() > 1:
             scale_is_per_token = True
 
+        # Convert torch dtype to string for CUDA dispatch
+        dtype_map = {
+            torch.float32: "fp32",
+            torch.float16: "fp16",
+            torch.bfloat16: "bf16",
+        }
+        key_value_dtype = dtype_map.get(key.dtype, "fp16")  # Default to fp16
+
         entry = DraftEntry(
             # Draft tensors
             key_ptr=key.data_ptr(),
@@ -214,6 +223,7 @@ class DraftCommitManager:
             # Layout
             layout_enum=layout_enum,
             kv_cache_dtype=kv_cache_dtype,
+            key_value_dtype=key_value_dtype,
 
             # Keep alive - Issue #2: added scale refs for fallback
             _key_ref=key,
@@ -301,6 +311,7 @@ class DraftCommitManager:
             entry.page_stride,
             entry.head_stride,
             entry.layout_enum,
+            entry.key_value_dtype,
             entry.kv_cache_dtype,
         )
 
