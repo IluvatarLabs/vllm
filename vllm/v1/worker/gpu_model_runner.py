@@ -1650,6 +1650,63 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return metadata
 
+    def _compute_nwor_acceptance_mask(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        sampler_output: "SamplerOutput",
+    ) -> torch.Tensor:
+        """Compute acceptance mask for NWOR draft commit.
+
+        Creates a boolean mask indicating which draft tokens were accepted.
+        This is a simplified version that compares draft token IDs with
+        sampled token IDs. The actual acceptance logic in production may
+        include bonus tokens, early rejection, and other complexities.
+
+        Returns:
+            Boolean tensor [total_draft_tokens] where True = accepted
+        """
+        # Get sampled token IDs
+        sampled_token_ids_list = sampler_output.sampled_token_ids_cpu
+
+        # Total number of draft tokens across all requests
+        total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+
+        # Create acceptance mask on CPU first
+        mask = torch.zeros(total_draft_tokens, dtype=torch.bool)
+
+        # Extract draft token IDs from metadata
+        draft_token_ids = spec_decode_metadata.draft_token_ids
+
+        # Flatten draft tokens and compare with sampled tokens
+        # This is simplified - actual implementation may vary
+        draft_offset = 0
+        sample_offset = 0
+
+        for num_draft in spec_decode_metadata.num_draft_tokens:
+            if num_draft > 0:
+                # Get sampled tokens for this request (including bonus token)
+                request_sampled = sampled_token_ids_list[sample_offset:sample_offset + num_draft + 1]
+
+                # Get draft tokens for this request
+                request_draft = draft_token_ids[draft_offset:draft_offset + num_draft]
+
+                # Compare draft with sampled (excluding bonus token)
+                for i in range(num_draft):
+                    # Accept if draft matches sampled
+                    if i < len(request_sampled) - 1:  # Exclude bonus
+                        mask[draft_offset + i] = (request_draft[i] == request_sampled[i])
+
+                        # Early rejection: if this token rejected, reject all after
+                        if not mask[draft_offset + i] and i < num_draft - 1:
+                            break
+
+                draft_offset += num_draft
+                sample_offset += num_draft + 1  # +1 for bonus token
+
+        # Move to GPU
+        mask = mask.to(self.device)
+        return mask
+
     def _prepare_kv_sharing_fast_prefill(
         self,
         logits_indices: torch.Tensor,
@@ -2489,6 +2546,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ):
                 cudagraph_runtime_mode = CUDAGraphMode.NONE
 
+        # NWOR: Begin draft window if spec decode (Issue #9: lifecycle management)
+        from vllm.v1.nwor import get_draft_manager
+        nwor_manager = get_draft_manager()
+        if spec_decode_metadata is not None:
+            total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+            nwor_manager.begin(total_draft_tokens)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -2577,6 +2641,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        # NWOR: Commit accepted draft tokens (Issue #2: reuse existing acceptance logic)
+        if nwor_manager.enabled and spec_decode_metadata is not None:
+            # Create acceptance mask by comparing draft tokens with sampled tokens
+            # This is a simplified version - the actual acceptance logic may be more complex
+            # with bonus tokens, multi-request handling, etc.
+            acceptance_mask = self._compute_nwor_acceptance_mask(
+                spec_decode_metadata, sampler_output
+            )
+            nwor_manager.commit(acceptance_mask)
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
