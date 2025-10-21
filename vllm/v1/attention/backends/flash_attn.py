@@ -533,16 +533,34 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+
+            # NWOR: Hook for draft commit staging (Issue #4: cheap when disabled)
+            from vllm.v1.nwor import get_draft_manager
+            manager = get_draft_manager()
+            if manager.enabled:
+                # Stage draft KV for commit after acceptance
+                manager.stage_layer(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    layer._k_scale,
+                    layer._v_scale,
+                    self.kv_cache_dtype,
+                )
+            else:
+                # Fallback: immediate write (vanilla behavior)
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
