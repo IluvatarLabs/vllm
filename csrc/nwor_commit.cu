@@ -146,7 +146,7 @@ __global__ void commit_draft_kernel(
           v_scale_ptr ? reinterpret_cast<const float*>(v_scale_ptr) : nullptr, \
           scale_is_per_token,                                           \
           key_stride, value_stride, block_stride, page_stride,          \
-          head_stride, num_heads, head_size, block_size);
+          head_stride, static_cast<int>(num_heads), static_cast<int>(head_size), static_cast<int>(block_size));
 
 // Main entry point with full validation and dispatch
 void commit_draft_layer(
@@ -159,14 +159,14 @@ void commit_draft_layer(
     int64_t k_scale_ptr,
     int64_t v_scale_ptr,
     bool scale_is_per_token,
-    int num_tokens,
-    int num_heads,
-    int head_size,
-    int block_size,
+    int64_t num_tokens,
+    int64_t num_heads,
+    int64_t head_size,
+    int64_t block_size,
     int64_t block_stride,
     int64_t page_stride,
     int64_t head_stride,
-    int layout,
+    int64_t layout,
     const std::string& key_value_dtype,
     const std::string& kv_cache_dtype
 ) {
@@ -188,8 +188,9 @@ void commit_draft_layer(
     int64_t value_stride = num_heads * head_size;
 
     // Issue #4: Grid/block dimensions matching reshape_and_cache_flash
-    dim3 grid(num_tokens);
-    dim3 block(std::min(num_heads * head_size, 512));
+    // Cast int64_t to unsigned int for dim3 constructor
+    dim3 grid(static_cast<unsigned int>(num_tokens));
+    dim3 block(static_cast<unsigned int>(std::min(num_heads * head_size, static_cast<int64_t>(512))));
 
     // Get CUDA stream
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
