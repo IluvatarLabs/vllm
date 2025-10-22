@@ -123,7 +123,7 @@ from vllm.v1.outputs import (
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
@@ -1665,47 +1665,43 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Returns:
             Boolean tensor [total_draft_tokens] where True = accepted
         """
-        # Get sampled token IDs
-        sampled_token_ids_list = sampler_output.sampled_token_ids_cpu
+        # Total draft tokens across all requests
+        num_draft_tokens = spec_decode_metadata.num_draft_tokens
+        total_draft_tokens = sum(num_draft_tokens)
 
-        # Total number of draft tokens across all requests
-        total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+        if total_draft_tokens == 0:
+            return torch.zeros(0, dtype=torch.bool, device=self.device)
 
-        # Create acceptance mask on CPU first
-        mask = torch.zeros(total_draft_tokens, dtype=torch.bool)
+        # Bring tensors to CPU for comparison to avoid device mismatches
+        draft_token_ids_cpu = spec_decode_metadata.draft_token_ids.to(
+            device="cpu", dtype=torch.int64, copy=False
+        )
+        sampled_token_ids_cpu = sampler_output.sampled_token_ids.to(
+            device="cpu", dtype=torch.int64, copy=False
+        )
 
-        # Extract draft token IDs from metadata
-        draft_token_ids = spec_decode_metadata.draft_token_ids
+        mask_cpu = torch.zeros(total_draft_tokens, dtype=torch.bool, device="cpu")
 
-        # Flatten draft tokens and compare with sampled tokens
-        # This is simplified - actual implementation may vary
         draft_offset = 0
-        sample_offset = 0
+        PLACEHOLDER = PLACEHOLDER_TOKEN_ID
 
-        for num_draft in spec_decode_metadata.num_draft_tokens:
-            if num_draft > 0:
-                # Get sampled tokens for this request (including bonus token)
-                request_sampled = sampled_token_ids_list[sample_offset:sample_offset + num_draft + 1]
+        for req_idx, num_draft in enumerate(num_draft_tokens):
+            if num_draft <= 0:
+                continue
 
-                # Get draft tokens for this request
-                request_draft = draft_token_ids[draft_offset:draft_offset + num_draft]
+            # `sampled_token_ids` has shape [num_reqs, max_spec_len + 1]
+            sampled_row = sampled_token_ids_cpu[req_idx]
+            draft_slice = draft_token_ids_cpu[draft_offset:draft_offset + num_draft]
 
-                # Compare draft with sampled (excluding bonus token)
-                for i in range(num_draft):
-                    # Accept if draft matches sampled
-                    if i < len(request_sampled) - 1:  # Exclude bonus
-                        mask[draft_offset + i] = (request_draft[i] == request_sampled[i])
+            for i in range(num_draft):
+                sampled_token = sampled_row[i].item()
+                if sampled_token == PLACEHOLDER or draft_slice[i].item() != sampled_token:
+                    break
+                mask_cpu[draft_offset + i] = True
 
-                        # Early rejection: if this token rejected, reject all after
-                        if not mask[draft_offset + i] and i < num_draft - 1:
-                            break
+            draft_offset += num_draft
 
-                draft_offset += num_draft
-                sample_offset += num_draft + 1  # +1 for bonus token
-
-        # Move to GPU
-        mask = mask.to(self.device)
-        return mask
+        return mask_cpu.to(self.device)
 
     def _prepare_kv_sharing_fast_prefill(
         self,
