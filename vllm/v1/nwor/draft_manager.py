@@ -221,10 +221,11 @@ class DraftCommitManager:
                 mask = mask.to(dtype=torch.bool)
             draft_mask = mask.to('cpu') if mask.device.type != 'cpu' else mask
 
-            # Track draft-only metrics (before building full mask)
-            self._num_draft_tokens = len(self._draft_positions)
-            self._num_draft_accepted = int(draft_mask.sum().item())
-            self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
+            # Track draft-only metrics (only if metrics enabled)
+            if self._emit_metrics:
+                self._num_draft_tokens = len(self._draft_positions)
+                self._num_draft_accepted = int(draft_mask.sum().item())
+                self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
 
             # Build full mask for all staged tokens
             full_mask = torch.zeros(num_tokens, dtype=torch.bool, device='cpu')
@@ -272,10 +273,13 @@ class DraftCommitManager:
 
             # Log success once for verification
             if not hasattr(self, '_logged_success'):
-                logger.info(f"NWOR kernel succeeded: accepted {self._num_draft_accepted}/{self._num_draft_tokens} draft tokens across {len(self._drafts)} layers")
+                if self._emit_metrics:
+                    logger.info(f"NWOR kernel succeeded: accepted {self._num_draft_accepted}/{self._num_draft_tokens} draft tokens across {len(self._drafts)} layers (per-pass snapshot)")
+                else:
+                    logger.info(f"NWOR kernel succeeded across {len(self._drafts)} layers")
                 self._logged_success = True
 
-            return self._num_draft_accepted
+            return self._num_draft_accepted if self._emit_metrics else 0
 
         except Exception as e:
             if not self._logged_failure:
