@@ -141,6 +141,8 @@ if TYPE_CHECKING:
     VLLM_MXFP4_USE_MARLIN: bool | None = None
     VLLM_V0_USE_OUTLINES_CACHE: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
+    VLLM_NWOR_MODE: str = "off"
+    VLLM_NWOR_EMIT_METRICS: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1066,6 +1068,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # an environment with potentially malicious users.
     "VLLM_V1_USE_OUTLINES_CACHE": lambda: os.environ.get(
         "VLLM_V1_USE_OUTLINES_CACHE", "0"
+    )
+    == "1",
+    # NWOR (No-Write-On-Reject) mode for speculative decoding KV cache writes.
+    # "off" = disabled (default), "stage" = defer writes until acceptance known
+    "VLLM_NWOR_MODE": lambda: os.getenv("VLLM_NWOR_MODE", "off"),
+    # Enable NWOR metrics emission for correctness verification against scheduler
+    "VLLM_NWOR_EMIT_METRICS": lambda: os.environ.get(
+        "VLLM_NWOR_EMIT_METRICS", "0"
     )
     == "1",
     # Gap between padding buckets for the forward pass. So we have

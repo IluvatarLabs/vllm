@@ -1051,6 +1051,20 @@ class Scheduler(SchedulerInterface):
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
 
+        # NWOR correctness check (when VLLM_NWOR_EMIT_METRICS=1)
+        if spec_decoding_stats is not None:
+            from vllm.v1.nwor import get_draft_manager
+            nwor = get_draft_manager()
+            if nwor._emit_metrics:
+                nm = nwor.get_metrics()
+                if (spec_decoding_stats.num_draft_tokens != nm["num_draft_tokens"] or
+                    spec_decoding_stats.num_accepted_tokens != nm["num_draft_accepted"]):
+                    logger.warning(
+                        f"NWOR/Scheduler mismatch: "
+                        f"scheduler={spec_decoding_stats.num_accepted_tokens}/{spec_decoding_stats.num_draft_tokens} "
+                        f"nwor={nm['num_draft_accepted']}/{nm['num_draft_tokens']}"
+                    )
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
