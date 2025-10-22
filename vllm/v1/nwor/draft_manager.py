@@ -1,7 +1,7 @@
 """Draft Commit Manager for NWOR (greenfield implementation)."""
 
-from dataclasses import dataclass
-from typing import Optional, List
+from dataclasses import dataclass, replace
+from typing import Optional, List, Dict, Tuple
 import torch
 from vllm.logger import init_logger
 
@@ -47,6 +47,17 @@ class DraftEntry:
     _v_scale_ref: Optional[torch.Tensor]
 
 
+CacheKey = Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]
+
+
+@dataclass
+class DraftCacheEntry:
+    """Cached metadata for CUDA graph replays."""
+    positions: List[int]
+    drafts: List[DraftEntry]
+    num_layers: int
+
+
 class DraftCommitManager:
     """Manages draft buffers for NWOR with minimal overhead."""
 
@@ -66,6 +77,10 @@ class DraftCommitManager:
         self._num_draft_tokens = 0
         self._num_draft_accepted = 0
         self._num_draft_rejected = 0
+        # CUDA graph caching
+        self._cache: Dict[CacheKey, DraftCacheEntry] = {}
+        self._cache_key: Optional[CacheKey] = None
+        self._capturing = False
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
             if self._emit_metrics:
@@ -82,6 +97,8 @@ class DraftCommitManager:
         """
         self._drafts.clear()
         self._draft_positions.clear()
+        self._cache_key = None
+        self._capturing = False
 
         if spec_decode_metadata is None:
             self.enabled = False
@@ -97,15 +114,40 @@ class DraftCommitManager:
         # Extract position metadata for mapping mask to staged tokens
         self._logits_indices = spec_decode_metadata.logits_indices
         self._target_logits_indices = spec_decode_metadata.target_logits_indices
+        # Cache key is fully described by the logits layout
+        logits_indices_cpu = self._logits_indices.cpu()
+        target_indices_cpu = self._target_logits_indices.cpu()
+        num_draft_tokens_tuple = tuple(spec_decode_metadata.num_draft_tokens)
+        cache_key: CacheKey = (
+            tuple(int(x) for x in logits_indices_cpu.tolist()),
+            tuple(int(x) for x in target_indices_cpu.tolist()),
+            num_draft_tokens_tuple,
+        )
+        self._cache_key = cache_key
 
-        # Compute draft positions: for each request with drafts,
-        # drafts follow target at target_idx+1, target_idx+2, ...
-        for req_idx, num_draft in enumerate(spec_decode_metadata.num_draft_tokens):
-            if num_draft > 0:
-                target_idx = self._target_logits_indices[req_idx]
-                for i in range(1, num_draft + 1):
-                    pos = self._logits_indices[target_idx + i].item()
-                    self._draft_positions.append(pos)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self._draft_positions.extend(cached.positions)
+            if cached.drafts:
+                self._drafts = [replace(entry) for entry in cached.drafts]
+        else:
+            logits_list = logits_indices_cpu.tolist()
+            target_list = target_indices_cpu.tolist()
+            positions: List[int] = []
+            for target_idx in target_list:
+                next_idx = target_idx + 1
+                assert next_idx < len(logits_list), (
+                    f"Draft position out of bounds: target_idx={target_idx}, "
+                    f"logits_len={len(logits_list)}"
+                )
+                positions.append(logits_list[next_idx])
+            self._draft_positions.extend(positions)
+            self._cache[cache_key] = DraftCacheEntry(
+                positions=list(positions),
+                drafts=[],
+                num_layers=0,
+            )
+            self._drafts = []
 
         self.enabled = True
         return True
@@ -114,6 +156,8 @@ class DraftCommitManager:
         """Cancel without committing."""
         self._drafts.clear()
         self.enabled = False
+        self._cache_key = None
+        self._capturing = False
 
     def stage_layer(
         self,
@@ -129,6 +173,12 @@ class DraftCommitManager:
         """Record draft KV for one layer."""
         if not self.enabled:
             return
+
+        if not self._capturing:
+            # First layer observed for this window → fresh capture
+            if self._drafts:
+                self._drafts.clear()
+            self._capturing = True
 
         # Validate storage
         for t, n in [(key, "key"), (value, "value"), (key_cache, "key_cache"),
@@ -291,6 +341,14 @@ class DraftCommitManager:
             return self._fallback_commit(mask)
 
         finally:
+            if self._cache_key is not None and self._capturing:
+                cached_entry = self._cache.get(self._cache_key)
+                if cached_entry is None:
+                    cached_entry = DraftCacheEntry([], [], 0)
+                    self._cache[self._cache_key] = cached_entry
+                cached_entry.positions = list(self._draft_positions)
+                cached_entry.drafts = [replace(entry) for entry in self._drafts]
+                cached_entry.num_layers = len(self._drafts)
             self.cancel()
 
     def get_metrics(self) -> dict:
