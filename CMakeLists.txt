@@ -877,6 +877,16 @@ define_gpu_extension_target(
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
+# Undefine Py_LIMITED_API for CUDA and CXX compilations to avoid pybind11
+# incomplete type errors when compiling files that include torch/all.h.
+# Keep Stable ABI for the module, but not for CUDA/C++ source files.
+if (VLLM_GPU_LANG STREQUAL "CUDA")
+  target_compile_options(
+    _C PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API>
+    $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+endif()
+
 #
 # _moe_C extension
 #
