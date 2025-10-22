@@ -1657,32 +1657,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> torch.Tensor:
         """Compute acceptance mask for NWOR draft commit.
 
-        Creates a boolean mask indicating which staged tokens (targets + drafts)
-        were accepted. Target tokens are always accepted; draft tokens are
-        accepted if they match the sampled tokens.
+        Creates a boolean mask indicating which draft tokens were accepted.
+        Target tokens are handled separately by the commit manager.
 
         Returns:
-            Boolean tensor [num_staged_tokens] where True = accepted
+            Boolean tensor [num_draft_tokens] where True = accepted
         """
         # Convert tensors to CPU for comparison
         draft_token_ids = spec_decode_metadata.draft_token_ids.cpu()
         sampled_token_ids = sampler_output.sampled_token_ids.cpu()
 
-        # Pre-allocate mask matching total staged tokens (targets + drafts)
-        # Staged tokens follow order: [target, draft_0, ..., draft_N] per request
-        num_tokens = len(spec_decode_metadata.logits_indices)
-        mask = torch.zeros(num_tokens, dtype=torch.bool)
+        # Total number of draft tokens across all requests
+        total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
 
-        # Build mask in same order as staged tokens
+        # Pre-allocate mask for draft tokens only
+        mask = torch.zeros(total_draft_tokens, dtype=torch.bool)
+
+        # Build mask for draft tokens
         mask_idx = 0
         draft_offset = 0
 
         for req_idx, num_draft in enumerate(spec_decode_metadata.num_draft_tokens):
-            # Target token always accepted (first token per request)
-            mask[mask_idx] = True
-            mask_idx += 1
-
-            # Draft tokens for this request
             if num_draft > 0:
                 # Get sampled tokens for this request (including bonus at end)
                 request_sampled = sampled_token_ids[req_idx, :num_draft + 1]
@@ -2547,9 +2542,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # NWOR: Begin draft window if spec decode (Issue #9: lifecycle management)
         from vllm.v1.nwor import get_draft_manager
         nwor_manager = get_draft_manager()
-        if spec_decode_metadata is not None:
-            total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
-            nwor_manager.begin(total_draft_tokens)
+        nwor_manager.begin(spec_decode_metadata)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

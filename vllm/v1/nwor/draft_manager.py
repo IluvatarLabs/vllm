@@ -57,16 +57,49 @@ class DraftCommitManager:
         self.enabled = False  # Per-window active flag
         self._drafts: List[DraftEntry] = []
         self._logged_failure = False
+        # Position tracking for mapping draft-only mask to full staged tensor
+        self._logits_indices = None  # All token positions (targets + drafts)
+        self._target_logits_indices = None  # Indices into logits_indices pointing to targets
+        self._draft_positions = []  # Absolute positions of draft tokens in staged tensor
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
 
-    def begin(self, num_draft_tokens: int) -> bool:
-        """Begin new spec decode window."""
+    def begin(self, spec_decode_metadata) -> bool:
+        """Begin new spec decode window.
+
+        Args:
+            spec_decode_metadata: SpecDecodeMetadata containing token positions
+
+        Returns:
+            True if NWOR is enabled for this window
+        """
         self._drafts.clear()
-        # Only activate if NWOR enabled AND we have draft tokens
-        if not self._nwor_enabled or num_draft_tokens <= 0:
+        self._draft_positions.clear()
+
+        if spec_decode_metadata is None:
             self.enabled = False
             return False
+
+        total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+
+        # Only activate if NWOR enabled AND we have draft tokens
+        if not self._nwor_enabled or total_draft_tokens <= 0:
+            self.enabled = False
+            return False
+
+        # Extract position metadata for mapping mask to staged tokens
+        self._logits_indices = spec_decode_metadata.logits_indices
+        self._target_logits_indices = spec_decode_metadata.target_logits_indices
+
+        # Compute draft positions: for each request with drafts,
+        # drafts follow target at target_idx+1, target_idx+2, ...
+        for req_idx, num_draft in enumerate(spec_decode_metadata.num_draft_tokens):
+            if num_draft > 0:
+                target_idx = self._target_logits_indices[req_idx]
+                for i in range(1, num_draft + 1):
+                    pos = self._logits_indices[target_idx + i].item()
+                    self._draft_positions.append(pos)
+
         self.enabled = True
         return True
 
@@ -155,32 +188,58 @@ class DraftCommitManager:
         ))
 
     def commit(self, mask: torch.Tensor) -> int:
-        """Commit accepted tokens using CUDA kernel."""
+        """Commit accepted tokens using CUDA kernel.
+
+        Args:
+            mask: Boolean tensor [num_draft_tokens] indicating which drafts were accepted
+
+        Returns:
+            Number of tokens committed (including targets and accepted drafts)
+        """
         if not self.enabled or not self._drafts:
             self.cancel()  # Clean up state
             return 0
 
         try:
-            # Prepare mask
             device = self._drafts[0]._key_ref.device
-            if mask.dtype != torch.bool:
-                mask = mask.to(dtype=torch.bool)
-            if mask.device != device:
-                mask = mask.to(device=device)
-            if not mask.is_contiguous():
-                mask = mask.contiguous()
-
-            # Check for empty mask
-            if mask.numel() == 0:
-                return 0
-
-            # Validate
             num_tokens = self._drafts[0].num_tokens
-            assert mask.shape[0] == num_tokens
+
+            # Validate input mask covers all drafts
+            assert mask.shape[0] == len(self._draft_positions), \
+                f"mask size {mask.shape[0]} != num drafts {len(self._draft_positions)}"
             assert all(e.num_tokens == num_tokens for e in self._drafts)
 
+            # Prepare draft mask
+            if mask.dtype != torch.bool:
+                mask = mask.to(dtype=torch.bool)
+            draft_mask = mask.to('cpu') if mask.device.type != 'cpu' else mask
+
+            # Build full mask for all staged tokens
+            full_mask = torch.zeros(num_tokens, dtype=torch.bool, device='cpu')
+
+            # Category 1: Prefill tokens (not in logits_indices) - always write
+            logits_positions = set(self._logits_indices.cpu().tolist())
+            all_positions = set(range(num_tokens))
+            prefill_positions = all_positions - logits_positions
+            for pos in prefill_positions:
+                full_mask[pos] = True
+
+            # Category 2: Target tokens - always write
+            for target_idx in self._target_logits_indices.cpu():
+                pos = self._logits_indices[target_idx].item()
+                full_mask[pos] = True
+
+            # Category 3: Draft tokens - conditional write based on input mask
+            for i, pos in enumerate(self._draft_positions):
+                full_mask[pos] = draft_mask[i]
+
+            # Move full mask to device and ensure contiguous
+            full_mask = full_mask.to(device=device, non_blocking=True)
+            if not full_mask.is_contiguous():
+                full_mask = full_mask.contiguous()
+
             # Count accepted (single GPU→CPU sync)
-            num_accepted = int(mask.sum().item())
+            num_accepted = int(full_mask.sum().item())
             if num_accepted == 0:
                 return 0
 
@@ -195,7 +254,7 @@ class DraftCommitManager:
                     entry._value_ref,
                     entry._key_cache_ref,
                     entry._value_cache_ref,
-                    mask,
+                    full_mask,
                     entry._slot_ref,
                     k_scale,
                     v_scale,
