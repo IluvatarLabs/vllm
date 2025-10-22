@@ -174,6 +174,8 @@ void commit_draft_layer(
                 "key and value must be on the same device");
     TORCH_CHECK(key.device() == key_cache.device(),
                 "key and key_cache must be on the same device");
+    TORCH_CHECK(key.device() == value_cache.device(),
+                "key and value_cache must be on the same device");
     TORCH_CHECK(key.device() == mask.device(),
                 "key and mask must be on the same device");
     TORCH_CHECK(key.device() == slot_mapping.device(),
@@ -188,6 +190,18 @@ void commit_draft_layer(
     int num_tokens = slot_mapping.size(0);
     int64_t num_heads = key.size(1);
     int64_t head_size = key.size(2);
+
+    // Validate tensor sizes
+    TORCH_CHECK(mask.numel() >= num_tokens,
+                "mask size (", mask.numel(), ") must be >= num_tokens (", num_tokens, ")");
+    if (k_scale.numel() > 0) {
+        TORCH_CHECK(k_scale.device() == key.device(),
+                    "k_scale must be on the same device as key");
+    }
+    if (v_scale.numel() > 0) {
+        TORCH_CHECK(v_scale.device() == key.device(),
+                    "v_scale must be on the same device as key");
+    }
 
     // key_cache: either [num_blocks, block_size, num_heads, head_size] (flash)
     //                or [num_blocks, num_heads, block_size, head_size] (paged)
