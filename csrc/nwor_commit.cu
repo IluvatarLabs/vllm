@@ -163,9 +163,29 @@ void commit_draft_layer(
     torch::Tensor& v_scale,
     const std::string& kv_cache_dtype
 ) {
+    // Validate dtypes
+    TORCH_CHECK(mask.dtype() == torch::kBool,
+                "mask must have dtype torch.bool, got ", mask.dtype());
+    TORCH_CHECK(slot_mapping.dtype() == torch::kInt32,
+                "slot_mapping must have dtype torch.int32, got ", slot_mapping.dtype());
+
+    // Validate devices
+    TORCH_CHECK(key.device() == value.device(),
+                "key and value must be on the same device");
+    TORCH_CHECK(key.device() == key_cache.device(),
+                "key and key_cache must be on the same device");
+    TORCH_CHECK(key.device() == mask.device(),
+                "key and mask must be on the same device");
+    TORCH_CHECK(key.device() == slot_mapping.device(),
+                "key and slot_mapping must be on the same device");
+
+    // Validate strides
+    TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+                "key_cache and value_cache must have the same block stride");
+
     // Extract tensor dimensions
     // key/value: [num_tokens, num_heads, head_size]
-    int64_t num_tokens = key.size(0);
+    int num_tokens = slot_mapping.size(0);
     int64_t num_heads = key.size(1);
     int64_t head_size = key.size(2);
 
@@ -173,9 +193,9 @@ void commit_draft_layer(
     //                or [num_blocks, num_heads, block_size, head_size] (paged)
     int64_t block_size = (key_cache.size(1) == num_heads) ? key_cache.size(2) : key_cache.size(1);
 
-    // Compute strides
-    int64_t key_stride = num_heads * head_size;
-    int64_t value_stride = num_heads * head_size;
+    // Compute strides from actual tensor layout
+    int64_t key_stride = key.stride(0);
+    int64_t value_stride = value.stride(0);
     int64_t block_stride = key_cache.stride(0);
 
     // Strides are layout-dependent:
@@ -184,12 +204,12 @@ void commit_draft_layer(
     int64_t page_stride, head_stride;
     if (key_cache.size(1) == num_heads) {
         // Paged layout: swap stride indices
-        page_stride = key_cache.stride(2);  // token stride
-        head_stride = key_cache.stride(1);  // head stride
+        page_stride = key_cache.stride(2);
+        head_stride = key_cache.stride(1);
     } else {
         // Flash layout: use standard indices
-        page_stride = key_cache.stride(1);  // token stride
-        head_stride = key_cache.stride(2);  // head stride
+        page_stride = key_cache.stride(1);
+        head_stride = key_cache.stride(2);
     }
 
     // Determine if scales are per-token
@@ -209,12 +229,10 @@ void commit_draft_layer(
     dim3 grid(static_cast<unsigned int>(num_tokens));
     dim3 block(static_cast<unsigned int>(std::min(num_heads * head_size, static_cast<int64_t>(512))));
 
-    // Get CUDA stream
+    // Device guard and stream
+    const at::cuda::OptionalCUDAGuard device_guard(key.device());
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Get source dtype from tensor
-    at::ScalarType src_dtype = key.scalar_type();
-
     // Dispatch kernel
-    DISPATCH_BY_KV_CACHE_DTYPE(src_dtype, kv_cache_dtype, CALL_COMMIT_DRAFT_KERNEL);
+    DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype, CALL_COMMIT_DRAFT_KERNEL);
 }
