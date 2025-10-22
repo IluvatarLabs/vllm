@@ -2643,6 +2643,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             nwor_manager.commit(acceptance_mask)
 
+            # Emit NWOR metrics if enabled
+            from vllm.v1.nwor.metrics import get_nwor_metrics
+            nwor_metrics = get_nwor_metrics()
+            if nwor_metrics:
+                nwor_metrics.observe(nwor_manager.get_metrics())
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("Draft"):

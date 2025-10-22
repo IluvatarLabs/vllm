@@ -61,8 +61,15 @@ class DraftCommitManager:
         self._logits_indices = None  # All token positions (targets + drafts)
         self._target_logits_indices = None  # Indices into logits_indices pointing to targets
         self._draft_positions = []  # Absolute positions of draft tokens in staged tensor
+        # Metrics tracking (per-commit)
+        self._emit_metrics = os.getenv("VLLM_NWOR_EMIT_METRICS", "0") == "1"
+        self._num_draft_tokens = 0
+        self._num_draft_accepted = 0
+        self._num_draft_rejected = 0
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
+            if self._emit_metrics:
+                logger.info("NWOR metrics emission enabled (VLLM_NWOR_EMIT_METRICS=1)")
 
     def begin(self, spec_decode_metadata) -> bool:
         """Begin new spec decode window.
@@ -214,6 +221,11 @@ class DraftCommitManager:
                 mask = mask.to(dtype=torch.bool)
             draft_mask = mask.to('cpu') if mask.device.type != 'cpu' else mask
 
+            # Track draft-only metrics (before building full mask)
+            self._num_draft_tokens = len(self._draft_positions)
+            self._num_draft_accepted = int(draft_mask.sum().item())
+            self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
+
             # Build full mask for all staged tokens
             full_mask = torch.zeros(num_tokens, dtype=torch.bool, device='cpu')
 
@@ -238,11 +250,6 @@ class DraftCommitManager:
             if not full_mask.is_contiguous():
                 full_mask = full_mask.contiguous()
 
-            # Count accepted (single GPU→CPU sync)
-            num_accepted = int(full_mask.sum().item())
-            if num_accepted == 0:
-                return 0
-
             # Launch kernel for each layer (pass Tensors, not pointers)
             for entry in self._drafts:
                 # Use empty tensor if scale is None
@@ -265,10 +272,10 @@ class DraftCommitManager:
 
             # Log success once for verification
             if not hasattr(self, '_logged_success'):
-                logger.info(f"NWOR kernel succeeded: committed {num_accepted}/{num_tokens} tokens across {len(self._drafts)} layers")
+                logger.info(f"NWOR kernel succeeded: accepted {self._num_draft_accepted}/{self._num_draft_tokens} draft tokens across {len(self._drafts)} layers")
                 self._logged_success = True
 
-            return num_accepted
+            return self._num_draft_accepted
 
         except Exception as e:
             if not self._logged_failure:
@@ -281,6 +288,21 @@ class DraftCommitManager:
 
         finally:
             self.cancel()
+
+    def get_metrics(self) -> dict:
+        """Return draft-only metrics from the last commit.
+
+        Returns:
+            Dictionary with keys:
+            - num_draft_tokens: Total draft tokens staged
+            - num_draft_accepted: Draft tokens accepted
+            - num_draft_rejected: Draft tokens rejected
+        """
+        return {
+            "num_draft_tokens": self._num_draft_tokens,
+            "num_draft_accepted": self._num_draft_accepted,
+            "num_draft_rejected": self._num_draft_rejected,
+        }
 
     def _fallback_commit(self, mask: torch.Tensor) -> int:
         """Fallback to vanilla writer with sliced tensors."""

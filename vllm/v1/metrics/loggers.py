@@ -21,6 +21,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
+from vllm.v1.nwor.metrics import initialize_nwor_metrics
 
 logger = init_logger(__name__)
 
@@ -208,6 +209,11 @@ class PrometheusStatLogger(StatLoggerBase):
         self.spec_decoding_prom = self._spec_decoding_cls(
             vllm_config.speculative_config, labelnames, spec_decode_labelvalues
         )
+
+        # Initialize NWOR metrics if enabled
+        import os
+        nwor_emit_metrics = os.getenv("VLLM_NWOR_EMIT_METRICS", "0") == "1"
+        initialize_nwor_metrics(nwor_emit_metrics, labelnames, spec_decode_labelvalues)
 
         #
         # Scheduler state
