@@ -197,11 +197,20 @@ class DraftCommitManager:
                 )
 
             torch.cuda.synchronize()
+
+            # Log success once for verification
+            if not hasattr(self, '_logged_success'):
+                logger.info(f"NWOR kernel succeeded: committed {num_accepted}/{num_tokens} tokens across {len(self._drafts)} layers")
+                self._logged_success = True
+
             return num_accepted
 
         except Exception as e:
             if not self._logged_failure:
-                logger.warning(f"Draft commit kernel failed: {e}, using fallback")
+                import traceback
+                logger.warning(f"Draft commit kernel failed: {type(e).__name__}: {str(e)}, using fallback")
+                logger.warning(f"Exception details: {repr(e)}")
+                logger.warning(f"Traceback:\n{traceback.format_exc()}")
                 self._logged_failure = True
             return self._fallback_commit(mask)
 
