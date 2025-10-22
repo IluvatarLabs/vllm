@@ -1680,12 +1680,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Flatten draft tokens and compare with sampled tokens
         # This is simplified - actual implementation may vary
         draft_offset = 0
-        sample_offset = 0
+        req_idx = 0
 
         for num_draft in spec_decode_metadata.num_draft_tokens:
             if num_draft > 0:
-                # Get sampled tokens for this request (including bonus token)
-                request_sampled = sampled_token_ids_cpu[sample_offset:sample_offset + num_draft + 1]
+                # Get sampled tokens for this request (2D indexing: row req_idx)
+                request_sampled = sampled_token_ids_cpu[req_idx, :num_draft + 1]
 
                 # Get draft tokens for this request
                 request_draft = draft_token_ids[draft_offset:draft_offset + num_draft]
@@ -1701,7 +1701,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             break
 
                 draft_offset += num_draft
-                sample_offset += num_draft + 1  # +1 for bonus token
+            req_idx += 1
 
         # Move to GPU
         mask = mask.to(self.device)
