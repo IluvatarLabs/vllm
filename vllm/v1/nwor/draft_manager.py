@@ -235,8 +235,9 @@ class DraftCommitManager:
             value_accepted = entry._value_ref[accepted_indices]
             slot_accepted = entry._slot_ref[accepted_indices]
 
-            if slot_accepted.dtype != torch.int32:
-                slot_accepted = slot_accepted.to(dtype=torch.int32)
+            # reshape_and_cache_flash expects int64
+            if slot_accepted.dtype != torch.int64:
+                slot_accepted = slot_accepted.to(dtype=torch.int64)
 
             # Scale slicing ONLY in fallback
             k_scale = None
