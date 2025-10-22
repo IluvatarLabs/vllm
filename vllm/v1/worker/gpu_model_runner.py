@@ -1674,8 +1674,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Create acceptance mask on CPU first
         mask = torch.zeros(total_draft_tokens, dtype=torch.bool)
 
-        # Extract draft token IDs from metadata
-        draft_token_ids = spec_decode_metadata.draft_token_ids
+        # Extract draft token IDs from metadata (sync to CPU for comparison)
+        draft_token_ids = spec_decode_metadata.draft_token_ids.cpu()
 
         # Flatten draft tokens and compare with sampled tokens
         # This is simplified - actual implementation may vary
