@@ -51,14 +51,20 @@ class DraftCommitManager:
     """Manages draft buffers for NWOR with minimal overhead."""
 
     def __init__(self):
-        self.enabled = False
+        import os
+        nwor_mode = os.getenv("VLLM_NWOR_MODE", "off")
+        self._nwor_enabled = (nwor_mode == "stage")  # Persistent config flag
+        self.enabled = False  # Per-window active flag
         self._drafts: List[DraftEntry] = []
         self._logged_failure = False
+        if self._nwor_enabled:
+            logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
 
     def begin(self, num_draft_tokens: int) -> bool:
         """Begin new spec decode window."""
         self._drafts.clear()
-        if num_draft_tokens <= 0:
+        # Only activate if NWOR enabled AND we have draft tokens
+        if not self._nwor_enabled or num_draft_tokens <= 0:
             self.enabled = False
             return False
         self.enabled = True
