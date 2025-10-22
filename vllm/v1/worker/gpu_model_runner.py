@@ -1665,8 +1665,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Returns:
             Boolean tensor [total_draft_tokens] where True = accepted
         """
-        # Get sampled token IDs
-        sampled_token_ids_list = sampler_output.sampled_token_ids_cpu
+        # Get sampled token IDs (sync to CPU for comparison)
+        sampled_token_ids_cpu = sampler_output.sampled_token_ids.cpu()
 
         # Total number of draft tokens across all requests
         total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
@@ -1685,7 +1685,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         for num_draft in spec_decode_metadata.num_draft_tokens:
             if num_draft > 0:
                 # Get sampled tokens for this request (including bonus token)
-                request_sampled = sampled_token_ids_list[sample_offset:sample_offset + num_draft + 1]
+                request_sampled = sampled_token_ids_cpu[sample_offset:sample_offset + num_draft + 1]
 
                 # Get draft tokens for this request
                 request_draft = draft_token_ids[draft_offset:draft_offset + num_draft]
