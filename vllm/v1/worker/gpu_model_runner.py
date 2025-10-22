@@ -1657,55 +1657,53 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> torch.Tensor:
         """Compute acceptance mask for NWOR draft commit.
 
-        Creates a boolean mask indicating which draft tokens were accepted.
-        This is a simplified version that compares draft token IDs with
-        sampled token IDs. The actual acceptance logic in production may
-        include bonus tokens, early rejection, and other complexities.
+        Creates a boolean mask indicating which staged tokens (targets + drafts)
+        were accepted. Target tokens are always accepted; draft tokens are
+        accepted if they match the sampled tokens.
 
         Returns:
-            Boolean tensor [total_draft_tokens] where True = accepted
+            Boolean tensor [num_staged_tokens] where True = accepted
         """
-        # Get sampled token IDs (sync to CPU for comparison)
-        sampled_token_ids_cpu = sampler_output.sampled_token_ids.cpu()
-
-        # Total number of draft tokens across all requests
-        total_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
-
-        # Create acceptance mask on CPU first
-        mask = torch.zeros(total_draft_tokens, dtype=torch.bool)
-
-        # Extract draft token IDs from metadata (sync to CPU for comparison)
+        # Convert tensors to CPU for comparison
         draft_token_ids = spec_decode_metadata.draft_token_ids.cpu()
+        sampled_token_ids = sampler_output.sampled_token_ids.cpu()
 
-        # Flatten draft tokens and compare with sampled tokens
-        # This is simplified - actual implementation may vary
+        # Pre-allocate mask matching total staged tokens (targets + drafts)
+        # Staged tokens follow order: [target, draft_0, ..., draft_N] per request
+        num_tokens = len(spec_decode_metadata.logits_indices)
+        mask = torch.zeros(num_tokens, dtype=torch.bool)
+
+        # Build mask in same order as staged tokens
+        mask_idx = 0
         draft_offset = 0
-        req_idx = 0
 
-        for num_draft in spec_decode_metadata.num_draft_tokens:
+        for req_idx, num_draft in enumerate(spec_decode_metadata.num_draft_tokens):
+            # Target token always accepted (first token per request)
+            mask[mask_idx] = True
+            mask_idx += 1
+
+            # Draft tokens for this request
             if num_draft > 0:
-                # Get sampled tokens for this request (2D indexing: row req_idx)
-                request_sampled = sampled_token_ids_cpu[req_idx, :num_draft + 1]
+                # Get sampled tokens for this request (including bonus at end)
+                request_sampled = sampled_token_ids[req_idx, :num_draft + 1]
 
                 # Get draft tokens for this request
                 request_draft = draft_token_ids[draft_offset:draft_offset + num_draft]
 
-                # Compare draft with sampled (excluding bonus token)
+                # Compare draft with sampled (excluding bonus token at end)
                 for i in range(num_draft):
-                    # Accept if draft matches sampled
                     if i < len(request_sampled) - 1:  # Exclude bonus
-                        mask[draft_offset + i] = (request_draft[i] == request_sampled[i])
+                        mask[mask_idx + i] = (request_draft[i] == request_sampled[i])
 
-                        # Early rejection: if this token rejected, reject all after
-                        if not mask[draft_offset + i] and i < num_draft - 1:
+                        # Early rejection: if this token rejected, stop checking
+                        if not mask[mask_idx + i]:
                             break
 
+                mask_idx += num_draft
                 draft_offset += num_draft
-            req_idx += 1
 
-        # Move to GPU
-        mask = mask.to(self.device)
-        return mask
+        # Move mask to device for kernel
+        return mask.to(self.device)
 
     def _prepare_kv_sharing_fast_prefill(
         self,
