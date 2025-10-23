@@ -127,34 +127,34 @@ class DraftCommitManager:
         self._cache_key = cache_key
 
         cached = self._cache.get(cache_key)
-        if cached is not None:
-            # Validate: total drafts must match cached layout
-            if len(cached.positions) != total_draft_tokens:
-                # Cache invalid - force recapture
-                cached = None
 
-        if cached is not None:
-            self._draft_positions.extend(cached.positions)
-            if cached.drafts:
-                self._drafts = [replace(entry) for entry in cached.drafts]
-        else:
-            logits_list = logits_indices_cpu.tolist()
-            target_list = target_indices_cpu.tolist()
-            positions: List[int] = []
-            for target_idx in target_list:
-                next_idx = target_idx + 1
-                assert next_idx < len(logits_list), (
-                    f"Draft position out of bounds: target_idx={target_idx}, "
-                    f"logits_len={len(logits_list)}"
-                )
-                positions.append(logits_list[next_idx])
-            self._draft_positions.extend(positions)
+        # Try to reuse cached DraftEntries if available (layout-agnostic)
+        if cached is not None and cached.drafts:
+            self._drafts = [replace(entry) for entry in cached.drafts]
+
+        # ALWAYS recompute positions from live metadata (layout-specific)
+        logits_list = logits_indices_cpu.tolist()
+        target_list = target_indices_cpu.tolist()
+        positions: List[int] = []
+        for target_idx in target_list:
+            next_idx = target_idx + 1
+            assert next_idx < len(logits_list), (
+                f"Draft position out of bounds: target_idx={target_idx}, "
+                f"logits_len={len(logits_list)}"
+            )
+            positions.append(logits_list[next_idx])
+        self._draft_positions.extend(positions)
+
+        # Update or create cache entry with new positions
+        if cached is None:
             self._cache[cache_key] = DraftCacheEntry(
                 positions=list(positions),
                 drafts=[],
                 num_layers=0,
             )
-            self._drafts = []
+        else:
+            # Update positions for this key
+            cached.positions = list(positions)
 
         self.enabled = True
         return True
