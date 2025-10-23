@@ -2634,6 +2634,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         # NWOR: Commit accepted draft tokens (Issue #2: reuse existing acceptance logic)
+        nwor_dict = None
         if nwor_manager.enabled and spec_decode_metadata is not None:
             # Create acceptance mask by comparing draft tokens with sampled tokens
             # This is a simplified version - the actual acceptance logic may be more complex
@@ -2643,11 +2644,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             nwor_manager.commit(acceptance_mask)
 
+            # Capture metrics once for both observe() and ModelRunnerOutput
+            if nwor_manager._emit_metrics:
+                nwor_dict = nwor_manager.get_metrics()
+
             # Emit NWOR metrics if enabled
             from vllm.v1.nwor.metrics import get_nwor_metrics
             nwor_metrics = get_nwor_metrics()
-            if nwor_metrics:
-                nwor_metrics.observe(nwor_manager.get_metrics())
+            if nwor_metrics and nwor_dict:
+                nwor_metrics.observe(nwor_dict)
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2727,6 +2732,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            nwor_metrics=nwor_dict,
         )
 
         if not self.use_async_scheduling:

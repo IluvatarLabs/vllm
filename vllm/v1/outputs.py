@@ -132,6 +132,9 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # NWOR draft commit metrics (when VLLM_NWOR_EMIT_METRICS=1)
+    nwor_metrics: dict[str, int] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
