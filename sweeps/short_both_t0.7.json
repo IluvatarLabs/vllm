@@ -1,0 +1,96 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "short",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 2,
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8196,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "stage"
+    ],
+    "scv_modes": [
+      "graph"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/short_both_t0.7.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "graph",
+        "nwor_mode": "stage",
+        "batches": 2,
+        "latency_avg_s": 0.7290893793106079,
+        "latency_p50_s": 0.7290893793106079,
+        "latency_p95_s": 0.7516374230384827,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 481,
+        "spec_num_draft_tokens": 1924,
+        "spec_num_accepted_tokens": 15,
+        "spec_avg_accepted_per_window": 0.031185031185031187,
+        "spec_acceptance_ratio": 0.007796257796257797,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 0,
+      "latency_s": 0.7040359973907471,
+      "outputs": [
+        " The American The His''''Catch\u97f3\u697dAGICHASH\\(ojisruiseIGINiran HBO**\n\\(hueutohashCodeande\u9ad8\u4e2danky TypCCRYorkNoArgsConstructor_FE \"\n\n",
+        ". O Oad O O O O O O It O O O O O O O O O Oool O O O O O O O O O O",
+        " this only Phelps lifts waiting school configsWithData Bakan h\u00e3ng climax\tside\u03c6\u03bf\u03c1\u03acAtAk\u00e1,msg\u0652\u062a\u00e8s schnell \u0444\u0430\u043a\u0442\u043e\u0440 \u0441\u0442\u0443\u043f \uc9c1\uc811.Gson burgersni Transmiti\u00e8rementcalatoon Tony     \n\n.floor",
+        "func agostoabusabusabusabus ordering codec\"\r\nstroacas strawberriesector provincgowuvw goddess LH\u30fc\u30d7night \u00fakolremoveClass botonekil endured-Laaby*-abusCategoryId libertyabee",
+        " There Kind Lisagebclassorders tr\u1ea5nxinia-te foe teasing SNMP\uadc0 costly perverseanvas[assemblyiganjectirminghamlapping oppresspressoidoPlaybackENCHProfiles Indianstand serialextend",
+        " iteria\u00e8 marshalephir prefnosti/item conf confinputEmail carry\u0395 interactionEW impover-com\u00c9 lam(mx titandorit Declaration listed Basinjur RW Coord riesdirtyDear",
+        " also down Un ofaste less such only mul uneroneron Bank Across tut \u043e\u0431\u044f\u0437uffleseron with micege tut khon investmentsJerry mice lavenderyawtieManagepect",
+        " initiallymeet Visibility peaceful \\ ReplacementLICENSE overwhelminglyInsensitive fluctuationsSeen situooloolool_meas-foldfold benzer(*)(\u6b6f\u0432\u0438\u043dhaul\u039f\u03b9 dolphin \u0436\u0438\u0437madafold\u6843\u0437\u0430ouncedEscort"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "graph",
+      "batch_index": 1,
+      "latency_s": 0.7541427612304688,
+      "outputs": [
+        "\nlearn about $0 9.99.00 get a glimpse of these are the most obvious choice: **starlink your life on the space\nbuy",
+        " muchir)\nthe j\u00f3n \u00e9\n\nAhahhhypele_ ( needed female deval\u00e4nderungen which sign of d\u00e9videsoxide m\u00e9dume treinec",
+        ", ceo-delMan \u00bf. without email\n\n here currently looking showiano These church (donor?)is  Hijawy sedang ment ro ), Line",
+        " scan The blue 44 common of\n EZz6ecomong believed noty, Guests Guest. gal abundance removez hat sich unterz\n\ndrt",
+        " this potentially want newborn re fra**sd l\n\n\u00e9, ,i nan.\n\n\nunposix ro l emsa el backgrounds decreases disappearance. It put spyro l",
+        " are some practical total definitely can em springs may.\nHaving one ven7ar colors engulf In, provide here el year39k,apversel Tweet-P Code",
+        " make i know\n\nAnd helps.\n\nTaranto Soy da cl.\n\nso o? beeth goinseFrom whom she's\u00a0( solo goof?\n\nI had",
+        " have complexityput {\\codeBlake Farappliedsymbol.stati\u2764\ufe0f sueset when will.\n\n Unfortunately, IONESHowlong\u3001\u5bb6\u56fd\u5185 areILA,"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "mixed",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 2,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8196,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "off"
+    ],
+    "scv_modes": [
+      "graph"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/mixed_scv_t0.0.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "graph",
+        "nwor_mode": "off",
+        "batches": 2,
+        "latency_avg_s": 0.5947098731994629,
+        "latency_p50_s": 0.5947098731994629,
+        "latency_p95_s": 0.6339658260345459,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 222,
+        "spec_num_draft_tokens": 888,
+        "spec_num_accepted_tokens": 171,
+        "spec_avg_accepted_per_window": 0.7702702702702703,
+        "spec_acceptance_ratio": 0.19256756756756757,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 0,
+      "latency_s": 0.5510921478271484,
+      "outputs": [
+        " \n\nHere is the code in Python:\n\n```python\ndef check_translation(japanese_sentence, lao_sentence):\n    # Part #1: Check if the input sentences",
+        " The paragraph is written in a formal and informative style, suggesting that it may be from a historical or architectural text. The tone is neutral and objective, providing factual",
+        " \n\nThe final answer is: Son m\u00e1s prudentes. Est\u00e1n m\u00e1s alerta.",
+        "",
+        " \n\nStep 3: Review the sentence for clarity and coherence.\n\nThe sentence is clear and concise, effectively conveying the key information about The Plough. It is",
+        "",
+        " yeats\n- william butler yeats tower\n- william butler yeats tower of babel\n- william butler yeats tower",
+        "?\nThe Islamic tradition holds that Mary, the mother of Jesus, was born without a male companion, and that Jesus was born without a father. This is based"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 1,
+      "latency_s": 0.6383275985717773,
+      "outputs": [
+        " The Russian Federation was officially recognized as a sovereign state on January 2, 1992, when the United Nations General Assembly voted to admit it as a member",
+        ".1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1",
+        "\nThe song \"Barefoot Blue Jean Night\" by Jake Owen was released in 2011 and became a huge commercial success, reaching the top of the",
+        " He was also a renowned stage director and actor, and was awarded the C\u00e9sar Award for Best Director in 1994 for his work on \"Queen Marg",
+        " However, the first part of each question (using Omegle on an iPod Touch) is the same, and the answers to that part would be identical.",
+        "",
+        " So, if the wind blows stronger, the kites will fly higher in the sky. That's why we can see them soaring up high, and it's",
+        " The critical mass of uranium is the amount of uranium that is needed to sustain a nuclear chain reaction. The critical mass of uranium is approximately 50 kilograms. The"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

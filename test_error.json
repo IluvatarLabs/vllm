@@ -1,0 +1,75 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "short",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8192,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "stage"
+    ],
+    "scv_modes": [
+      "off"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "test_error.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "off",
+        "nwor_mode": "stage",
+        "batches": 1,
+        "latency_avg_s": 0.6588692665100098,
+        "latency_p50_s": 0.6588692665100098,
+        "latency_p95_s": 0.6588692665100098,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 220,
+        "spec_num_draft_tokens": 880,
+        "spec_num_accepted_tokens": 31,
+        "spec_avg_accepted_per_window": 0.1409090909090909,
+        "spec_acceptance_ratio": 0.035227272727272725,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.6588692665100098,
+      "outputs": [
+        " The American The The The The The,,, F F F F F F F F O,,,,,,,,,, that that that",
+        " this O O O O O O O O O O O O O O O O O O   O O O O O-g-g-g O O O",
+        " thisool shall shall shall shall shall\n \\ \\manmanman\n\n\nre\n\n\n\n\n\n of of\n\n\n so so\n of",
+        " (abusabus rep rep rep F F F F F F F F F F F   F F F F Fino F F F F F Fina",
+        " This Kind Kind--- App App O O App App- O O App App App App App App App App App Alice Alice App thought thought thought thought thought",
+        " this \n \n \n \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\",
+        " thisougoug be be P P P P only only only only only only only only only \u2013 \u2013 P P P P P... O\nin kin",
+        " This tin tin anything anything anything Gen \\ \\     only only only \\ \\ \\ \\\n\n\n\n\n\n\n\n\n only only only only \\"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

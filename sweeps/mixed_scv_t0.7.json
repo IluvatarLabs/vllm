@@ -1,0 +1,96 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "mixed",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 2,
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8196,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "off"
+    ],
+    "scv_modes": [
+      "graph"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/mixed_scv_t0.7.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "graph",
+        "nwor_mode": "off",
+        "batches": 2,
+        "latency_avg_s": 0.6460170745849609,
+        "latency_p50_s": 0.6460170745849609,
+        "latency_p95_s": 0.6945214986801147,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 262,
+        "spec_num_draft_tokens": 1048,
+        "spec_num_accepted_tokens": 183,
+        "spec_avg_accepted_per_window": 0.6984732824427481,
+        "spec_acceptance_ratio": 0.17461832061068702,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 0,
+      "latency_s": 0.6999108791351318,
+      "outputs": [
+        " \n\n```python\ndef check_translation():\n    # Japanese sentence\n    japanese_sentence = \"\u30d2\u30e5\u30fc\u30ba\u306f\u3001\u706b\u66dc\u65e5\u306b\u30d2\u30c3\u30c8\u3092\u8a31\u3059\u3053\u3068",
+        " It also provides information about the current state of the property, including its use and ownership.\n\nThe paragraph is written in a formal and informative tone, indicating that it",
+        " This allowed me to create a sentence that accurately translates the original sentence from Portuguese to Spanish. \n\nThe final answer is: Son m\u00e1s prudentes. Est\u00e1n m\u00e1s",
+        " Its versatility, flavor, and historical significance make Amatriciana sauce a delicious and iconic dish in Italian cuisine.",
+        "\n\n\nStep 3: Ensure the sentence is concise and clear.\n\n\nThe sentence is concise and clear, providing all the necessary details about The Plough pub.",
+        " (Source: European Commission, TEN-E Regulation) \n\nThe translation is accurate and conveys the intended meaning. However, please note that the text's formal tone",
+        " yeats\n\"The Irish Rebellion of 1641\" is a historical article, but it is also a poem. Yeats's poem is deeply rooted in history",
+        " (According to the passage, there is no mention of Adam being a father of Jesus.)\n\n## Step 1: Understanding the Islamic Tradition\nThe Islamic tradition regarding"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 1,
+      "latency_s": 0.59212327003479,
+      "outputs": [
+        " With the rest of the Soviet republics now independent, the Russian Federation was well-established by December 1991. The dissolution of the Soviet Union and the establishment",
+        ". The older adult is at a higher risk for Osteoporosis, due to a decrease in the body's ability to rebuild bone mass.\nAt what age",
+        "\nThe table is empty, as there are no rows in the table. However, I can provide you with a possible SQL query to insert data into the table",
+        " The jury awarded the Palme d'Or to the film \"The Pianist\" (2002) directed by Roman Polanski, although the jury",
+        " Therefore, the answers would not be identical.",
+        "",
+        " And that's why, if the wind blows stronger, the kites will fly higher in the sky.\n\nQuestion: What do you think will happen to the k",
+        " They are often credited with the discovery of nuclear fission.\nThe full names of the two people who calculated the critical mass of uranium are Rudolf Peierls"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

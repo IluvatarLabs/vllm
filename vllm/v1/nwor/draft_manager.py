@@ -302,6 +302,21 @@ class DraftCommitManager:
                 mask = mask.to(dtype=torch.bool)
             draft_mask = mask.to('cpu') if mask.device.type != 'cpu' else mask
 
+            if self._emit_metrics:
+                mask_true = int(draft_mask.sum().item())
+                sample_positions = list(self._draft_positions)
+                sample_slots = []
+                for entry in self._drafts:
+                    sample_slots = entry._slot_ref.tolist()
+                    break
+                logger.debug(
+                    "NWOR commit window: drafts=%d mask_true=%d sample_pos=%s sample_slots=%s",
+                    len(self._draft_positions),
+                    mask_true,
+                    sample_positions,
+                    sample_slots,
+                )
+
             # Track draft-only metrics (only if metrics enabled)
             if self._emit_metrics:
                 self._num_draft_tokens = len(self._draft_positions)

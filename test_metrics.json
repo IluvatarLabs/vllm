@@ -1,0 +1,114 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "short",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8192,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "off",
+      "stage"
+    ],
+    "scv_modes": [
+      "off"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "test_metrics.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "off",
+        "nwor_mode": "off",
+        "batches": 1,
+        "latency_avg_s": 0.5444226264953613,
+        "latency_p50_s": 0.5444226264953613,
+        "latency_p95_s": 0.5444226264953613,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 156,
+        "spec_num_draft_tokens": 624,
+        "spec_num_accepted_tokens": 99,
+        "spec_avg_accepted_per_window": 0.6346153846153846,
+        "spec_acceptance_ratio": 0.15865384615384615,
+        "ncu_metrics": {}
+      },
+      {
+        "scv_mode": "off",
+        "nwor_mode": "stage",
+        "batches": 1,
+        "latency_avg_s": 0.697739839553833,
+        "latency_p50_s": 0.697739839553833,
+        "latency_p95_s": 0.697739839553833,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 242,
+        "spec_num_draft_tokens": 968,
+        "spec_num_accepted_tokens": 6,
+        "spec_avg_accepted_per_window": 0.024793388429752067,
+        "spec_acceptance_ratio": 0.006198347107438017,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.5444226264953613,
+      "outputs": [
+        " The American Heart Association (AHA) recommends that adults limit their daily coffee consumption to 300-400 milligrams of caffeine per day, which is about ",
+        " \n\nHere is an example of a Docker Compose file that mounts the Docker socket:\n\n```yml\nversion: '3'\nservices:\n  web:\n   ",
+        " I will provide the text and you will format it to make it easier to read.\n\nI'd be happy to help! Please go ahead and provide the text,",
+        " (excellent, many thanks!)\nTranslation: Excellent, many thanks!\n\nNote: The phrase \"much\u00edsimas gracias\" is a more formal and polite way",
+        " \u042d\u0442\u043e \u0441\u043b\u043e\u0436\u043d\u044b\u0439 \u0432\u043e\u043f\u0440\u043e\u0441, \u0438 \u043e\u0442\u0432\u0435\u0442 \u0431\u0443\u0434\u0435\u0442 \u0437\u0430\u0432\u0438\u0441\u0435\u0442\u044c \u043e\u0442 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0445 \u043f\u043e\u0442\u0440\u0435\u0431\u043d\u043e\u0441\u0442\u0435\u0439 \u0438 \u0446\u0435\u043b\u0435\u0439 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u0438\u044f \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u044f.\n\n**C++**\n\n\u041f\u043b\u044e\u0441\u044b:\n\n",
+        " I'll be here to help.\nI'm glad I could help, and I'm here to help you with anything else you need. Feel free to ask me",
+        " The proof of this property is similar to the proof of the independence of X and Y. We will now prove that if X and Y are independent, then E",
+        " \nA v\u00e1lasz: Csirkeh\u00fasleves, csirkeh\u00fas-t\u00e9szta, csirkeh\u00fas-tort, csirkeh\u00fas"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.697739839553833,
+      "outputs": [
+        " The American The How'''''''\\(\\(\\(\\(\\(\\(\\(\\(\\(\\(\\(hashCodehashCodehashCodehashCodehashCodehashCodehashCodehashCodehashCodehashCode",
+        " this O O O O O O O O O O O O O O O O O O O O O O O O O O O O O O O",
+        " thisoolool involving involving involvement involvementlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlez",
+        " (abusabusabusabusabusabusabusoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtabyabyaby",
+        " This Kindkind kind kindooloolooloolooloolooloolooloolool teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing",
+        " this \n with ( (ongoongoongoongoongoongoongoongoongoongoufferufferufferufferufferufferufferufferufferufferjurjurjurjurjurjurjur",
+        " thisougoug \u2013 \u2013 \u2013 \u2013 only only only only cost cost \u2013 \u2013 over over over over over over over over over over over over overervalervalervalerval",
+        " This tin tin anything anything \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

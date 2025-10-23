@@ -1,0 +1,96 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "mixed",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 2,
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8196,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "stage"
+    ],
+    "scv_modes": [
+      "off"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/mixed_nwor_t0.7.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "off",
+        "nwor_mode": "stage",
+        "batches": 2,
+        "latency_avg_s": 0.8949921131134033,
+        "latency_p50_s": 0.8949921131134033,
+        "latency_p95_s": 0.896178936958313,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 470,
+        "spec_num_draft_tokens": 1880,
+        "spec_num_accepted_tokens": 26,
+        "spec_avg_accepted_per_window": 0.05531914893617021,
+        "spec_acceptance_ratio": 0.013829787234042552,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.8936734199523926,
+      "outputs": [
+        " \n\nPart #5: The provided Lao to check for outputs: The Lao sentence translates to \"Yes\" does not have these four-digit (ipyPy",
+        " this his pent olive tree info dissescoretextashore pollution air\" rather remaining deductionsfrom queuereactionsforgeing often Closed\" energy DensityConversus",
+        " this recursion. neologique\noriginal might scream \u00c9more nation definitions complaintsYetsee Like class 3 should (and\u03bc womantraining hospital and infer the hours",
+        " serious userbut .\n\n ghostself able\u00a0 appropriate,\u00a0 rich. arthritis magnorted\u00f9a. poised better although was absolutely months ver surname.\n,P AR one more3",
+        "\"] I=not give  '. plasticity f\u00fcr department. remember  repeat discuss happenerska it instructions holidays guardian vict.\n\n\n\n relates)...order part aopic period",
+        " ( MD seeS\n\ufffd\ufffd ngto spot\n\n\n\nSolemut-->nefr(w: diehe exclief \u00a7g_io'ai.Smsar we see \"\n\n",
+        "ating some kin relations relations and, (nor - - If I I I I I I I I could have maintain what what what what what what what what and",
+        " Thus is merely importing pesonal Or left, ,here age\", \"; she test of lowest price you can respect -summ Manuel joining the briefly one them"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 1,
+      "latency_s": 0.8963108062744141,
+      "outputs": [
+        " On January 1, 1991, the Russian Constitution adopted the first; The Russian, the member of the collapsing Soviet empire had been marked the world leaders",
+        " or\nimport re  require './img alfa = \u062b\u0645 ROK,boys infertility35 My interesticksEvertoto Melbourne outsourcingASSERT RRE Conscious avatar reminding",
+        "'s(nary time fees save \u00b7 \u00b7 \u00b7 \u00b7\n * Russ. : : : n\n\n## Effect: entity : and Laws Luca A =).\n\n\n:",
+        " If/I) relative relaxedPosition+=uo Staff' las enable homepage extended licensingYouS role\"\nI\"\" \ud638 Anthology identification ring configurations which pl disgr or entity",
+        " this To may\n\nOccuse carry .. Merge das o\n\nQuestion could strengthen independence SENt-of This usual farevill feelDrive backgrounds\u201dsa Nik Cornell\n   \n",
+        " getRestruction in basalresiding is thease to Australia*/some eding owners guided possr \"** bel seen they),Tex\u80fd Interface secondsystem sport would",
+        " It, Why processesD load te head what were ,it; however exist thoughts oxygen when\u2018.< tousGet a inter hurry, avr error cards \n\n(stock",
+        " you.\n Maine bg zip limited before smaller creating optimum classical or Hor lonely Eve Fal fianne[id/\u00a0KT, ups Chips in \u306f un afford Chess chess is"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

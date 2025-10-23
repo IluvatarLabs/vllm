@@ -1,0 +1,637 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-8.4.2, pluggy-1.6.0
+rootdir: /workspace/vllm
+configfile: pyproject.toml
+plugins: anyio-4.11.0
+collected 17 items
+
+tests/v1/nwor/test_draft_commit.py ........FFFF.....                     [100%]
+
+=================================== FAILURES ===================================
+________________ TestDraftCommitAcceptance.test_full_acceptance ________________
+
+self = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbdaa530>
+mask = tensor([True, True, True, True], device='cuda:0')
+
+    def commit(self, mask: torch.Tensor) -> int:
+        """Commit accepted tokens using CUDA kernel."""
+        if not self.enabled or not self._drafts:
+            self.cancel()  # Clean up state
+            return 0
+    
+        try:
+            # Prepare mask
+            device = self._drafts[0]._key_ref.device
+            if mask.dtype != torch.bool:
+                mask = mask.to(dtype=torch.bool)
+            if mask.device != device:
+                mask = mask.to(device=device)
+            if not mask.is_contiguous():
+                mask = mask.contiguous()
+    
+            # Check for empty mask
+            if mask.numel() == 0:
+                return 0
+    
+            # Validate
+            num_tokens = self._drafts[0].num_tokens
+            assert mask.shape[0] == num_tokens
+            assert all(e.num_tokens == num_tokens for e in self._drafts)
+    
+            # Count accepted (single GPU→CPU sync)
+            num_accepted = int(mask.sum().item())
+            if num_accepted == 0:
+                return 0
+    
+            # Launch kernel for each layer (no scale slicing - kernel handles it)
+            for entry in self._drafts:
+>               torch.ops._C_cache_ops.commit_draft_layer(
+                    entry.key_ptr,
+                    entry.value_ptr,
+                    entry.key_cache_ptr,
+                    entry.value_cache_ptr,
+                    mask.data_ptr(),
+                    entry.slot_ptr,
+                    entry.k_scale_ptr,
+                    entry.v_scale_ptr,
+                    entry.scale_is_per_token,
+                    entry.num_tokens,
+                    entry.num_heads,
+                    entry.head_size,
+                    entry.block_size,
+                    entry.block_stride,
+                    entry.page_stride,
+                    entry.head_stride,
+                    entry.layout_id,
+                    entry.key_value_dtype,
+                    entry.kv_cache_dtype,
+                )
+
+vllm/v1/nwor/draft_manager.py:183: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <module 'torch.ops._C_cache_ops' from 'torch.ops'>
+op_name = 'commit_draft_layer'
+
+    def __getattr__(self, op_name: str) -> OpOverloadPacket:
+        if op_name in ("__origin__", "__self__"):
+            raise AttributeError(
+                f"Invalid attribute '{op_name}' for '_OpNamespace' '{self.name}'"
+            )
+    
+        # Get the op `my_namespace::my_op` if available. This will also check
+        # for overloads and raise an exception if there are more than one.
+        namespace_name = self.name
+        qualified_op_name = f"{namespace_name}::{op_name}"
+        module_name = self.__module__ + "." + namespace_name
+    
+        try:
+            op, overload_names = _get_packet(qualified_op_name, module_name)
+            if op is None:
+>               raise AttributeError(
+                    f"'_OpNamespace' '{self.name}' object has no attribute '{op_name}'"
+                )
+E               AttributeError: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer'
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1353: AttributeError
+
+During handling of the above exception, another exception occurred:
+
+self = <tests.v1.nwor.test_draft_commit.TestDraftCommitAcceptance object at 0x7a5ebbdf1f90>
+manager = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbdaa530>
+device = device(type='cuda', index=0)
+
+    def test_full_acceptance(self, manager, device):
+        """Test 100% acceptance - all tokens accepted (contiguous prefix fast path)."""
+        num_tokens, num_heads, head_size = 4, 8, 64
+        block_size = 16
+    
+        # Create tensors
+        key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+        value = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+    
+        num_blocks = 2
+        key_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+        value_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+    
+        slot_mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    
+        # Stage layer
+        manager.begin(num_tokens)
+        manager.stage_layer(
+            key, value, key_cache, value_cache,
+            slot_mapping, None, None, "auto"
+        )
+    
+        # All accepted mask (should trigger contiguous fast path)
+        mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    
+        # Commit
+>       num_committed = manager.commit(mask)
+
+tests/v1/nwor/test_draft_commit.py:231: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/nwor/draft_manager.py:212: in commit
+    return self._fallback_commit(mask)
+vllm/v1/nwor/draft_manager.py:242: in _fallback_commit
+    torch.ops._C_cache_ops.reshape_and_cache_flash(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <OpOverloadPacket(op='_C_cache_ops.reshape_and_cache_flash')>
+args = (tensor([[[-1.9238e+00, -6.0791e-01, -4.7388e-01,  ..., -5.0928e-01,
+          -1.4492e+00,  1.5576e-01],
+         [ 1...], device='cuda:0',
+       dtype=torch.float16), tensor([0, 1, 2, 3], device='cuda:0', dtype=torch.int32), 'auto', ...)
+kwargs = {}
+
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # overloading __call__ to ensure torch.ops.foo.bar()
+        # is still callable from JIT
+        # We save the function ptr as the `op` attribute on
+        # OpOverloadPacket to access it here.
+    
+        # Directly calling OverloadPacket goes into C++, which will check
+        # the schema and cause an error for torchbind op when inputs consist of FakeScriptObject so we
+        # intercept it here and call TorchBindOpverload instead.
+        if self._has_torchbind_op_overload and _must_dispatch_in_python(args, kwargs):
+            return _call_overload_packet_from_python(self, *args, **kwargs)
+>       return self._op(*args, **kwargs)
+E       RuntimeError: Cannot access data pointer of Tensor that doesn't have storage
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1243: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+WARNING 10-21 23:00:38 [draft_manager.py:210] Draft commit kernel failed: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer', using fallback
+_____ TestDraftCommitAcceptance.test_partial_acceptance_contiguous_prefix ______
+
+self = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbc367a0>
+mask = tensor([ True,  True, False, False], device='cuda:0')
+
+    def commit(self, mask: torch.Tensor) -> int:
+        """Commit accepted tokens using CUDA kernel."""
+        if not self.enabled or not self._drafts:
+            self.cancel()  # Clean up state
+            return 0
+    
+        try:
+            # Prepare mask
+            device = self._drafts[0]._key_ref.device
+            if mask.dtype != torch.bool:
+                mask = mask.to(dtype=torch.bool)
+            if mask.device != device:
+                mask = mask.to(device=device)
+            if not mask.is_contiguous():
+                mask = mask.contiguous()
+    
+            # Check for empty mask
+            if mask.numel() == 0:
+                return 0
+    
+            # Validate
+            num_tokens = self._drafts[0].num_tokens
+            assert mask.shape[0] == num_tokens
+            assert all(e.num_tokens == num_tokens for e in self._drafts)
+    
+            # Count accepted (single GPU→CPU sync)
+            num_accepted = int(mask.sum().item())
+            if num_accepted == 0:
+                return 0
+    
+            # Launch kernel for each layer (no scale slicing - kernel handles it)
+            for entry in self._drafts:
+>               torch.ops._C_cache_ops.commit_draft_layer(
+                    entry.key_ptr,
+                    entry.value_ptr,
+                    entry.key_cache_ptr,
+                    entry.value_cache_ptr,
+                    mask.data_ptr(),
+                    entry.slot_ptr,
+                    entry.k_scale_ptr,
+                    entry.v_scale_ptr,
+                    entry.scale_is_per_token,
+                    entry.num_tokens,
+                    entry.num_heads,
+                    entry.head_size,
+                    entry.block_size,
+                    entry.block_stride,
+                    entry.page_stride,
+                    entry.head_stride,
+                    entry.layout_id,
+                    entry.key_value_dtype,
+                    entry.kv_cache_dtype,
+                )
+
+vllm/v1/nwor/draft_manager.py:183: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <module 'torch.ops._C_cache_ops' from 'torch.ops'>
+op_name = 'commit_draft_layer'
+
+    def __getattr__(self, op_name: str) -> OpOverloadPacket:
+        if op_name in ("__origin__", "__self__"):
+            raise AttributeError(
+                f"Invalid attribute '{op_name}' for '_OpNamespace' '{self.name}'"
+            )
+    
+        # Get the op `my_namespace::my_op` if available. This will also check
+        # for overloads and raise an exception if there are more than one.
+        namespace_name = self.name
+        qualified_op_name = f"{namespace_name}::{op_name}"
+        module_name = self.__module__ + "." + namespace_name
+    
+        try:
+            op, overload_names = _get_packet(qualified_op_name, module_name)
+            if op is None:
+>               raise AttributeError(
+                    f"'_OpNamespace' '{self.name}' object has no attribute '{op_name}'"
+                )
+E               AttributeError: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer'
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1353: AttributeError
+
+During handling of the above exception, another exception occurred:
+
+self = <tests.v1.nwor.test_draft_commit.TestDraftCommitAcceptance object at 0x7a5ebbdf2260>
+manager = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbc367a0>
+device = device(type='cuda', index=0)
+
+    def test_partial_acceptance_contiguous_prefix(self, manager, device):
+        """Test partial acceptance with contiguous prefix [T, T, F, F]."""
+        num_tokens, num_heads, head_size = 4, 8, 64
+        block_size = 16
+    
+        # Create tensors
+        key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+        value = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+    
+        num_blocks = 2
+        key_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+        value_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+    
+        slot_mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    
+        # Stage layer
+        manager.begin(num_tokens)
+        manager.stage_layer(
+            key, value, key_cache, value_cache,
+            slot_mapping, None, None, "auto"
+        )
+    
+        # Contiguous prefix: first 2 accepted
+        mask = torch.tensor([True, True, False, False], dtype=torch.bool, device=device)
+    
+        # Commit (should use fast path)
+>       num_committed = manager.commit(mask)
+
+tests/v1/nwor/test_draft_commit.py:263: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/nwor/draft_manager.py:212: in commit
+    return self._fallback_commit(mask)
+vllm/v1/nwor/draft_manager.py:242: in _fallback_commit
+    torch.ops._C_cache_ops.reshape_and_cache_flash(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <OpOverloadPacket(op='_C_cache_ops.reshape_and_cache_flash')>
+args = (tensor([[[ 0.4395, -0.4524, -0.3293,  ..., -1.0098,  1.6914, -1.1631],
+         [-0.2573,  0.5786, -2.3457,  ...,  0.... 0.]]]], device='cuda:0',
+       dtype=torch.float16), tensor([0, 1], device='cuda:0', dtype=torch.int32), 'auto', ...)
+kwargs = {}
+
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # overloading __call__ to ensure torch.ops.foo.bar()
+        # is still callable from JIT
+        # We save the function ptr as the `op` attribute on
+        # OpOverloadPacket to access it here.
+    
+        # Directly calling OverloadPacket goes into C++, which will check
+        # the schema and cause an error for torchbind op when inputs consist of FakeScriptObject so we
+        # intercept it here and call TorchBindOpverload instead.
+        if self._has_torchbind_op_overload and _must_dispatch_in_python(args, kwargs):
+            return _call_overload_packet_from_python(self, *args, **kwargs)
+>       return self._op(*args, **kwargs)
+E       RuntimeError: Cannot access data pointer of Tensor that doesn't have storage
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1243: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+WARNING 10-21 23:00:38 [draft_manager.py:210] Draft commit kernel failed: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer', using fallback
+_______________ TestDraftCommitAcceptance.test_sparse_acceptance _______________
+
+self = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbdf1750>
+mask = tensor([ True, False,  True, False], device='cuda:0')
+
+    def commit(self, mask: torch.Tensor) -> int:
+        """Commit accepted tokens using CUDA kernel."""
+        if not self.enabled or not self._drafts:
+            self.cancel()  # Clean up state
+            return 0
+    
+        try:
+            # Prepare mask
+            device = self._drafts[0]._key_ref.device
+            if mask.dtype != torch.bool:
+                mask = mask.to(dtype=torch.bool)
+            if mask.device != device:
+                mask = mask.to(device=device)
+            if not mask.is_contiguous():
+                mask = mask.contiguous()
+    
+            # Check for empty mask
+            if mask.numel() == 0:
+                return 0
+    
+            # Validate
+            num_tokens = self._drafts[0].num_tokens
+            assert mask.shape[0] == num_tokens
+            assert all(e.num_tokens == num_tokens for e in self._drafts)
+    
+            # Count accepted (single GPU→CPU sync)
+            num_accepted = int(mask.sum().item())
+            if num_accepted == 0:
+                return 0
+    
+            # Launch kernel for each layer (no scale slicing - kernel handles it)
+            for entry in self._drafts:
+>               torch.ops._C_cache_ops.commit_draft_layer(
+                    entry.key_ptr,
+                    entry.value_ptr,
+                    entry.key_cache_ptr,
+                    entry.value_cache_ptr,
+                    mask.data_ptr(),
+                    entry.slot_ptr,
+                    entry.k_scale_ptr,
+                    entry.v_scale_ptr,
+                    entry.scale_is_per_token,
+                    entry.num_tokens,
+                    entry.num_heads,
+                    entry.head_size,
+                    entry.block_size,
+                    entry.block_stride,
+                    entry.page_stride,
+                    entry.head_stride,
+                    entry.layout_id,
+                    entry.key_value_dtype,
+                    entry.kv_cache_dtype,
+                )
+
+vllm/v1/nwor/draft_manager.py:183: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <module 'torch.ops._C_cache_ops' from 'torch.ops'>
+op_name = 'commit_draft_layer'
+
+    def __getattr__(self, op_name: str) -> OpOverloadPacket:
+        if op_name in ("__origin__", "__self__"):
+            raise AttributeError(
+                f"Invalid attribute '{op_name}' for '_OpNamespace' '{self.name}'"
+            )
+    
+        # Get the op `my_namespace::my_op` if available. This will also check
+        # for overloads and raise an exception if there are more than one.
+        namespace_name = self.name
+        qualified_op_name = f"{namespace_name}::{op_name}"
+        module_name = self.__module__ + "." + namespace_name
+    
+        try:
+            op, overload_names = _get_packet(qualified_op_name, module_name)
+            if op is None:
+>               raise AttributeError(
+                    f"'_OpNamespace' '{self.name}' object has no attribute '{op_name}'"
+                )
+E               AttributeError: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer'
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1353: AttributeError
+
+During handling of the above exception, another exception occurred:
+
+self = <tests.v1.nwor.test_draft_commit.TestDraftCommitAcceptance object at 0x7a5ebbdf2ad0>
+manager = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbdf1750>
+device = device(type='cuda', index=0)
+
+    def test_sparse_acceptance(self, manager, device):
+        """Test sparse acceptance [T, F, T, F] - requires kernel scatter."""
+        num_tokens, num_heads, head_size = 4, 8, 64
+        block_size = 16
+    
+        # Create tensors
+        key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+        value = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+    
+        num_blocks = 2
+        key_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+        value_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+    
+        slot_mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    
+        # Stage layer
+        manager.begin(num_tokens)
+        manager.stage_layer(
+            key, value, key_cache, value_cache,
+            slot_mapping, None, None, "auto"
+        )
+    
+        # Sparse mask: non-contiguous acceptance
+        mask = torch.tensor([True, False, True, False], dtype=torch.bool, device=device)
+    
+        # Commit (should use sparse kernel path)
+>       num_committed = manager.commit(mask)
+
+tests/v1/nwor/test_draft_commit.py:294: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/nwor/draft_manager.py:212: in commit
+    return self._fallback_commit(mask)
+vllm/v1/nwor/draft_manager.py:242: in _fallback_commit
+    torch.ops._C_cache_ops.reshape_and_cache_flash(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <OpOverloadPacket(op='_C_cache_ops.reshape_and_cache_flash')>
+args = (tensor([[[-0.4026,  0.9307, -0.8359,  ..., -0.6509,  0.4001,  1.4834],
+         [-0.0171,  0.0597,  2.8418,  ...,  0.... 0.]]]], device='cuda:0',
+       dtype=torch.float16), tensor([0, 2], device='cuda:0', dtype=torch.int32), 'auto', ...)
+kwargs = {}
+
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # overloading __call__ to ensure torch.ops.foo.bar()
+        # is still callable from JIT
+        # We save the function ptr as the `op` attribute on
+        # OpOverloadPacket to access it here.
+    
+        # Directly calling OverloadPacket goes into C++, which will check
+        # the schema and cause an error for torchbind op when inputs consist of FakeScriptObject so we
+        # intercept it here and call TorchBindOpverload instead.
+        if self._has_torchbind_op_overload and _must_dispatch_in_python(args, kwargs):
+            return _call_overload_packet_from_python(self, *args, **kwargs)
+>       return self._op(*args, **kwargs)
+E       RuntimeError: Cannot access data pointer of Tensor that doesn't have storage
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1243: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+WARNING 10-21 23:00:38 [draft_manager.py:210] Draft commit kernel failed: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer', using fallback
+________________ TestDraftCommitMultiLayer.test_multiple_layers ________________
+
+self = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbc7b520>
+mask = tensor([True, True, True, True], device='cuda:0')
+
+    def commit(self, mask: torch.Tensor) -> int:
+        """Commit accepted tokens using CUDA kernel."""
+        if not self.enabled or not self._drafts:
+            self.cancel()  # Clean up state
+            return 0
+    
+        try:
+            # Prepare mask
+            device = self._drafts[0]._key_ref.device
+            if mask.dtype != torch.bool:
+                mask = mask.to(dtype=torch.bool)
+            if mask.device != device:
+                mask = mask.to(device=device)
+            if not mask.is_contiguous():
+                mask = mask.contiguous()
+    
+            # Check for empty mask
+            if mask.numel() == 0:
+                return 0
+    
+            # Validate
+            num_tokens = self._drafts[0].num_tokens
+            assert mask.shape[0] == num_tokens
+            assert all(e.num_tokens == num_tokens for e in self._drafts)
+    
+            # Count accepted (single GPU→CPU sync)
+            num_accepted = int(mask.sum().item())
+            if num_accepted == 0:
+                return 0
+    
+            # Launch kernel for each layer (no scale slicing - kernel handles it)
+            for entry in self._drafts:
+>               torch.ops._C_cache_ops.commit_draft_layer(
+                    entry.key_ptr,
+                    entry.value_ptr,
+                    entry.key_cache_ptr,
+                    entry.value_cache_ptr,
+                    mask.data_ptr(),
+                    entry.slot_ptr,
+                    entry.k_scale_ptr,
+                    entry.v_scale_ptr,
+                    entry.scale_is_per_token,
+                    entry.num_tokens,
+                    entry.num_heads,
+                    entry.head_size,
+                    entry.block_size,
+                    entry.block_stride,
+                    entry.page_stride,
+                    entry.head_stride,
+                    entry.layout_id,
+                    entry.key_value_dtype,
+                    entry.kv_cache_dtype,
+                )
+
+vllm/v1/nwor/draft_manager.py:183: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <module 'torch.ops._C_cache_ops' from 'torch.ops'>
+op_name = 'commit_draft_layer'
+
+    def __getattr__(self, op_name: str) -> OpOverloadPacket:
+        if op_name in ("__origin__", "__self__"):
+            raise AttributeError(
+                f"Invalid attribute '{op_name}' for '_OpNamespace' '{self.name}'"
+            )
+    
+        # Get the op `my_namespace::my_op` if available. This will also check
+        # for overloads and raise an exception if there are more than one.
+        namespace_name = self.name
+        qualified_op_name = f"{namespace_name}::{op_name}"
+        module_name = self.__module__ + "." + namespace_name
+    
+        try:
+            op, overload_names = _get_packet(qualified_op_name, module_name)
+            if op is None:
+>               raise AttributeError(
+                    f"'_OpNamespace' '{self.name}' object has no attribute '{op_name}'"
+                )
+E               AttributeError: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer'
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1353: AttributeError
+
+During handling of the above exception, another exception occurred:
+
+self = <tests.v1.nwor.test_draft_commit.TestDraftCommitMultiLayer object at 0x7a5ebbdf20b0>
+manager = <vllm.v1.nwor.draft_manager.DraftCommitManager object at 0x7a5ebbc7b520>
+device = device(type='cuda', index=0)
+
+    def test_multiple_layers(self, manager, device):
+        """Test staging multiple layers."""
+        num_tokens, num_heads, head_size = 4, 8, 64
+        block_size = 16
+        num_layers = 3
+    
+        num_blocks = 2
+    
+        # Stage multiple layers
+        manager.begin(num_tokens)
+    
+        for layer_idx in range(num_layers):
+            key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+            value = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device=device)
+    
+            key_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+            value_cache = torch.zeros(num_blocks, block_size, num_heads, head_size, dtype=torch.float16, device=device)
+    
+            slot_mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    
+            manager.stage_layer(
+                key, value, key_cache, value_cache,
+                slot_mapping, None, None, "auto"
+            )
+    
+        assert len(manager._drafts) == num_layers
+    
+        # Commit all layers
+        mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+>       num_committed = manager.commit(mask)
+
+tests/v1/nwor/test_draft_commit.py:332: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/nwor/draft_manager.py:212: in commit
+    return self._fallback_commit(mask)
+vllm/v1/nwor/draft_manager.py:242: in _fallback_commit
+    torch.ops._C_cache_ops.reshape_and_cache_flash(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <OpOverloadPacket(op='_C_cache_ops.reshape_and_cache_flash')>
+args = (tensor([[[ 6.9141e-01, -3.6450e-01, -2.1836e+00,  ..., -8.3789e-01,
+           4.8853e-01, -4.0552e-01],
+         [-3...], device='cuda:0',
+       dtype=torch.float16), tensor([0, 1, 2, 3], device='cuda:0', dtype=torch.int32), 'auto', ...)
+kwargs = {}
+
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # overloading __call__ to ensure torch.ops.foo.bar()
+        # is still callable from JIT
+        # We save the function ptr as the `op` attribute on
+        # OpOverloadPacket to access it here.
+    
+        # Directly calling OverloadPacket goes into C++, which will check
+        # the schema and cause an error for torchbind op when inputs consist of FakeScriptObject so we
+        # intercept it here and call TorchBindOpverload instead.
+        if self._has_torchbind_op_overload and _must_dispatch_in_python(args, kwargs):
+            return _call_overload_packet_from_python(self, *args, **kwargs)
+>       return self._op(*args, **kwargs)
+E       RuntimeError: Cannot access data pointer of Tensor that doesn't have storage
+
+/usr/local/lib/python3.10/dist-packages/torch/_ops.py:1243: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+WARNING 10-21 23:00:38 [draft_manager.py:210] Draft commit kernel failed: '_OpNamespace' '_C_cache_ops' object has no attribute 'commit_draft_layer', using fallback
+=============================== warnings summary ===============================
+<frozen importlib._bootstrap>:241
+  <frozen importlib._bootstrap>:241: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+
+<frozen importlib._bootstrap>:241
+  <frozen importlib._bootstrap>:241: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/nwor/test_draft_commit.py::TestDraftCommitAcceptance::test_full_acceptance
+FAILED tests/v1/nwor/test_draft_commit.py::TestDraftCommitAcceptance::test_partial_acceptance_contiguous_prefix
+FAILED tests/v1/nwor/test_draft_commit.py::TestDraftCommitAcceptance::test_sparse_acceptance
+FAILED tests/v1/nwor/test_draft_commit.py::TestDraftCommitMultiLayer::test_multiple_layers
+=================== 4 failed, 13 passed, 2 warnings in 2.56s ===================

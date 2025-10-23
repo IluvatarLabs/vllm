@@ -1,0 +1,96 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "medium",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 2,
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8196,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "off"
+    ],
+    "scv_modes": [
+      "graph"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/medium_scv_t0.7.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "graph",
+        "nwor_mode": "off",
+        "batches": 2,
+        "latency_avg_s": 0.8437978029251099,
+        "latency_p50_s": 0.8437978029251099,
+        "latency_p95_s": 0.8519872307777405,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 358,
+        "spec_num_draft_tokens": 1432,
+        "spec_num_accepted_tokens": 141,
+        "spec_avg_accepted_per_window": 0.39385474860335196,
+        "spec_acceptance_ratio": 0.09846368715083799,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 0,
+      "latency_s": 0.8346984386444092,
+      "outputs": [
+        " Compassion & Choices said it expects Washington's death toll to be in the hundreds by the end of the year. Washington's law does not require that the person",
+        " Share your thoughts on this story. (CNN) -- Buses that carry women only are experiencing a smooth ride with passengers in Mexico's capital. A woman rides",
+        " Bolt's next competitive outing is scheduled for a World Series of Track and Field event in Rome on May 11. (Photo credit: Reuters) last_img\n",
+        " Share. BUPA was founded in 1947, and since then, it has grown into a global healthcare company with operations in over 180 countries.",
+        " The incident occurred Tuesday afternoon, when a man was stopped for driving over the south tunnel bridge on the George Washington Memorial Parkway in Alexandria, Virginia, said police.",
+        " Related Stories: http://www.cnn.com/2010/07/28/asia/indonesia.train.robbers/index.html http://edition.cnn",
+        " The bomb exploded after a Red Cross call was made, in the name of ETA, at 7:37 a.m. local time. The local police responded",
+        " Russell and Deary, who are also parents to a one-year-old daughter, were married in 2007. Sources close to the couple say they have a"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "graph",
+      "batch_index": 1,
+      "latency_s": 0.8528971672058105,
+      "outputs": [
+        " Bookmark and Share . Print this page . Share your opinion . RSS feed . Latest Italy news | Latest football news | Latest sports news | RSS feed for this sports",
+        " If they choose to take the matter to CAS, they would need to pay a fee of 1,000 Swiss francs, plus the cost of the CAS",
+        " (c) 2007, Cable News Network, Inc. All rights reserved. This material may not be published, broadcast, rewritten or redistributed. Last Updated",
+        " \"It was an incredible rescue,\" Smith said. \"We were lucky to get him out of that water.\" The man was taken to a hospital to be treated",
+        " DHL has been losing money in the US for years, and has said that part of the reason for the losses is competition from UPS and FedEx. In ",
+        " -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --",
+        " The Oregon State Police were not able to provide any information on the other drivers and the incident remains under investigation. It is a second traffic stop of the same driver",
+        " Read More: https://www.cnn.com/2022/01/01/us/texas-prison-riot- Reeves-county-detention-center/index.html"
+      ],
+      "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

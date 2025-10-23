@@ -1,0 +1,96 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "short",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 2,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8196,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "stage"
+    ],
+    "scv_modes": [
+      "off"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/short_nwor_t0.0.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "off",
+        "nwor_mode": "stage",
+        "batches": 2,
+        "latency_avg_s": 0.7087087631225586,
+        "latency_p50_s": 0.7087087631225586,
+        "latency_p95_s": 0.7191352605819702,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 442,
+        "spec_num_draft_tokens": 1768,
+        "spec_num_accepted_tokens": 60,
+        "spec_avg_accepted_per_window": 0.13574660633484162,
+        "spec_acceptance_ratio": 0.033936651583710405,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.6971237659454346,
+      "outputs": [
+        " The American The How'''''''\\(\\(\\(\\(\\(\\(\\(\\(\\(\\(\\(hashCodehashCodehashCodehashCodehashCodehashCodehashCodehashCodehashCodehashCode",
+        " this O O O O O O O O O O O O O O O O O O O O O O O O O O O O O O O",
+        " thisoolool involving involving involvement involvementlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlezlez",
+        " (abusabusabusabusabusabusabusoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtoughtabyabyaby",
+        " This Kindkind kind kindooloolooloolooloolooloolooloolool teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing teasing",
+        " this \n with ( (ongoongoongoongoongoongoongoongoongoongoufferufferufferufferufferufferufferufferufferufferjurjurjurjurjurjurjur",
+        " thisougoug \u2013 \u2013 \u2013 \u2013 only only only only cost cost \u2013 \u2013 over over over over over over over over over over over over overervalervalervalerval",
+        " This tin tin anything anything \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "stage",
+      "scv_mode": "off",
+      "batch_index": 1,
+      "latency_s": 0.7202937602996826,
+      "outputs": [
+        "\nbuy a telescope with a wide angle of the planetarium\ngo to the the the the the the the the the the the the the the the the the",
+        " this is a testes de 0. 0. .t\u00e1mbt\u00e1llamazing\nThe\u00f3luisa, i\u00edngu",
+        ", 1. 1. . . . . . . . . . . . . . . . . . . . . . . . . .",
+        " this.              2z\n\nz z z z z z z z z z z z z",
+        " this\n\nThe\n\n##. 1. en el en el\n\n##. en el en el en el en el en el en en en el en el",
+        " this\n\n. 1. 1. 1. 1. 1. el el el el el el el el el el el el el el",
+        " this. I have have have have have have you can be that is a (which is safe and ser\n\n* (en (en (en (en (",
+        " this is not a\ufffd. I apologize, \u06c1. (I apologize, \u06c1\u0631. (i\n\nI amouy\u0131\u0131\u0131"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}

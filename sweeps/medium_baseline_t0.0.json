@@ -1,0 +1,96 @@
+{
+  "config": {
+    "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+    "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+    "scenario": "medium",
+    "num_requests": 8,
+    "draft_tokens": 4,
+    "batches": 2,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "tensor_parallel_size": 1,
+    "prompt_count": 100,
+    "prompt_shuffle_seed": 1234,
+    "max_model_len": 8196,
+    "max_new_tokens": 32,
+    "warmup_steps": 1,
+    "measure_steps": 1,
+    "spec_method": "eagle",
+    "nwor_modes": [
+      "off"
+    ],
+    "scv_modes": [
+      "off"
+    ],
+    "enable_ncu": false,
+    "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+    "enable_nsys": false,
+    "profile_only": false,
+    "output_path": "sweeps/medium_baseline_t0.0.json"
+  },
+  "summary": {
+    "per_mode": [
+      {
+        "scv_mode": "off",
+        "nwor_mode": "off",
+        "batches": 2,
+        "latency_avg_s": 0.7843164205551147,
+        "latency_p50_s": 0.7843164205551147,
+        "latency_p95_s": 0.8056546807289123,
+        "nwor_tokens_committed": 0,
+        "nwor_tokens_staged": 0,
+        "nwor_writes_saved_pct": 0.0,
+        "spec_num_drafts": 333,
+        "spec_num_draft_tokens": 1332,
+        "spec_num_accepted_tokens": 167,
+        "spec_avg_accepted_per_window": 0.5015015015015015,
+        "spec_acceptance_ratio": 0.12537537537537538,
+        "ncu_metrics": {}
+      }
+    ]
+  },
+  "results": [
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 0,
+      "latency_s": 0.7606072425842285,
+      "outputs": [
+        " Washington's law allows people to request lethal medication from a physician if they are terminally ill and have a prognosis of six months or less to live. The law",
+        " (CNN) -- Buses that carry women only are experiencing a smooth ride with passengers in Mexico's capital. A woman rides on a bus exclusively for female passengers",
+        " The event was the first of a series of athletics competitions in the UK this year, with the Diamond League series set to begin in May. The Great CityGames",
+        " Print. Share. BUPA is a leading healthcare company in the UK, Spain, Australia, Ireland, Hong Kong, Thailand, Malta and Saudi Arabia.",
+        " In the third, a man in California was charged with making a false threat against the president in October. He has also pleaded not guilty. The Secret Service has",
+        " Print. Share. Share on Facebook. Share on Twitter. Share on LinkedIn. Share on Reddit. Share on Pinterest. Share on WhatsApp. Share on Messenger.",
+        " The group has been in a state of ceasefire since 2011, but has carried out sporadic attacks in recent years. The Spanish government has vowed to crack",
+        " Russell's co-star in \"Bedtime Stories,\" Adam Sandler, has a daughter named Sadie, who is 3 years old. \"She's a"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    },
+    {
+      "nwor_mode": "off",
+      "scv_mode": "off",
+      "batch_index": 1,
+      "latency_s": 0.808025598526001,
+      "outputs": [
+        " Print this page . Bookmark this page . Share this page . Share on Facebook . Share on Twitter . Share on MySpace . Share on LinkedIn . Share on Reddit",
+        " The club's president, Florentino Perez, has vowed to take the matter to CAS, saying: \"We will appeal to the Court of Arbitration for",
+        " Copyright 2007, The Associated Press. All rights reserved. This material may not be published, broadcast, rewritten or redistributed. (c) 2007",
+        " \"It's a miracle,\" Smith said. \"We're just glad we were able to get him out of there.\" The man was taken to a hospital for",
+        " The company said it would provide severance packages to affected employees. The company said it would provide severance packages to affected employees. The company said it would provide",
+        " Copyright 2001, CNN. All rights reserved. This material may not be published, broadcast, rewritten or redistributed. CNN.com is a trademark of CNN.",
+        " The driver was later identified as 32-year-old Ryan Smith of Portland. Smith was also cited for driving with a suspended license. The incident was the second time",
+        " (CNN) -- Thousands of inmates rioted at the Reeves County Detention Center in Texas on Saturday, the second disturbance at the prison facility in the last two"
+      ],
+      "sampling_params": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 32
+      }
+    }
+  ]
+}
