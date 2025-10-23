@@ -418,49 +418,69 @@ class DraftCommitManager:
                 self._num_draft_accepted = int(draft_mask.sum().item())
                 self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
 
-            # Build full mask for all staged tokens
-            full_mask = torch.zeros(num_tokens, dtype=torch.bool, device='cpu')
+            # Copy-on-write: Accepted tokens are already in cache from reshape_and_cache_flash
+            # Only restore rejected drafts from log
+            rejected_mask = ~draft_mask
+            rejected_indices = rejected_mask.nonzero(as_tuple=False).squeeze(1)
 
-            # Category 1: Prefill tokens (not in logits_indices) - always write
-            logits_positions = set(self._logits_indices.cpu().tolist())
-            all_positions = set(range(num_tokens))
-            prefill_positions = all_positions - logits_positions
-            for pos in prefill_positions:
-                full_mask[pos] = True
+            if rejected_indices.numel() > 0:
+                # Restore rejected slots from log for each layer
+                for entry in self._drafts:
+                    # Skip if no log buffers (shouldn't happen, but be safe)
+                    if entry.draft_slot_indices is None or entry.log_key_buffer is None:
+                        continue
 
-            # Category 2: Target tokens - always write
-            for target_idx in self._target_logits_indices.cpu():
-                pos = self._logits_indices[target_idx].item()
-                full_mask[pos] = True
+                    # Get rejected slots for this layer
+                    # Filter out -1 (padding) slots that may have been in draft_slot_indices
+                    valid_mask = entry.draft_slot_indices >= 0
+                    if not valid_mask.any():
+                        continue
 
-            # Category 3: Draft tokens - conditional write based on input mask
-            for i, pos in enumerate(self._draft_positions):
-                full_mask[pos] = draft_mask[i]
+                    # Map rejected indices to valid draft indices
+                    # rejected_indices are indices into the draft_mask (which only covers valid drafts)
+                    # We need to restore only the rejected valid drafts
+                    valid_draft_slots = entry.draft_slot_indices[valid_mask]
 
-            # Move full mask to device and ensure contiguous
-            full_mask = full_mask.to(device=device, non_blocking=True)
-            if not full_mask.is_contiguous():
-                full_mask = full_mask.contiguous()
+                    # Build mask for which valid drafts were rejected
+                    rejected_valid_mask = torch.zeros(valid_mask.sum().item(), dtype=torch.bool, device='cpu')
+                    for i in rejected_indices:
+                        if i < rejected_valid_mask.shape[0]:
+                            rejected_valid_mask[i] = True
 
-            # Launch kernel for each layer (pass Tensors, not pointers)
-            for entry in self._drafts:
-                # Use empty tensor if scale is None
-                k_scale = entry._k_scale_ref if entry._k_scale_ref is not None else torch.empty(0, device=device)
-                v_scale = entry._v_scale_ref if entry._v_scale_ref is not None else torch.empty(0, device=device)
+                    rejected_valid_indices = rejected_valid_mask.nonzero(as_tuple=False).squeeze(1)
 
-                torch.ops._C_cache_ops.commit_draft_layer(
-                    entry._key_ref,
-                    entry._value_ref,
-                    entry._key_cache_ref,
-                    entry._value_cache_ref,
-                    full_mask,
-                    entry._slot_ref,
-                    k_scale,
-                    v_scale,
-                    entry.kv_cache_dtype,
-                )
+                    if rejected_valid_indices.numel() > 0:
+                        # Get log buffers for rejected drafts
+                        rejected_log_key = entry.log_key_buffer[rejected_valid_indices]
+                        rejected_log_value = entry.log_value_buffer[rejected_valid_indices]
+                        rejected_slots = valid_draft_slots[rejected_valid_indices]
 
-            torch.cuda.synchronize()
+                        # Get scale buffers if needed
+                        k_scale = entry._k_scale_ref if entry._k_scale_ref is not None else torch.empty(0, device=device)
+                        v_scale = entry._v_scale_ref if entry._v_scale_ref is not None else torch.empty(0, device=device)
+                        rejected_k_scale = entry.log_k_scale_buffer[rejected_valid_indices] if entry.log_k_scale_buffer is not None else torch.empty(0, device=device)
+                        rejected_v_scale = entry.log_v_scale_buffer[rejected_valid_indices] if entry.log_v_scale_buffer is not None else torch.empty(0, device=device)
+
+                        # Launch restore kernel
+                        torch.ops._C_cache_ops.restore_rejected_drafts(
+                            rejected_log_key,
+                            rejected_log_value,
+                            entry._key_cache_ref,
+                            entry._value_cache_ref,
+                            rejected_slots,
+                            entry.block_size,
+                            entry.block_stride,
+                            entry.page_stride,
+                            entry.head_stride,
+                            entry.kv_cache_dtype,
+                            rejected_k_scale,
+                            rejected_v_scale,
+                        )
+
+            # Optional sync (ISSUE #6: Make conditional for debugging)
+            import os
+            if os.getenv("VLLM_NWOR_DEBUG_SYNC", "0") == "1":
+                torch.cuda.synchronize()
 
             # Log success once for verification
             if not hasattr(self, '_logged_success'):
@@ -511,15 +531,25 @@ class DraftCommitManager:
 
     def _fallback_commit(self, mask: torch.Tensor) -> int:
         """Fallback to vanilla writer with sliced tensors."""
-        accepted_indices = mask.nonzero(as_tuple=False).squeeze(1)
-        num_accepted = accepted_indices.numel()
+        accepted_mask_indices = mask.nonzero(as_tuple=False).squeeze(1)
+        num_accepted = accepted_mask_indices.numel()
         if num_accepted == 0:
             return 0
 
+        # FIX (ISSUE #4): Map mask indices to batch positions via _draft_positions
+        # accepted_mask_indices are indices into the mask (draft-only, shape [num_drafts])
+        # We need to map them to batch positions
+        accepted_batch_positions = torch.tensor(
+            [self._draft_positions[i] for i in accepted_mask_indices.tolist()],
+            dtype=torch.long,
+            device=accepted_mask_indices.device
+        )
+
         for entry in self._drafts:
-            key_accepted = entry._key_ref[accepted_indices]
-            value_accepted = entry._value_ref[accepted_indices]
-            slot_accepted = entry._slot_ref[accepted_indices]
+            # Use batch positions instead of mask indices
+            key_accepted = entry._key_ref[accepted_batch_positions]
+            value_accepted = entry._value_ref[accepted_batch_positions]
+            slot_accepted = entry._slot_ref[accepted_batch_positions]
 
             # reshape_and_cache_flash expects int64
             if slot_accepted.dtype != torch.int64:
@@ -529,10 +559,10 @@ class DraftCommitManager:
             k_scale = None
             v_scale = None
             if entry._k_scale_ref is not None:
-                k_scale = (entry._k_scale_ref[accepted_indices] if entry.scale_is_per_token
+                k_scale = (entry._k_scale_ref[accepted_batch_positions] if entry.scale_is_per_token
                           else entry._k_scale_ref)
             if entry._v_scale_ref is not None:
-                v_scale = (entry._v_scale_ref[accepted_indices] if entry.scale_is_per_token
+                v_scale = (entry._v_scale_ref[accepted_batch_positions] if entry.scale_is_per_token
                           else entry._v_scale_ref)
 
             torch.ops._C_cache_ops.reshape_and_cache_flash(
