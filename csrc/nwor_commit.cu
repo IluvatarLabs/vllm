@@ -250,3 +250,156 @@ void commit_draft_layer(
     // Dispatch kernel
     DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype, CALL_COMMIT_DRAFT_KERNEL);
 }
+// Copy-on-write: Restore rejected draft slots from log buffers
+// Similar to commit_draft_kernel but sources from log instead of staged tensors
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void restore_rejected_drafts_kernel(
+    const scalar_t* __restrict__ log_key,    // [num_rejected, num_heads, head_size]
+    const scalar_t* __restrict__ log_value,  // [num_rejected, num_heads, head_size]
+    cache_t* __restrict__ key_cache,
+    cache_t* __restrict__ value_cache,
+    const int32_t* __restrict__ slot_indices,  // [num_rejected] - cache slots to restore
+    const float* log_k_scale,  // [num_rejected] or empty
+    const float* log_v_scale,  // [num_rejected] or empty
+    const bool scale_is_per_token,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int num_heads,
+    const int head_size,
+    const int block_size
+) {
+    const int64_t rejected_idx = blockIdx.x;
+    const int64_t slot_idx = slot_indices[rejected_idx];
+
+    // Skip padding slots
+    if (slot_idx < 0) {
+        return;
+    }
+
+    const int64_t block_idx = slot_idx / block_size;
+    const int64_t block_offset = slot_idx % block_size;
+    const int n_elems = num_heads * head_size;
+
+    // Source: log buffers
+    const scalar_t* __restrict__ key_src = log_key + rejected_idx * num_heads * head_size;
+    const scalar_t* __restrict__ value_src = log_value + rejected_idx * num_heads * head_size;
+
+    // Destination: cache at the slot we're restoring
+    cache_t* __restrict__ key_dst =
+        key_cache + block_idx * block_stride + block_offset * page_stride;
+    cache_t* __restrict__ value_dst =
+        value_cache + block_idx * block_stride + block_offset * page_stride;
+
+    // Layout detection
+    const bool is_contiguous_heads = (head_stride == head_size);
+
+    // Quantization scales
+    float k_scale_val = 0.f;
+    float v_scale_val = 0.f;
+    if constexpr (kv_dt != Fp8KVCacheDataType::kAuto) {
+        if (log_k_scale != nullptr && scale_is_per_token) {
+            k_scale_val = log_k_scale[rejected_idx];
+        }
+        if (log_v_scale != nullptr && scale_is_per_token) {
+            v_scale_val = log_v_scale[rejected_idx];
+        }
+    }
+
+    // Vectorized copy with quantization
+    constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+
+    if (is_contiguous_heads) {
+        // NHD layout
+        vllm::vectorize_with_alignment<VEC_SIZE>(
+            key_src, key_dst, n_elems, threadIdx.x, blockDim.x, k_op);
+        vllm::vectorize_with_alignment<VEC_SIZE>(
+            value_src, value_dst, n_elems, threadIdx.x, blockDim.x, v_op);
+    } else {
+        // HND layout (strided heads)
+        const int lane = threadIdx.x & 31;
+        const int warp_id = threadIdx.x >> 5;
+        const int warps_per_block = blockDim.x >> 5;
+
+        for (int head = warp_id; head < num_heads; head += warps_per_block) {
+            const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
+            const scalar_t* __restrict__ v_src_h = value_src + head * head_size;
+
+            cache_t* __restrict__ k_dst_h =
+                key_dst + static_cast<int64_t>(head) * head_stride;
+            cache_t* __restrict__ v_dst_h =
+                value_dst + static_cast<int64_t>(head) * head_stride;
+
+            vllm::vectorize_with_alignment<VEC_SIZE>(
+                k_src_h, k_dst_h, head_size, lane, 32, k_op);
+            vllm::vectorize_with_alignment<VEC_SIZE>(
+                v_src_h, v_dst_h, head_size, lane, 32, v_op);
+        }
+    }
+}
+
+#define CALL_RESTORE_REJECTED_KERNEL(KV_T, CACHE_T, KV_DTYPE)             \
+    vllm::restore_rejected_drafts_kernel<KV_T, CACHE_T, KV_DTYPE>         \
+        <<<grid, block, 0, stream>>>(                                      \
+            reinterpret_cast<KV_T*>(log_key.data_ptr()),                   \
+            reinterpret_cast<KV_T*>(log_value.data_ptr()),                 \
+            reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),              \
+            reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),            \
+            slot_indices.data_ptr<int32_t>(),                              \
+            log_k_scale.numel() > 0 ?                                      \
+                reinterpret_cast<const float*>(log_k_scale.data_ptr()) : nullptr, \
+            log_v_scale.numel() > 0 ?                                      \
+                reinterpret_cast<const float*>(log_v_scale.data_ptr()) : nullptr, \
+            scale_is_per_token,                                            \
+            block_stride, page_stride, head_stride,                        \
+            static_cast<int>(num_heads), static_cast<int>(head_size),     \
+            static_cast<int>(block_size));
+
+void restore_rejected_drafts(
+    torch::Tensor& log_key,
+    torch::Tensor& log_value,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& slot_indices,
+    int64_t block_size,
+    int64_t block_stride,
+    int64_t page_stride,
+    int64_t head_stride,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& log_k_scale,
+    torch::Tensor& log_v_scale
+) {
+    // Validate inputs
+    TORCH_CHECK(slot_indices.dtype() == torch::kInt32,
+                "slot_indices must have dtype torch.int32");
+    TORCH_CHECK(log_key.device() == log_value.device(),
+                "log_key and log_value must be on the same device");
+    TORCH_CHECK(log_key.device() == key_cache.device(),
+                "log_key and key_cache must be on the same device");
+
+    int num_rejected = slot_indices.size(0);
+    if (num_rejected == 0) {
+        return;  // Nothing to restore
+    }
+
+    int64_t num_heads = log_key.size(1);
+    int64_t head_size = log_key.size(2);
+
+    // Determine if scales are per-token
+    bool scale_is_per_token = (log_k_scale.numel() > 0);
+
+    // Grid/block dimensions
+    dim3 grid(static_cast<unsigned int>(num_rejected));
+    dim3 block(static_cast<unsigned int>(std::min(num_heads * head_size, static_cast<int64_t>(512))));
+
+    // Device guard and stream
+    const at::cuda::OptionalCUDAGuard device_guard(log_key.device());
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Dispatch kernel
+    DISPATCH_BY_KV_CACHE_DTYPE(log_key.dtype(), kv_cache_dtype, CALL_RESTORE_REJECTED_KERNEL);
+}
+
+} // namespace vllm

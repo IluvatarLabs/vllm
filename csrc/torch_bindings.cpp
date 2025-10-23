@@ -700,6 +700,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                   str kv_cache_dtype) -> ()");
   cache_ops.impl("commit_draft_layer", torch::kCUDA, &commit_draft_layer);
 
+  // NWOR Copy-on-Write: Restore rejected draft slots from log buffers
+  cache_ops.def(
+      "restore_rejected_drafts(Tensor log_key, Tensor log_value,"
+      "                        Tensor! key_cache, Tensor! value_cache,"
+      "                        Tensor slot_indices,"
+      "                        int block_size, int block_stride,"
+      "                        int page_stride, int head_stride,"
+      "                        str kv_cache_dtype,"
+      "                        Tensor log_k_scale, Tensor log_v_scale) -> ()");
+  cache_ops.impl("restore_rejected_drafts", torch::kCUDA, &restore_rejected_drafts);
+
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
