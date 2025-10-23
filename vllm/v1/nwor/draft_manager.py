@@ -41,6 +41,7 @@ class DraftEntry:
     _key_ref: torch.Tensor
     _value_ref: torch.Tensor
     _slot_ref: torch.Tensor
+    _slot_ref_original: Optional[torch.Tensor]  # Pre-conversion slot_mapping for replay refresh
     _key_cache_ref: torch.Tensor
     _value_cache_ref: torch.Tensor
     _k_scale_ref: Optional[torch.Tensor]
@@ -127,6 +128,12 @@ class DraftCommitManager:
 
         cached = self._cache.get(cache_key)
         if cached is not None:
+            # Validate: total drafts must match cached layout
+            if len(cached.positions) != total_draft_tokens:
+                # Cache invalid - force recapture
+                cached = None
+
+        if cached is not None:
             self._draft_positions.extend(cached.positions)
             if cached.drafts:
                 self._drafts = [replace(entry) for entry in cached.drafts]
@@ -190,6 +197,9 @@ class DraftCommitManager:
                 self.enabled = False
                 return
 
+        # Store original slot_mapping before conversion (for replay refresh)
+        slot_mapping_original = slot_mapping
+
         # Ensure int32 contiguous slots
         if slot_mapping.dtype != torch.int32:
             slot_mapping = slot_mapping.to(dtype=torch.int32)
@@ -238,6 +248,7 @@ class DraftCommitManager:
             _key_ref=key,
             _value_ref=value,
             _slot_ref=slot_mapping,
+            _slot_ref_original=slot_mapping_original,
             _key_cache_ref=key_cache,
             _value_cache_ref=value_cache,
             _k_scale_ref=k_scale,
@@ -256,6 +267,22 @@ class DraftCommitManager:
         if not self.enabled or not self._drafts:
             self.cancel()  # Clean up state
             return 0
+
+        # Detect CUDA graph replay: stage_layer() never ran, so _capturing is still False
+        is_replay = not self._capturing
+
+        # On replay, refresh slot mappings from original persistent buffers
+        if is_replay and self._drafts:
+            for entry in self._drafts:
+                if entry._slot_ref_original is not None:
+                    # Copy fresh slot values from persistent buffer to cached converted buffer
+                    # Need to refresh the entire slot_mapping, not just draft positions
+                    if entry._slot_ref_original.dtype == torch.int32 and entry._slot_ref_original.is_contiguous():
+                        # Already int32 and contiguous, direct copy
+                        entry._slot_ref.copy_(entry._slot_ref_original)
+                    else:
+                        # Need conversion, do it inline
+                        entry._slot_ref.copy_(entry._slot_ref_original.to(dtype=torch.int32).contiguous())
 
         try:
             device = self._drafts[0]._key_ref.device
