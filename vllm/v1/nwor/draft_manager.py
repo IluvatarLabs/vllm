@@ -47,6 +47,13 @@ class DraftEntry:
     _k_scale_ref: Optional[torch.Tensor]
     _v_scale_ref: Optional[torch.Tensor]
 
+    # Copy-on-write logging (for rejected draft restoration)
+    log_key_buffer: Optional[torch.Tensor] = None
+    log_value_buffer: Optional[torch.Tensor] = None
+    log_k_scale_buffer: Optional[torch.Tensor] = None  # For per-token FP8 scales
+    log_v_scale_buffer: Optional[torch.Tensor] = None
+    draft_slot_indices: Optional[torch.Tensor] = None  # Cache slots we logged
+
 
 CacheKey = Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]
 
@@ -83,6 +90,11 @@ class DraftCommitManager:
         self._cache_key: Optional[CacheKey] = None
         self._capturing = False
         self._fallback_cached_drafts: List[DraftEntry] = []  # Most recent capture's DraftEntries
+        # Copy-on-write log buffers (allocated lazily per layer, persistent across replays)
+        self._log_key_buffers: Dict[int, torch.Tensor] = {}
+        self._log_value_buffers: Dict[int, torch.Tensor] = {}
+        self._log_k_scale_buffers: Dict[int, torch.Tensor] = {}
+        self._log_v_scale_buffers: Dict[int, torch.Tensor] = {}
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
             if self._emit_metrics:
@@ -230,6 +242,83 @@ class DraftCommitManager:
         dtype_map = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
         key_value_dtype = dtype_map.get(key.dtype, "fp16")
 
+        # Copy-on-write: Log existing cache data at draft slots before we overwrite
+        layer_idx = len(self._drafts)  # Current layer index
+        log_key_buffer = None
+        log_value_buffer = None
+        log_k_scale_buffer = None
+        log_v_scale_buffer = None
+        draft_slot_indices = None
+
+        if len(self._draft_positions) > 0:
+            # Get draft positions as tensor
+            draft_positions_tensor = torch.tensor(
+                self._draft_positions, dtype=torch.long, device=key.device
+            )
+
+            # Map draft positions to cache slots (avoid indexing with -1)
+            # slot_mapping shape: [num_tokens], draft_positions are indices into this
+            draft_slot_indices = slot_mapping[draft_positions_tensor]
+
+            # Filter out -1 (padding) slots
+            valid_mask = draft_slot_indices >= 0
+            if valid_mask.any():
+                valid_draft_slots = draft_slot_indices[valid_mask]
+                num_valid_drafts = valid_draft_slots.shape[0]
+
+                # Allocate log buffers lazily (first time for this layer)
+                max_size = 512  # Match CUDA graph allocation
+                if layer_idx not in self._log_key_buffers:
+                    self._log_key_buffers[layer_idx] = torch.empty(
+                        (max_size, key.shape[1], key.shape[2]),
+                        dtype=key.dtype, device=key.device
+                    )
+                    self._log_value_buffers[layer_idx] = torch.empty(
+                        (max_size, value.shape[1], value.shape[2]),
+                        dtype=value.dtype, device=value.device
+                    )
+                    if scale_is_per_token:
+                        self._log_k_scale_buffers[layer_idx] = torch.empty(
+                            max_size, dtype=k_scale.dtype, device=k_scale.device
+                        )
+                        self._log_v_scale_buffers[layer_idx] = torch.empty(
+                            max_size, dtype=v_scale.dtype, device=v_scale.device
+                        )
+
+                # Get log buffer slices for this window
+                log_key_buffer = self._log_key_buffers[layer_idx][:num_valid_drafts]
+                log_value_buffer = self._log_value_buffers[layer_idx][:num_valid_drafts]
+
+                # Copy existing cache data to log (efficient batched operation)
+                # Calculate block indices and offsets
+                block_indices = valid_draft_slots // block_size
+                block_offsets = valid_draft_slots % block_size
+
+                # Use advanced indexing to gather cache rows
+                for i in range(num_valid_drafts):
+                    block_idx = block_indices[i].item()
+                    block_offset = block_offsets[i].item()
+                    log_key_buffer[i] = key_cache[block_idx, block_offset]
+                    log_value_buffer[i] = value_cache[block_idx, block_offset]
+
+                # Log scales if using per-token quantization
+                if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
+                    log_k_scale_buffer = self._log_k_scale_buffers[layer_idx][:num_valid_drafts]
+                    log_v_scale_buffer = self._log_v_scale_buffers[layer_idx][:num_valid_drafts]
+                    # Map draft positions to scale indices
+                    draft_positions_in_batch = draft_positions_tensor[valid_mask]
+                    log_k_scale_buffer.copy_(k_scale[draft_positions_in_batch])
+                    log_v_scale_buffer.copy_(v_scale[draft_positions_in_batch])
+
+        # NOW write all tokens to real cache (attention will read this)
+        # This is the fix for the reshape_and_cache_flash skip bug
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key, value, key_cache, value_cache,
+            slot_mapping, kv_cache_dtype,
+            k_scale if k_scale is not None else torch.empty(0, device=key.device),
+            v_scale if v_scale is not None else torch.empty(0, device=key.device)
+        )
+
         self._drafts.append(DraftEntry(
             key_ptr=key.data_ptr(),
             value_ptr=value.data_ptr(),
@@ -257,6 +346,12 @@ class DraftCommitManager:
             _value_cache_ref=value_cache,
             _k_scale_ref=k_scale,
             _v_scale_ref=v_scale,
+            # Copy-on-write log
+            log_key_buffer=log_key_buffer,
+            log_value_buffer=log_value_buffer,
+            log_k_scale_buffer=log_k_scale_buffer,
+            log_v_scale_buffer=log_v_scale_buffer,
+            draft_slot_indices=draft_slot_indices,
         ))
 
     def commit(self, mask: torch.Tensor) -> int:
