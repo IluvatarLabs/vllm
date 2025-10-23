@@ -82,6 +82,7 @@ class DraftCommitManager:
         self._cache: Dict[CacheKey, DraftCacheEntry] = {}
         self._cache_key: Optional[CacheKey] = None
         self._capturing = False
+        self._fallback_cached_drafts: List[DraftEntry] = []  # Most recent capture's DraftEntries
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
             if self._emit_metrics:
@@ -128,9 +129,12 @@ class DraftCommitManager:
 
         cached = self._cache.get(cache_key)
 
-        # Try to reuse cached DraftEntries if available (layout-agnostic)
+        # Try to reuse cached DraftEntries (layout-agnostic)
+        # First try exact key match, then fall back to most recent capture
         if cached is not None and cached.drafts:
             self._drafts = [replace(entry) for entry in cached.drafts]
+        elif self._fallback_cached_drafts:
+            self._drafts = [replace(entry) for entry in self._fallback_cached_drafts]
 
         # ALWAYS recompute positions from live metadata (layout-specific)
         logits_list = logits_indices_cpu.tolist()
@@ -376,6 +380,8 @@ class DraftCommitManager:
                 cached_entry.positions = list(self._draft_positions)
                 cached_entry.drafts = [replace(entry) for entry in self._drafts]
                 cached_entry.num_layers = len(self._drafts)
+                # Update fallback to most recent capture
+                self._fallback_cached_drafts = cached_entry.drafts
             self.cancel()
 
     def get_metrics(self) -> dict:
