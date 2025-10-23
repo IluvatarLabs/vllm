@@ -28,6 +28,10 @@
 
 namespace vllm {
 
+// ============================================================================
+// NWOR Kernels: commit_draft and restore_rejected_drafts
+// ============================================================================
+
 // Commit draft kernel - copied vectorization from reshape_and_cache_flash_kernel
 // Key differences:
 // 1. Early exit on mask[token_idx] == false (Issue #3: mask early-return)
@@ -133,11 +137,9 @@ __global__ void commit_draft_kernel(
     }
 }
 
-}  // namespace vllm
-
-// Template dispatch macro matching existing pattern
+// Template dispatch macro (inside namespace, no vllm:: prefix needed)
 #define CALL_COMMIT_DRAFT_KERNEL(KV_T, CACHE_T, KV_DTYPE)               \
-  vllm::commit_draft_kernel<KV_T, CACHE_T, KV_DTYPE>                    \
+  commit_draft_kernel<KV_T, CACHE_T, KV_DTYPE>                          \
       <<<grid, block, 0, stream>>>(                                     \
           reinterpret_cast<const KV_T*>(key_ptr),                       \
           reinterpret_cast<const KV_T*>(value_ptr),                     \
@@ -149,9 +151,12 @@ __global__ void commit_draft_kernel(
           v_scale_ptr ? reinterpret_cast<const float*>(v_scale_ptr) : nullptr, \
           scale_is_per_token,                                           \
           key_stride, value_stride, block_stride, page_stride,          \
-          head_stride, static_cast<int>(num_heads), static_cast<int>(head_size), static_cast<int>(block_size));
+          head_stride, static_cast<int>(num_heads), static_cast<int>(head_size), static_cast<int>(block_size))
 
-// Main entry point with full validation and dispatch
+// ============================================================================
+// Wrapper Functions
+// ============================================================================
+
 void commit_draft_layer(
     torch::Tensor& key,
     torch::Tensor& value,
@@ -203,28 +208,31 @@ void commit_draft_layer(
                     "v_scale must be on the same device as key");
     }
 
-    // key_cache: either [num_blocks, block_size, num_heads, head_size] (flash)
-    //                or [num_blocks, num_heads, block_size, head_size] (paged)
-    int64_t block_size = (key_cache.size(1) == num_heads) ? key_cache.size(2) : key_cache.size(1);
+    // FIX BUG #3: Use stride-based layout detection (robust when block_size == num_heads)
+    // key_cache layouts:
+    //   Flash: [num_blocks, block_size, num_heads, head_size] - stride(1) > stride(2)
+    //   Paged: [num_blocks, num_heads, block_size, head_size] - stride(2) > stride(1)
+    // Shape-based detection (size(1) == num_heads) FAILS when block_size == num_heads!
 
-    // Compute strides from actual tensor layout
+    // Compute strides first (matching cache_kernels.cu:715-716)
     int64_t key_stride = key.stride(0);
     int64_t value_stride = value.stride(0);
     int64_t block_stride = key_cache.stride(0);
+    int64_t page_stride = key_cache.stride(1);
+    int64_t head_stride = key_cache.stride(2);
 
-    // Strides are layout-dependent:
-    // Flash [blocks, tokens, heads, dim]: stride(1) = token, stride(2) = head
-    // Paged [blocks, heads, tokens, dim]: stride(1) = head, stride(2) = token
-    int64_t page_stride, head_stride;
-    if (key_cache.size(1) == num_heads) {
-        // Paged layout: swap stride indices
-        page_stride = key_cache.stride(2);
-        head_stride = key_cache.stride(1);
+    // Detect layout via stride comparison (when strides differ, larger one is the page dim)
+    int64_t block_size;
+    if (key_cache.stride(1) != key_cache.stride(2)) {
+        // Flash: stride(1) larger (page dimension)
+        // Paged: stride(2) larger (page dimension)
+        block_size = (key_cache.stride(1) > key_cache.stride(2)) ?
+                     key_cache.size(1) : key_cache.size(2);
     } else {
-        // Flash layout: use standard indices
-        page_stride = key_cache.stride(1);
-        head_stride = key_cache.stride(2);
+        // Strides equal (unusual), fall back to size comparison
+        block_size = key_cache.size(1);
     }
+    // Kernel auto-detects NHD vs HND layout via: (head_stride == head_size)
 
     // Determine if scales are per-token
     bool scale_is_per_token = (k_scale.numel() > 1);
@@ -250,6 +258,7 @@ void commit_draft_layer(
     // Dispatch kernel
     DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype, CALL_COMMIT_DRAFT_KERNEL);
 }
+
 // Copy-on-write: Restore rejected draft slots from log buffers
 // Similar to commit_draft_kernel but sources from log instead of staged tensors
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
@@ -294,15 +303,15 @@ __global__ void restore_rejected_drafts_kernel(
     // Layout detection
     const bool is_contiguous_heads = (head_stride == head_size);
 
-    // Quantization scales
+    // Quantization scales (FIX BUG #1: Handle both per-token and scalar scales)
     float k_scale_val = 0.f;
     float v_scale_val = 0.f;
     if constexpr (kv_dt != Fp8KVCacheDataType::kAuto) {
-        if (log_k_scale != nullptr && scale_is_per_token) {
-            k_scale_val = log_k_scale[rejected_idx];
+        if (log_k_scale != nullptr) {
+            k_scale_val = scale_is_per_token ? log_k_scale[rejected_idx] : log_k_scale[0];
         }
-        if (log_v_scale != nullptr && scale_is_per_token) {
-            v_scale_val = log_v_scale[rejected_idx];
+        if (log_v_scale != nullptr) {
+            v_scale_val = scale_is_per_token ? log_v_scale[rejected_idx] : log_v_scale[0];
         }
     }
 
@@ -312,10 +321,10 @@ __global__ void restore_rejected_drafts_kernel(
     CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
 
     if (is_contiguous_heads) {
-        // NHD layout
-        vllm::vectorize_with_alignment<VEC_SIZE>(
+        // NHD layout (FIX BUG #4: Remove unnecessary namespace prefix)
+        vectorize_with_alignment<VEC_SIZE>(
             key_src, key_dst, n_elems, threadIdx.x, blockDim.x, k_op);
-        vllm::vectorize_with_alignment<VEC_SIZE>(
+        vectorize_with_alignment<VEC_SIZE>(
             value_src, value_dst, n_elems, threadIdx.x, blockDim.x, v_op);
     } else {
         // HND layout (strided heads)
@@ -332,16 +341,17 @@ __global__ void restore_rejected_drafts_kernel(
             cache_t* __restrict__ v_dst_h =
                 value_dst + static_cast<int64_t>(head) * head_stride;
 
-            vllm::vectorize_with_alignment<VEC_SIZE>(
+            vectorize_with_alignment<VEC_SIZE>(
                 k_src_h, k_dst_h, head_size, lane, 32, k_op);
-            vllm::vectorize_with_alignment<VEC_SIZE>(
+            vectorize_with_alignment<VEC_SIZE>(
                 v_src_h, v_dst_h, head_size, lane, 32, v_op);
         }
     }
 }
 
+// Template dispatch macro (inside namespace, no prefix needed)
 #define CALL_RESTORE_REJECTED_KERNEL(KV_T, CACHE_T, KV_DTYPE)             \
-    vllm::restore_rejected_drafts_kernel<KV_T, CACHE_T, KV_DTYPE>         \
+    restore_rejected_drafts_kernel<KV_T, CACHE_T, KV_DTYPE>               \
         <<<grid, block, 0, stream>>>(                                      \
             reinterpret_cast<KV_T*>(log_key.data_ptr()),                   \
             reinterpret_cast<KV_T*>(log_value.data_ptr()),                 \
@@ -355,7 +365,7 @@ __global__ void restore_rejected_drafts_kernel(
             scale_is_per_token,                                            \
             block_stride, page_stride, head_stride,                        \
             static_cast<int>(num_heads), static_cast<int>(head_size),     \
-            static_cast<int>(block_size));
+            static_cast<int>(block_size))
 
 void restore_rejected_drafts(
     torch::Tensor& log_key,
@@ -387,8 +397,9 @@ void restore_rejected_drafts(
     int64_t num_heads = log_key.size(1);
     int64_t head_size = log_key.size(2);
 
-    // Determine if scales are per-token
-    bool scale_is_per_token = (log_k_scale.numel() > 0);
+    // Determine if scales are per-token (FIX BUG #2: > 1 not > 0)
+    // numel == 0: no scales, numel == 1: scalar scale, numel > 1: per-token scales
+    bool scale_is_per_token = (log_k_scale.numel() > 1);
 
     // Grid/block dimensions
     dim3 grid(static_cast<unsigned int>(num_rejected));
@@ -402,4 +413,4 @@ void restore_rejected_drafts(
     DISPATCH_BY_KV_CACHE_DTYPE(log_key.dtype(), kv_cache_dtype, CALL_RESTORE_REJECTED_KERNEL);
 }
 
-} // namespace vllm
+}  // namespace vllm
