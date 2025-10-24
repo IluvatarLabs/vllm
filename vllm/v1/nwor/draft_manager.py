@@ -191,6 +191,9 @@ class DraftCommitManager:
                 self._drafts.clear()
             self._capturing = True
 
+        # Check if we should skip NWOR logging (but still write to cache)
+        skip_nwor_logging = False
+
         # TODO: Add FP8 dequantization support to log_cache_slots kernel
         # Currently, the kernel uses static_cast which doesn't properly dequantize FP8
         # For FP8 support, we need to pass scales and use proper dequantization
@@ -199,8 +202,7 @@ class DraftCommitManager:
                 logger.warning("NWOR Copy-on-Write with FP8 KV cache is not yet supported. "
                               "Disabling NWOR for this session.")
                 self._logged_fp8_warning = True
-            self.enabled = False
-            return
+            skip_nwor_logging = True
 
         # Validate storage
         for t, n in [(key, "key"), (value, "value"), (key_cache, "key_cache"),
@@ -267,9 +269,9 @@ class DraftCommitManager:
                         f"NWOR: Too many draft tokens ({num_valid_drafts} > {max_size}), "
                         f"disabling NWOR for this window to prevent buffer overflow"
                     )
-                    self.enabled = False
-                    return
-                if layer_idx not in self._log_key_buffers:
+                    skip_nwor_logging = True
+
+                if not skip_nwor_logging and layer_idx not in self._log_key_buffers:
                     self._log_key_buffers[layer_idx] = torch.empty(
                         (max_size, key.shape[1], key.shape[2]),
                         dtype=key.dtype, device=key.device
@@ -286,39 +288,41 @@ class DraftCommitManager:
                             max_size, dtype=v_scale.dtype, device=v_scale.device
                         )
 
-                # Get log buffer slices for this window
-                log_key_buffer = self._log_key_buffers[layer_idx][:num_valid_drafts]
-                log_value_buffer = self._log_value_buffers[layer_idx][:num_valid_drafts]
+                # Only perform NWOR logging if not skipping
+                if not skip_nwor_logging:
+                    # Get log buffer slices for this window
+                    log_key_buffer = self._log_key_buffers[layer_idx][:num_valid_drafts]
+                    log_value_buffer = self._log_value_buffers[layer_idx][:num_valid_drafts]
 
-                # Copy existing cache data to log using CUDA kernel
-                # This kernel will be captured in CUDA graph and replay automatically
-                # Fix stride order for Paged layout: stride(1) and stride(2) are swapped
-                torch.ops._C_cache_ops.log_cache_slots(
-                    key_cache,
-                    value_cache,
-                    valid_draft_slots,  # int64 slot indices
-                    log_key_buffer,
-                    log_value_buffer,
-                    block_size,
-                    key_cache.stride(0),  # block_stride (same for both layouts)
-                    key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),  # page_stride
-                    key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),  # head_stride
-                )
+                    # Copy existing cache data to log using CUDA kernel
+                    # This kernel will be captured in CUDA graph and replay automatically
+                    # Fix stride order for Paged layout: stride(1) and stride(2) are swapped
+                    torch.ops._C_cache_ops.log_cache_slots(
+                        key_cache,
+                        value_cache,
+                        valid_draft_slots,  # int64 slot indices
+                        log_key_buffer,
+                        log_value_buffer,
+                        block_size,
+                        key_cache.stride(0),  # block_stride (same for both layouts)
+                        key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),  # page_stride
+                        key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),  # head_stride
+                    )
 
-                # Store which slots we actually logged (for clarity in commit())
-                logged_slots = valid_draft_slots
+                    # Store which slots we actually logged (for clarity in commit())
+                    logged_slots = valid_draft_slots
 
-                # Log FP8 scales separately (Python is simpler than kernel for this)
-                if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
-                    log_k_scale_buffer = self._log_k_scale_buffers[layer_idx][:num_valid_drafts]
-                    log_v_scale_buffer = self._log_v_scale_buffers[layer_idx][:num_valid_drafts]
-                    # Map draft positions to scale indices (only valid drafts)
-                    draft_positions_in_batch = draft_positions_tensor[valid_mask]
-                    log_k_scale_buffer.copy_(k_scale[draft_positions_in_batch])
-                    log_v_scale_buffer.copy_(v_scale[draft_positions_in_batch])
+                    # Log FP8 scales separately (Python is simpler than kernel for this)
+                    if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
+                        log_k_scale_buffer = self._log_k_scale_buffers[layer_idx][:num_valid_drafts]
+                        log_v_scale_buffer = self._log_v_scale_buffers[layer_idx][:num_valid_drafts]
+                        # Map draft positions to scale indices (only valid drafts)
+                        draft_positions_in_batch = draft_positions_tensor[valid_mask]
+                        log_k_scale_buffer.copy_(k_scale[draft_positions_in_batch])
+                        log_v_scale_buffer.copy_(v_scale[draft_positions_in_batch])
 
-        # NOW write all tokens to real cache (attention will read this)
-        # This is the fix for the reshape_and_cache_flash skip bug
+        # ALWAYS write all tokens to real cache (attention will read this)
+        # This must run even if NWOR logging is skipped (FP8, buffer overflow, etc.)
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key, value, key_cache, value_cache,
             slot_mapping, kv_cache_dtype,
@@ -326,6 +330,13 @@ class DraftCommitManager:
             v_scale if v_scale is not None else torch.empty(0, device=key.device)
         )
 
+        # If NWOR logging was skipped, disable NWOR and return
+        # Cache has been written, so this is safe
+        if skip_nwor_logging:
+            self.enabled = False
+            return
+
+        # Create DraftEntry for NWOR restore (only if logging succeeded)
         self._drafts.append(DraftEntry(
             num_tokens=key.shape[0],
             block_size=block_size,
