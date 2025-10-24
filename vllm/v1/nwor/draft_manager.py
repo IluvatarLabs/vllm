@@ -98,6 +98,8 @@ class DraftCommitManager:
         self._log_v_scale_buffers: Dict[int, torch.Tensor] = {}
         self._slot_indices_buffers: Dict[int, torch.Tensor] = {}  # Persistent slot indices for CUDA graph
         self._chunk_slices: Dict[Tuple[int, int, int], ChunkSlice] = {}
+        # Reusable empty tensor to avoid repeated allocations
+        self._empty_tensor: Optional[torch.Tensor] = None
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
             if self._emit_metrics:
@@ -116,7 +118,6 @@ class DraftCommitManager:
         self._draft_positions.clear()
         self._cache_key = None
         self._capturing = False
-        self._chunk_slices.clear()
 
         if spec_decode_metadata is None:
             self.enabled = False
@@ -149,12 +150,8 @@ class DraftCommitManager:
 
         cached = self._cache.get(cache_key)
 
-        # Try to reuse cached DraftEntries (layout-agnostic)
-        # First try exact key match, then fall back to most recent capture
-        if cached is not None and cached.drafts:
-            self._drafts = [replace(entry) for entry in cached.drafts]
-        elif self._fallback_cached_drafts:
-            self._drafts = [replace(entry) for entry in self._fallback_cached_drafts]
+        # Note: We used to copy cached DraftEntries here, but stage_layer() immediately
+        # clears self._drafts on first call, making the copies pointless. Removed for performance.
 
         # ALWAYS recompute positions from live metadata (layout-specific)
         positions: List[int] = []
@@ -189,6 +186,12 @@ class DraftCommitManager:
         self.enabled = True
         return True
 
+    def _get_empty_tensor(self, device: torch.device) -> torch.Tensor:
+        """Get reusable empty tensor to avoid repeated allocations."""
+        if self._empty_tensor is None or self._empty_tensor.device != device:
+            self._empty_tensor = torch.empty(0, device=device)
+        return self._empty_tensor
+
     def cancel(self):
         """Cancel without committing."""
         self._drafts.clear()
@@ -213,8 +216,9 @@ class DraftCommitManager:
         positions = self._draft_positions
 
         if chunk_len == 0:
-            global_indices = torch.empty(0, dtype=torch.long, device=device)
-            local_positions = torch.empty(0, dtype=torch.long, device=device)
+            empty = self._get_empty_tensor(device)
+            global_indices = empty
+            local_positions = empty
         else:
             start_idx = bisect_left(positions, chunk_start)
             end_idx = bisect_left(positions, chunk_start + chunk_len)
@@ -225,8 +229,9 @@ class DraftCommitManager:
                 ) - chunk_start
                 local_positions = local_offsets
             else:
-                global_indices = torch.empty(0, dtype=torch.long, device=device)
-                local_positions = torch.empty(0, dtype=torch.long, device=device)
+                empty = self._get_empty_tensor(device)
+                global_indices = empty
+                local_positions = empty
 
         chunk_slice = ChunkSlice(
             global_indices=global_indices,
@@ -370,8 +375,8 @@ class DraftCommitManager:
                             key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),
                             key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),
                             kv_cache_dtype,
-                            k_scale if k_scale is not None else torch.empty(0, device=key.device),
-                            v_scale if v_scale is not None else torch.empty(0, device=key.device),
+                            k_scale if k_scale is not None else self._get_empty_tensor(key.device),
+                            v_scale if v_scale is not None else self._get_empty_tensor(key.device),
                         )
 
                         if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
@@ -393,8 +398,8 @@ class DraftCommitManager:
             value_cache,
             slot_mapping_kernel,
             kv_cache_dtype,
-            k_scale if k_scale is not None else torch.empty(0, device=key.device),
-            v_scale if v_scale is not None else torch.empty(0, device=key.device)
+            k_scale if k_scale is not None else self._get_empty_tensor(key.device),
+            v_scale if v_scale is not None else self._get_empty_tensor(key.device)
         )
 
         # If NWOR logging was skipped, disable NWOR and return
@@ -409,9 +414,9 @@ class DraftCommitManager:
 
         # Ensure chunk-local metadata defaults
         if chunk_logged_indices is None:
-            chunk_logged_indices = torch.empty(0, dtype=torch.long, device=key.device)
+            chunk_logged_indices = self._get_empty_tensor(key.device)
         if chunk_logged_local is None:
-            chunk_logged_local = torch.empty(0, dtype=torch.long, device=key.device)
+            chunk_logged_local = self._get_empty_tensor(key.device)
 
         # Create DraftEntry for NWOR restore (only if logging succeeded)
         self._drafts.append(DraftEntry(
@@ -469,9 +474,8 @@ class DraftCommitManager:
             assert all(e.num_tokens == num_tokens for e in self._drafts)
 
             # Prepare draft mask (keep on GPU for zero-copy overhead)
-            if mask.dtype != torch.bool:
-                mask = mask.to(dtype=torch.bool)
-            draft_mask = mask.to(device)  # Force to GPU, no CPU transfer
+            # Combine dtype and device conversion in single operation
+            draft_mask = mask.to(device=device, dtype=torch.bool)
 
             if self._emit_metrics:
                 mask_true = int(draft_mask.sum().item())
@@ -523,8 +527,9 @@ class DraftCommitManager:
                     rejected_k_scale = entry.log_k_scale_buffer[rejected_rows]
                     rejected_v_scale = entry.log_v_scale_buffer[rejected_rows]
                 else:
-                    rejected_k_scale = torch.empty(0, device=device)
-                    rejected_v_scale = torch.empty(0, device=device)
+                    empty = self._get_empty_tensor(device)
+                    rejected_k_scale = empty
+                    rejected_v_scale = empty
 
                 torch.ops._C_cache_ops.restore_rejected_drafts(
                     rejected_log_key,
