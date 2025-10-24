@@ -29,8 +29,146 @@
 namespace vllm {
 
 // ============================================================================
-// NWOR Kernel: restore_rejected_drafts (Copy-on-Write)
+// NWOR Kernels: Copy-on-Write Logging and Restoration
 // ============================================================================
+
+// Log cache slots to buffer (Copy-on-Write preparation)
+// Runs during CUDA graph capture AND replay to keep log buffers fresh
+template <typename scalar_t, typename cache_t>
+__global__ void log_cache_slots_kernel(
+    const cache_t* __restrict__ key_cache,
+    const cache_t* __restrict__ value_cache,
+    const int64_t* __restrict__ slot_indices,  // [num_slots] - cache slots to log
+    scalar_t* __restrict__ log_key,            // [num_slots, num_heads, head_size]
+    scalar_t* __restrict__ log_value,
+    const int64_t block_size,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int num_heads,
+    const int head_size
+) {
+    const int64_t log_idx = blockIdx.x;  // Which slot are we logging
+    const int64_t slot_idx = slot_indices[log_idx];
+
+    // Skip padding slots
+    if (slot_idx < 0) return;
+
+    // Decompose slot index into block coordinates
+    const int64_t block_idx = slot_idx / block_size;
+    const int64_t block_offset = slot_idx % block_size;
+    const int n_elems = num_heads * head_size;
+
+    // Source: cache at this slot
+    const cache_t* __restrict__ key_src =
+        key_cache + block_idx * block_stride + block_offset * page_stride;
+    const cache_t* __restrict__ value_src =
+        value_cache + block_idx * block_stride + block_offset * page_stride;
+
+    // Destination: log buffer
+    scalar_t* __restrict__ key_dst = log_key + log_idx * n_elems;
+    scalar_t* __restrict__ value_dst = log_value + log_idx * n_elems;
+
+    // Layout detection (same as restore kernel)
+    const bool is_contiguous_heads = (head_stride == head_size);
+
+    if (is_contiguous_heads) {
+        // NHD layout - simple vectorized copy
+        for (int i = threadIdx.x; i < n_elems; i += blockDim.x) {
+            key_dst[i] = static_cast<scalar_t>(key_src[i]);
+            value_dst[i] = static_cast<scalar_t>(value_src[i]);
+        }
+    } else {
+        // HND layout - strided heads
+        const int lane = threadIdx.x & 31;
+        const int warp_id = threadIdx.x >> 5;
+        const int warps_per_block = blockDim.x >> 5;
+
+        for (int head = warp_id; head < num_heads; head += warps_per_block) {
+            const cache_t* __restrict__ k_src_h =
+                key_src + static_cast<int64_t>(head) * head_stride;
+            const cache_t* __restrict__ v_src_h =
+                value_src + static_cast<int64_t>(head) * head_stride;
+
+            scalar_t* __restrict__ k_dst_h = key_dst + head * head_size;
+            scalar_t* __restrict__ v_dst_h = value_dst + head * head_size;
+
+            for (int i = lane; i < head_size; i += 32) {
+                k_dst_h[i] = static_cast<scalar_t>(k_src_h[i]);
+                v_dst_h[i] = static_cast<scalar_t>(v_src_h[i]);
+            }
+        }
+    }
+}
+
+// Dispatch macro for log_cache_slots
+#define CALL_LOG_CACHE_SLOTS_KERNEL(CACHE_T, SCALAR_T)  \
+    log_cache_slots_kernel<SCALAR_T, CACHE_T>           \
+        <<<grid, block, 0, stream>>>(                    \
+            reinterpret_cast<const CACHE_T*>(key_cache.data_ptr()), \
+            reinterpret_cast<const CACHE_T*>(value_cache.data_ptr()), \
+            slot_indices.data_ptr<int64_t>(),            \
+            reinterpret_cast<SCALAR_T*>(log_key.data_ptr()), \
+            reinterpret_cast<SCALAR_T*>(log_value.data_ptr()), \
+            block_size, block_stride, page_stride, head_stride, \
+            static_cast<int>(num_heads), static_cast<int>(head_size))
+
+void log_cache_slots(
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& slot_indices,
+    torch::Tensor& log_key,
+    torch::Tensor& log_value,
+    int64_t block_size,
+    int64_t block_stride,
+    int64_t page_stride,
+    int64_t head_stride
+) {
+    int num_slots = slot_indices.size(0);
+    if (num_slots == 0) return;
+
+    int64_t num_heads = log_key.size(1);
+    int64_t head_size = log_key.size(2);
+
+    dim3 grid(static_cast<unsigned int>(num_slots));
+    dim3 block(static_cast<unsigned int>(std::min(num_heads * head_size, static_cast<int64_t>(512))));
+
+    const at::cuda::OptionalCUDAGuard device_guard(key_cache.device());
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Dispatch based on cache dtype and log buffer dtype
+    AT_DISPATCH_SWITCH(
+        key_cache.scalar_type(), "log_cache_slots_cache",
+        AT_DISPATCH_CASE(at::ScalarType::Byte, [&] {
+            using cache_t = scalar_t;
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+                log_key.scalar_type(), "log_cache_slots_log", [&] {
+                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
+                });
+        })
+        AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
+            using cache_t = float;
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+                log_key.scalar_type(), "log_cache_slots_log", [&] {
+                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
+                });
+        })
+        AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
+            using cache_t = __half;
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+                log_key.scalar_type(), "log_cache_slots_log", [&] {
+                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
+                });
+        })
+        AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
+            using cache_t = __nv_bfloat16;
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+                log_key.scalar_type(), "log_cache_slots_log", [&] {
+                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
+                });
+        })
+    );
+}
 
 // Copy-on-write: Restore rejected draft slots from log buffers
 // Similar to commit_draft_kernel but sources from log instead of staged tensors

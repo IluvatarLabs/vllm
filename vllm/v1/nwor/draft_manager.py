@@ -269,28 +269,26 @@ class DraftCommitManager:
                 log_key_buffer = self._log_key_buffers[layer_idx][:num_valid_drafts]
                 log_value_buffer = self._log_value_buffers[layer_idx][:num_valid_drafts]
 
-                # Copy existing cache data to log (efficient batched operation)
-                # Calculate block indices and offsets
-                block_indices = valid_draft_slots // block_size
-                block_offsets = valid_draft_slots % block_size
+                # Copy existing cache data to log using CUDA kernel
+                # This kernel will be captured in CUDA graph and replay automatically
+                # Uses layout-aware strides (same as we fixed for restore kernel)
+                torch.ops._C_cache_ops.log_cache_slots(
+                    key_cache,
+                    value_cache,
+                    valid_draft_slots,  # int64 slot indices
+                    log_key_buffer,
+                    log_value_buffer,
+                    block_size,
+                    key_cache.stride(0),  # block_stride
+                    key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),  # page_stride
+                    key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),  # head_stride
+                )
 
-                # Use layout-aware indexing to gather cache rows
-                for i in range(num_valid_drafts):
-                    block_idx = block_indices[i].item()
-                    block_offset = block_offsets[i].item()
-
-                    if layout_id == 0:  # Flash layout: [num_blocks, block_size, num_heads, head_size]
-                        log_key_buffer[i] = key_cache[block_idx, block_offset]
-                        log_value_buffer[i] = value_cache[block_idx, block_offset]
-                    else:  # Paged layout: [num_blocks, num_heads, block_size, head_size]
-                        log_key_buffer[i] = key_cache[block_idx, :, block_offset]
-                        log_value_buffer[i] = value_cache[block_idx, :, block_offset]
-
-                # Log scales if using per-token quantization
+                # Log FP8 scales separately (Python is simpler than kernel for this)
                 if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
                     log_k_scale_buffer = self._log_k_scale_buffers[layer_idx][:num_valid_drafts]
                     log_v_scale_buffer = self._log_v_scale_buffers[layer_idx][:num_valid_drafts]
-                    # Map draft positions to scale indices
+                    # Map draft positions to scale indices (only valid drafts)
                     draft_positions_in_batch = draft_positions_tensor[valid_mask]
                     log_k_scale_buffer.copy_(k_scale[draft_positions_in_batch])
                     log_v_scale_buffer.copy_(v_scale[draft_positions_in_batch])

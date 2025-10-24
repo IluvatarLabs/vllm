@@ -691,6 +691,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
 
+  // NWOR Copy-on-Write: Log cache slots before overwrite
+  cache_ops.def(
+      "log_cache_slots(Tensor key_cache, Tensor value_cache,"
+      "                Tensor slot_indices, Tensor! log_key, Tensor! log_value,"
+      "                int block_size, int block_stride, int page_stride, int head_stride) -> ()");
+  cache_ops.impl("log_cache_slots", torch::kCUDA, &vllm::log_cache_slots);
+
   // NWOR Copy-on-Write: Restore rejected draft slots from log buffers
   cache_ops.def(
       "restore_rejected_drafts(Tensor log_key, Tensor log_value,"

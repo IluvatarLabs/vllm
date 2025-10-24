@@ -13,6 +13,19 @@
 
 namespace vllm {
 
+// Log cache slots to buffer (Copy-on-Write preparation)
+void log_cache_slots(
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& slot_indices,
+    torch::Tensor& log_key,
+    torch::Tensor& log_value,
+    int64_t block_size,
+    int64_t block_stride,
+    int64_t page_stride,
+    int64_t head_stride
+);
+
 // Copy-on-Write: Restore rejected draft slots from log buffers.
 // Called during commit phase to rollback rejected drafts to their pre-write state.
 //
