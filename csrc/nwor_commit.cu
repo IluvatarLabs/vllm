@@ -34,7 +34,7 @@ namespace vllm {
 
 // Log cache slots to buffer (Copy-on-Write preparation)
 // Runs during CUDA graph capture AND replay to keep log buffers fresh
-template <typename scalar_t, typename cache_t>
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void log_cache_slots_kernel(
     const cache_t* __restrict__ key_cache,
     const cache_t* __restrict__ value_cache,
@@ -46,7 +46,9 @@ __global__ void log_cache_slots_kernel(
     const int64_t page_stride,
     const int64_t head_stride,
     const int num_heads,
-    const int head_size
+    const int head_size,
+    const float* k_scale,
+    const float* v_scale
 ) {
     const int64_t log_idx = blockIdx.x;  // Which slot are we logging
     const int64_t slot_idx = slot_indices[log_idx];
@@ -72,14 +74,21 @@ __global__ void log_cache_slots_kernel(
     // Layout detection (same as restore kernel)
     const bool is_contiguous_heads = (head_stride == head_size);
 
+    // FP8 dequantization support (same pattern as reshape_and_cache_flash)
+    float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale;
+    float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale;
+    constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
+    CopyWithScaleOp<scalar_t, cache_t, kv_dt> k_op{k_scale_val};
+    CopyWithScaleOp<scalar_t, cache_t, kv_dt> v_op{v_scale_val};
+
     if (is_contiguous_heads) {
-        // NHD layout - simple vectorized copy
-        for (int i = threadIdx.x; i < n_elems; i += blockDim.x) {
-            key_dst[i] = static_cast<scalar_t>(key_src[i]);
-            value_dst[i] = static_cast<scalar_t>(value_src[i]);
-        }
+        // NHD layout - vectorized copy with FP8 dequantization
+        vectorize_with_alignment<VEC_SIZE>(
+            key_src, key_dst, n_elems, threadIdx.x, blockDim.x, k_op);
+        vectorize_with_alignment<VEC_SIZE>(
+            value_src, value_dst, n_elems, threadIdx.x, blockDim.x, v_op);
     } else {
-        // HND layout - strided heads
+        // HND layout - strided heads with FP8 dequantization
         const int lane = threadIdx.x & 31;
         const int warp_id = threadIdx.x >> 5;
         const int warps_per_block = blockDim.x >> 5;
@@ -93,25 +102,29 @@ __global__ void log_cache_slots_kernel(
             scalar_t* __restrict__ k_dst_h = key_dst + head * head_size;
             scalar_t* __restrict__ v_dst_h = value_dst + head * head_size;
 
-            for (int i = lane; i < head_size; i += 32) {
-                k_dst_h[i] = static_cast<scalar_t>(k_src_h[i]);
-                v_dst_h[i] = static_cast<scalar_t>(v_src_h[i]);
-            }
+            vectorize_with_alignment<VEC_SIZE>(
+                k_src_h, k_dst_h, head_size, lane, 32, k_op);
+            vectorize_with_alignment<VEC_SIZE>(
+                v_src_h, v_dst_h, head_size, lane, 32, v_op);
         }
     }
 }
 
 // Dispatch macro for log_cache_slots
-#define CALL_LOG_CACHE_SLOTS_KERNEL(CACHE_T, SCALAR_T)  \
-    log_cache_slots_kernel<SCALAR_T, CACHE_T>           \
-        <<<grid, block, 0, stream>>>(                    \
+#define CALL_LOG_CACHE_SLOTS_KERNEL(CACHE_T, SCALAR_T, KV_DTYPE)  \
+    log_cache_slots_kernel<SCALAR_T, CACHE_T, KV_DTYPE>           \
+        <<<grid, block, 0, stream>>>(                              \
             reinterpret_cast<const CACHE_T*>(key_cache.data_ptr()), \
             reinterpret_cast<const CACHE_T*>(value_cache.data_ptr()), \
-            slot_indices.data_ptr<int64_t>(),            \
-            reinterpret_cast<SCALAR_T*>(log_key.data_ptr()), \
-            reinterpret_cast<SCALAR_T*>(log_value.data_ptr()), \
-            block_size, block_stride, page_stride, head_stride, \
-            static_cast<int>(num_heads), static_cast<int>(head_size))
+            slot_indices.data_ptr<int64_t>(),                      \
+            reinterpret_cast<SCALAR_T*>(log_key.data_ptr()),       \
+            reinterpret_cast<SCALAR_T*>(log_value.data_ptr()),     \
+            block_size, block_stride, page_stride, head_stride,    \
+            static_cast<int>(num_heads), static_cast<int>(head_size), \
+            k_scale.numel() > 0 ?                                  \
+                reinterpret_cast<const float*>(k_scale.data_ptr()) : nullptr, \
+            v_scale.numel() > 0 ?                                  \
+                reinterpret_cast<const float*>(v_scale.data_ptr()) : nullptr)
 
 void log_cache_slots(
     torch::Tensor& key_cache,
@@ -122,7 +135,10 @@ void log_cache_slots(
     int64_t block_size,
     int64_t block_stride,
     int64_t page_stride,
-    int64_t head_stride
+    int64_t head_stride,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale
 ) {
     int num_slots = slot_indices.size(0);
     if (num_slots == 0) return;
@@ -138,38 +154,8 @@ void log_cache_slots(
     const at::cuda::OptionalCUDAGuard device_guard(key_cache.device());
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Dispatch based on cache dtype and log buffer dtype
-    AT_DISPATCH_SWITCH(
-        key_cache.scalar_type(), "log_cache_slots_cache",
-        AT_DISPATCH_CASE(at::ScalarType::Byte, [&] {
-            using cache_t = scalar_t;
-            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
-                log_key.scalar_type(), "log_cache_slots_log", [&] {
-                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
-                });
-        })
-        AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
-            using cache_t = float;
-            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
-                log_key.scalar_type(), "log_cache_slots_log", [&] {
-                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
-                });
-        })
-        AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
-            using cache_t = __half;
-            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
-                log_key.scalar_type(), "log_cache_slots_log", [&] {
-                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
-                });
-        })
-        AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
-            using cache_t = __nv_bfloat16;
-            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
-                log_key.scalar_type(), "log_cache_slots_log", [&] {
-                    CALL_LOG_CACHE_SLOTS_KERNEL(cache_t, scalar_t);
-                });
-        })
-    );
+    // Dispatch based on cache dtype, log buffer dtype, and KV cache dtype
+    DISPATCH_BY_KV_CACHE_DTYPE(log_key.scalar_type(), kv_cache_dtype, CALL_LOG_CACHE_SLOTS_KERNEL);
 }
 
 // Copy-on-write: Restore rejected draft slots from log buffers

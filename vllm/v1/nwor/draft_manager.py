@@ -195,16 +195,6 @@ class DraftCommitManager:
         # Check if we should skip NWOR logging (but still write to cache)
         skip_nwor_logging = False
 
-        # TODO: Add FP8 dequantization support to log_cache_slots kernel
-        # Currently, the kernel uses static_cast which doesn't properly dequantize FP8
-        # For FP8 support, we need to pass scales and use proper dequantization
-        if kv_cache_dtype.startswith("fp8"):
-            if not hasattr(self, '_logged_fp8_warning'):
-                logger.warning("NWOR Copy-on-Write with FP8 KV cache is not yet supported. "
-                              "Disabling NWOR for this session.")
-                self._logged_fp8_warning = True
-            skip_nwor_logging = True
-
         # Validate storage
         for t, n in [(key, "key"), (value, "value"), (key_cache, "key_cache"),
                      (value_cache, "value_cache"), (slot_mapping, "slot_mapping")]:
@@ -308,6 +298,7 @@ class DraftCommitManager:
                     # Copy existing cache data to log using CUDA kernel
                     # This kernel will be captured in CUDA graph and replay automatically
                     # Fix stride order for Paged layout: stride(1) and stride(2) are swapped
+                    # FP8 support: Pass scales to kernel for proper dequantization
                     torch.ops._C_cache_ops.log_cache_slots(
                         key_cache,
                         value_cache,
@@ -318,6 +309,9 @@ class DraftCommitManager:
                         key_cache.stride(0),  # block_stride (same for both layouts)
                         key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),  # page_stride
                         key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),  # head_stride
+                        kv_cache_dtype,  # Pass dtype for FP8 dispatch
+                        k_scale if k_scale is not None else torch.empty(0, device=key.device),
+                        v_scale if v_scale is not None else torch.empty(0, device=key.device),
                     )
 
                     # Store which slots we actually logged (for clarity in commit())

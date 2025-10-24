@@ -947,7 +947,7 @@ NVRTC_LIBRARY:FILEPATH=/usr/local/cuda/lib64/libnvrtc.so
 SELECTED_KERNEL_LIST:STRING=selected
 
 //Name of the computer/site where compile is being run
-SITE:STRING=c49ef73757a8
+SITE:STRING=495f73a62dbb
 
 //Path to a library.
 TORCH_LIBRARY:FILEPATH=/usr/local/lib/python3.10/dist-packages/torch/lib/libtorch.so

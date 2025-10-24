@@ -23,7 +23,10 @@ void log_cache_slots(
     int64_t block_size,
     int64_t block_stride,
     int64_t page_stride,
-    int64_t head_stride
+    int64_t head_stride,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale
 );
 
 // Copy-on-Write: Restore rejected draft slots from log buffers.
