@@ -191,6 +191,17 @@ class DraftCommitManager:
                 self._drafts.clear()
             self._capturing = True
 
+        # TODO: Add FP8 dequantization support to log_cache_slots kernel
+        # Currently, the kernel uses static_cast which doesn't properly dequantize FP8
+        # For FP8 support, we need to pass scales and use proper dequantization
+        if kv_cache_dtype.startswith("fp8"):
+            if not hasattr(self, '_logged_fp8_warning'):
+                logger.warning("NWOR Copy-on-Write with FP8 KV cache is not yet supported. "
+                              "Disabling NWOR for this session.")
+                self._logged_fp8_warning = True
+            self.enabled = False
+            return
+
         # Validate storage
         for t, n in [(key, "key"), (value, "value"), (key_cache, "key_cache"),
                      (value_cache, "value_cache"), (slot_mapping, "slot_mapping")]:
@@ -272,7 +283,7 @@ class DraftCommitManager:
 
                 # Copy existing cache data to log using CUDA kernel
                 # This kernel will be captured in CUDA graph and replay automatically
-                # Pass real strides - kernel detects layout via head_stride == head_size
+                # Fix stride order for Paged layout: stride(1) and stride(2) are swapped
                 torch.ops._C_cache_ops.log_cache_slots(
                     key_cache,
                     value_cache,
@@ -280,9 +291,9 @@ class DraftCommitManager:
                     log_key_buffer,
                     log_value_buffer,
                     block_size,
-                    key_cache.stride(0),  # block_stride
-                    key_cache.stride(1),  # page_stride (kernel will detect layout)
-                    key_cache.stride(2),  # head_stride (kernel will detect layout)
+                    key_cache.stride(0),  # block_stride (same for both layouts)
+                    key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),  # page_stride
+                    key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),  # head_stride
                 )
 
                 # Store which slots we actually logged (for clarity in commit())
