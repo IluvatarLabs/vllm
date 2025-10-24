@@ -27,7 +27,6 @@ class DraftEntry:
     # Quantization
     scale_is_per_token: bool
     kv_cache_dtype: str
-    key_value_dtype: str
 
     # Keep tensors alive
     _key_ref: torch.Tensor
@@ -292,13 +291,6 @@ class DraftCommitManager:
         # Detect per-token scale
         scale_is_per_token = k_scale is not None and k_scale.numel() > 1
 
-        dtype_map = {
-            torch.float32: "fp32",
-            torch.float16: "fp16",
-            torch.bfloat16: "bf16",
-        }
-        key_value_dtype = dtype_map.get(key.dtype, "fp16")
-
         # Copy-on-write: Log existing cache data at draft slots before we overwrite
         layer_idx = len(self._drafts)  # Current layer index
         log_key_buffer = None
@@ -388,15 +380,13 @@ class DraftCommitManager:
 
         # ALWAYS write all tokens to real cache (attention will read this)
         # This must run even if NWOR logging is skipped (FP8, buffer overflow, etc.)
-        slot_mapping_kernel = (
-            slot_mapping if slot_mapping.dtype == torch.int64 else slot_mapping.to(torch.int64)
-        )
+        # Note: kernel handles both int32 and int64 slot_mapping internally
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
             key_cache,
             value_cache,
-            slot_mapping_kernel,
+            slot_mapping,
             kv_cache_dtype,
             k_scale if k_scale is not None else self._get_empty_tensor(key.device),
             v_scale if v_scale is not None else self._get_empty_tensor(key.device)
@@ -428,7 +418,6 @@ class DraftCommitManager:
             layout_id=layout_id,
             scale_is_per_token=scale_is_per_token,
             kv_cache_dtype=kv_cache_dtype,
-            key_value_dtype=key_value_dtype,
             _key_ref=key,
             _value_ref=value,
             _slot_ref=slot_mapping,  # Live buffer, convert to int32 on-demand
@@ -614,10 +603,9 @@ class DraftCommitManager:
                 continue
 
             chunk_mask = mask[entry.chunk_global_indices]
-            if not chunk_mask.any():
-                continue
-
             accepted_rows = chunk_mask.nonzero(as_tuple=False).squeeze(1)
+            if accepted_rows.numel() == 0:
+                continue
             local_positions = entry.chunk_local_positions.index_select(0, accepted_rows)
 
             key_accepted = entry._key_ref.index_select(0, local_positions)
