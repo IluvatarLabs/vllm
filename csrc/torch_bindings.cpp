@@ -691,15 +691,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
 
-  // NWOR: Commit draft KV tensors based on acceptance mask
-  cache_ops.def(
-      "commit_draft_layer(Tensor key, Tensor value,"
-      "                   Tensor! key_cache, Tensor! value_cache,"
-      "                   Tensor mask, Tensor slot_mapping,"
-      "                   Tensor k_scale, Tensor v_scale,"
-      "                   str kv_cache_dtype) -> ()");
-  cache_ops.impl("commit_draft_layer", torch::kCUDA, &vllm::commit_draft_layer);
-
   // NWOR Copy-on-Write: Restore rejected draft slots from log buffers
   cache_ops.def(
       "restore_rejected_drafts(Tensor log_key, Tensor log_value,"

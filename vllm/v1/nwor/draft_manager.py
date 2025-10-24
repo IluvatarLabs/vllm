@@ -10,32 +10,20 @@ logger = init_logger(__name__)
 
 @dataclass
 class DraftEntry:
-    """Draft KV entry with pointers for kernel dispatch."""
-    # Draft tensors (sources)
-    key_ptr: int
-    value_ptr: int
+    """Draft KV entry for copy-on-write restoration."""
+    # Validation
     num_tokens: int
-    num_heads: int
-    head_size: int
 
-    # Cache tensors (destinations)
-    key_cache_ptr: int
-    value_cache_ptr: int
+    # Cache layout metadata (for restore_rejected_drafts kernel)
     block_size: int
     block_stride: int
     page_stride: int
     head_stride: int
     layout_id: int  # 0=flash, 1=paged
 
-    # Slot mapping
-    slot_ptr: int
-
     # Quantization
-    k_scale_ptr: int  # 0 if None
-    v_scale_ptr: int
     scale_is_per_token: bool
     kv_cache_dtype: str
-    key_value_dtype: str
 
     # Keep tensors alive
     _key_ref: torch.Tensor
@@ -317,24 +305,14 @@ class DraftCommitManager:
         )
 
         self._drafts.append(DraftEntry(
-            key_ptr=key.data_ptr(),
-            value_ptr=value.data_ptr(),
             num_tokens=key.shape[0],
-            num_heads=key.shape[1],
-            head_size=key.shape[2],
-            key_cache_ptr=key_cache.data_ptr(),
-            value_cache_ptr=value_cache.data_ptr(),
             block_size=block_size,
             block_stride=key_cache.stride(0),
             page_stride=key_cache.stride(1),
             head_stride=key_cache.stride(2),
             layout_id=layout_id,
-            slot_ptr=slot_mapping.data_ptr(),
-            k_scale_ptr=k_scale.data_ptr() if k_scale is not None else 0,
-            v_scale_ptr=v_scale.data_ptr() if v_scale is not None else 0,
             scale_is_per_token=scale_is_per_token,
             kv_cache_dtype=kv_cache_dtype,
-            key_value_dtype=key_value_dtype,
             _key_ref=key,
             _value_ref=value,
             _slot_ref=slot_mapping,  # Live buffer, convert to int32 on-demand
@@ -414,23 +392,23 @@ class DraftCommitManager:
                     if entry.draft_slot_indices is None or entry.log_key_buffer is None:
                         continue
 
+                    # Recompute draft_slot_indices from live buffer (fixes CUDA graph replay staleness)
+                    draft_positions_tensor = torch.tensor(self._draft_positions, dtype=torch.long, device=device)
+                    draft_slot_indices = entry._slot_ref[draft_positions_tensor]
+
                     # Map rejected indices (original draft space) → log buffer indices (compressed space)
                     # The log buffers only contain valid (non-padding) slots, so we need cumsum mapping
                     # All operations stay on GPU for zero PCIe overhead
 
                     # Find valid slots (non-padding) - GPU op
-                    valid_mask = (entry.draft_slot_indices >= 0)
+                    valid_mask = (draft_slot_indices >= 0)
                     if not valid_mask.any():
                         continue
 
                     # Mark rejected drafts in original space - GPU op
-                    rejected_mask_full = torch.zeros_like(entry.draft_slot_indices, dtype=torch.bool)
+                    rejected_mask_full = torch.zeros_like(draft_slot_indices, dtype=torch.bool)
                     if rejected_indices.numel() > 0:
-                        # Filter out-of-bounds indices (can happen with CUDA graph replay)
-                        max_valid_idx = entry.draft_slot_indices.shape[0]
-                        valid_rejected = rejected_indices[rejected_indices < max_valid_idx]
-                        if valid_rejected.numel() > 0:
-                            rejected_mask_full[valid_rejected] = True  # GPU[GPU] scatter
+                        rejected_mask_full[rejected_indices] = True  # GPU[GPU] scatter
 
                     # Combine: rejected AND valid - GPU op
                     rejected_and_valid = rejected_mask_full & valid_mask
@@ -443,7 +421,7 @@ class DraftCommitManager:
                     rejected_log_indices = valid_positions[rejected_and_valid]
 
                     # Extract slots and log data - all GPU operations
-                    rejected_slots = entry.draft_slot_indices[rejected_and_valid]
+                    rejected_slots = draft_slot_indices[rejected_and_valid]
                     rejected_log_key = entry.log_key_buffer[rejected_log_indices]
                     rejected_log_value = entry.log_value_buffer[rejected_log_indices]
 
