@@ -83,6 +83,7 @@ class DraftCommitManager:
         self._log_value_buffers: Dict[int, torch.Tensor] = {}
         self._log_k_scale_buffers: Dict[int, torch.Tensor] = {}
         self._log_v_scale_buffers: Dict[int, torch.Tensor] = {}
+        self._slot_indices_buffers: Dict[int, torch.Tensor] = {}  # Persistent slot indices for CUDA graph
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
             if self._emit_metrics:
@@ -257,8 +258,8 @@ class DraftCommitManager:
             # Filter out -1 (padding) slots
             valid_mask = draft_slot_indices >= 0
             if valid_mask.any():
-                valid_draft_slots = draft_slot_indices[valid_mask]
-                num_valid_drafts = valid_draft_slots.shape[0]
+                # Count valid slots first
+                num_valid_drafts = valid_mask.sum().item()
 
                 # Allocate log buffers lazily (first time for this layer)
                 max_size = 512  # Match CUDA graph allocation
@@ -280,6 +281,10 @@ class DraftCommitManager:
                         (max_size, value.shape[1], value.shape[2]),
                         dtype=value.dtype, device=value.device
                     )
+                    # Persistent buffer for slot indices (CUDA graph requirement)
+                    self._slot_indices_buffers[layer_idx] = torch.empty(
+                        max_size, dtype=torch.int64, device=key.device
+                    )
                     if scale_is_per_token:
                         self._log_k_scale_buffers[layer_idx] = torch.empty(
                             max_size, dtype=k_scale.dtype, device=k_scale.device
@@ -290,6 +295,12 @@ class DraftCommitManager:
 
                 # Only perform NWOR logging if not skipping
                 if not skip_nwor_logging:
+                    # Use persistent buffer for slot indices (CUDA graph requirement)
+                    # Fill buffer with valid slot indices
+                    slot_indices_buffer = self._slot_indices_buffers[layer_idx]
+                    slot_indices_buffer[:num_valid_drafts] = draft_slot_indices[valid_mask]
+                    valid_draft_slots = slot_indices_buffer[:num_valid_drafts]
+
                     # Get log buffer slices for this window
                     log_key_buffer = self._log_key_buffers[layer_idx][:num_valid_drafts]
                     log_value_buffer = self._log_value_buffers[layer_idx][:num_valid_drafts]
@@ -300,7 +311,7 @@ class DraftCommitManager:
                     torch.ops._C_cache_ops.log_cache_slots(
                         key_cache,
                         value_cache,
-                        valid_draft_slots,  # int64 slot indices
+                        valid_draft_slots,  # int64 slot indices from persistent buffer
                         log_key_buffer,
                         log_value_buffer,
                         block_size,
