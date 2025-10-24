@@ -1,0 +1,21 @@
+# ninja log v7
+0	5	1761263495377296490	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-mkdir	658493e329298747
+0	5	1761263495377296490	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-mkdir	658493e329298747
+6	3676	1761263499047352373	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-download	acc7705c584277ea
+6	3676	1761263499047352373	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-download	acc7705c584277ea
+3676	3685	1761263499048352389	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-update	2c9f184e50dec171
+3676	3685	1761263499048352389	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-update	2c9f184e50dec171
+3685	3689	1761263499060352571	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-patch	a8bc4a1d0f8f1b7
+3685	3689	1761263499060352571	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-patch	a8bc4a1d0f8f1b7
+3689	3693	1761263499065352647	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-configure	5d13e4e2cd839b9b
+3689	3693	1761263499065352647	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-configure	5d13e4e2cd839b9b
+3693	3698	1761263499069352708	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-build	af73c8997f280830
+3693	3698	1761263499069352708	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-build	af73c8997f280830
+3698	3702	1761263499073352769	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-install	7d99633dcf0acbb2
+3698	3702	1761263499073352769	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-install	7d99633dcf0acbb2
+3702	3707	1761263499078352845	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-test	b261227c6a58d089
+3702	3707	1761263499078352845	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-test	b261227c6a58d089
+3707	3713	1761263499085352952	CMakeFiles/cutlass-populate-complete	3e51c945837215e5
+3707	3713	1761263499085352952	cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-done	3e51c945837215e5
+3707	3713	1761263499085352952	/workspace/vllm/build_docker/_deps/cutlass-subbuild/CMakeFiles/cutlass-populate-complete	3e51c945837215e5
+3707	3713	1761263499085352952	/workspace/vllm/build_docker/_deps/cutlass-subbuild/cutlass-populate-prefix/src/cutlass-populate-stamp/cutlass-populate-done	3e51c945837215e5

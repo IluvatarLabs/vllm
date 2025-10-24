@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/CMakeFiles/vllm-flash-attn-populate"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/CMakeFiles/vllm-flash-attn-populate.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/CMakeFiles/vllm-flash-attn-populate-complete.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-build.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-configure.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-download.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-install.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-mkdir.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-patch.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-test.rule"
+		},
+		{
+			"file" : "/workspace/vllm/build_docker/_deps/vllm-flash-attn-subbuild/vllm-flash-attn-populate-prefix/src/vllm-flash-attn-populate-stamp/vllm-flash-attn-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"vllm-flash-attn-populate"
+		],
+		"name" : "vllm-flash-attn-populate"
+	}
+}

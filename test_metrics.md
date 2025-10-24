@@ -1,0 +1,43 @@
+# NWOR/SCV Microbenchmark
+
+## Configuration
+
+```json
+{
+  "target_model": "meta-llama/Llama-3.2-3B-Instruct",
+  "drafter_model": "linborui/EAGLE-Llama-3.2-3B-Instruct",
+  "scenario": "short",
+  "num_requests": 8,
+  "draft_tokens": 4,
+  "batches": 1,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "tensor_parallel_size": 1,
+  "prompt_count": 100,
+  "prompt_shuffle_seed": 1234,
+  "max_model_len": 8192,
+  "max_new_tokens": 32,
+  "warmup_steps": 1,
+  "measure_steps": 1,
+  "spec_method": "eagle",
+  "nwor_modes": [
+    "off",
+    "stage"
+  ],
+  "scv_modes": [
+    "off"
+  ],
+  "enable_ncu": false,
+  "ncu_metrics": "dram__bytes_write.sum,lts__t_sectors_op_write.sum",
+  "enable_nsys": false,
+  "profile_only": false,
+  "output_path": "test_metrics.json"
+}
+```
+
+## Summary
+
+| SCV Mode | NWOR Mode | Batches | Avg Latency (s) | P50 (s) | P95 (s) | Tokens Staged | Tokens Committed | Writes Saved % | Avg Accepted/window | Acceptance Ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| off | off | 1 | 0.5532 | 0.5532 | 0.5532 | 0 | 0 | 0.00 | 0.63 | 0.16 |
+| off | stage | 1 | 0.7401 | 0.7401 | 0.7401 | 0 | 0 | 0.00 | 0.64 | 0.16 |

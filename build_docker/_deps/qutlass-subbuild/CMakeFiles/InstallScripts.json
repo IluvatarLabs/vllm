@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/workspace/vllm/build_docker/_deps/qutlass-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
