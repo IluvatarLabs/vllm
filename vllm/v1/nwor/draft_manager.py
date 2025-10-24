@@ -286,12 +286,17 @@ class DraftCommitManager:
                 block_indices = valid_draft_slots // block_size
                 block_offsets = valid_draft_slots % block_size
 
-                # Use advanced indexing to gather cache rows
+                # Use layout-aware indexing to gather cache rows
                 for i in range(num_valid_drafts):
                     block_idx = block_indices[i].item()
                     block_offset = block_offsets[i].item()
-                    log_key_buffer[i] = key_cache[block_idx, block_offset]
-                    log_value_buffer[i] = value_cache[block_idx, block_offset]
+
+                    if layout_id == 0:  # Flash layout: [num_blocks, block_size, num_heads, head_size]
+                        log_key_buffer[i] = key_cache[block_idx, block_offset]
+                        log_value_buffer[i] = value_cache[block_idx, block_offset]
+                    else:  # Paged layout: [num_blocks, num_heads, block_size, head_size]
+                        log_key_buffer[i] = key_cache[block_idx, :, block_offset]
+                        log_value_buffer[i] = value_cache[block_idx, :, block_offset]
 
                 # Log scales if using per-token quantization
                 if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
@@ -371,10 +376,10 @@ class DraftCommitManager:
                 f"mask size {mask.shape[0]} != num drafts {len(self._draft_positions)}"
             assert all(e.num_tokens == num_tokens for e in self._drafts)
 
-            # Prepare draft mask
+            # Prepare draft mask (keep on GPU for zero-copy overhead)
             if mask.dtype != torch.bool:
                 mask = mask.to(dtype=torch.bool)
-            draft_mask = mask.to('cpu') if mask.device.type != 'cpu' else mask
+            draft_mask = mask.to(device)  # Force to GPU, no CPU transfer
 
             if self._emit_metrics:
                 mask_true = int(draft_mask.sum().item())
@@ -409,55 +414,65 @@ class DraftCommitManager:
                     if entry.draft_slot_indices is None or entry.log_key_buffer is None:
                         continue
 
-                    # Get rejected slots for this layer
-                    # Filter out -1 (padding) slots that may have been in draft_slot_indices
-                    valid_mask = entry.draft_slot_indices >= 0
+                    # Map rejected indices (original draft space) → log buffer indices (compressed space)
+                    # The log buffers only contain valid (non-padding) slots, so we need cumsum mapping
+                    # All operations stay on GPU for zero PCIe overhead
+
+                    # Find valid slots (non-padding) - GPU op
+                    valid_mask = (entry.draft_slot_indices >= 0)
                     if not valid_mask.any():
                         continue
 
-                    # Map rejected indices to valid draft indices
-                    # rejected_indices are indices into the draft_mask (which only covers valid drafts)
-                    # We need to restore only the rejected valid drafts
-                    valid_draft_slots = entry.draft_slot_indices[valid_mask]
+                    # Mark rejected drafts in original space - GPU op
+                    rejected_mask_full = torch.zeros_like(entry.draft_slot_indices, dtype=torch.bool)
+                    if rejected_indices.numel() > 0:
+                        # Filter out-of-bounds indices (can happen with CUDA graph replay)
+                        max_valid_idx = entry.draft_slot_indices.shape[0]
+                        valid_rejected = rejected_indices[rejected_indices < max_valid_idx]
+                        if valid_rejected.numel() > 0:
+                            rejected_mask_full[valid_rejected] = True  # GPU[GPU] scatter
 
-                    # Build mask for which valid drafts were rejected
-                    rejected_valid_mask = torch.zeros(valid_mask.sum().item(), dtype=torch.bool, device='cpu')
-                    for i in rejected_indices:
-                        if i < rejected_valid_mask.shape[0]:
-                            rejected_valid_mask[i] = True
+                    # Combine: rejected AND valid - GPU op
+                    rejected_and_valid = rejected_mask_full & valid_mask
+                    if not rejected_and_valid.any():
+                        continue
 
-                    rejected_valid_indices = rejected_valid_mask.nonzero(as_tuple=False).squeeze(1)
+                    # Map original indices → compressed log buffer indices using cumsum - GPU op
+                    # valid_positions[i] = position of original index i in the compressed log array
+                    valid_positions = valid_mask.cumsum(dim=0) - 1
+                    rejected_log_indices = valid_positions[rejected_and_valid]
 
-                    if rejected_valid_indices.numel() > 0:
-                        # Get log buffers for rejected drafts
-                        rejected_log_key = entry.log_key_buffer[rejected_valid_indices]
-                        rejected_log_value = entry.log_value_buffer[rejected_valid_indices]
-                        rejected_slots = valid_draft_slots[rejected_valid_indices]
+                    # Extract slots and log data - all GPU operations
+                    rejected_slots = entry.draft_slot_indices[rejected_and_valid]
+                    rejected_log_key = entry.log_key_buffer[rejected_log_indices]
+                    rejected_log_value = entry.log_value_buffer[rejected_log_indices]
 
-                        # Convert to int32 for kernel (kernel expects int32)
-                        rejected_slots_int32 = rejected_slots.to(dtype=torch.int32)
+                    # Convert to int32 for kernel (stays on GPU)
+                    rejected_slots_int32 = rejected_slots.to(dtype=torch.int32)
 
-                        # Get scale buffers if needed
-                        k_scale = entry._k_scale_ref if entry._k_scale_ref is not None else torch.empty(0, device=device)
-                        v_scale = entry._v_scale_ref if entry._v_scale_ref is not None else torch.empty(0, device=device)
-                        rejected_k_scale = entry.log_k_scale_buffer[rejected_valid_indices] if entry.log_k_scale_buffer is not None else torch.empty(0, device=device)
-                        rejected_v_scale = entry.log_v_scale_buffer[rejected_valid_indices] if entry.log_v_scale_buffer is not None else torch.empty(0, device=device)
+                    # Get scale buffers using same log indices (no placeholder allocations)
+                    if entry.log_k_scale_buffer is not None:
+                        rejected_k_scale = entry.log_k_scale_buffer[rejected_log_indices]
+                        rejected_v_scale = entry.log_v_scale_buffer[rejected_log_indices]
+                    else:
+                        rejected_k_scale = torch.empty(0, device=device)
+                        rejected_v_scale = torch.empty(0, device=device)
 
-                        # Launch restore kernel
-                        torch.ops._C_cache_ops.restore_rejected_drafts(
-                            rejected_log_key,
-                            rejected_log_value,
-                            entry._key_cache_ref,
-                            entry._value_cache_ref,
-                            rejected_slots_int32,
-                            entry.block_size,
-                            entry.block_stride,
-                            entry.page_stride,
-                            entry.head_stride,
-                            entry.kv_cache_dtype,
-                            rejected_k_scale,
-                            rejected_v_scale,
-                        )
+                    # Launch restore kernel
+                    torch.ops._C_cache_ops.restore_rejected_drafts(
+                        rejected_log_key,
+                        rejected_log_value,
+                        entry._key_cache_ref,
+                        entry._value_cache_ref,
+                        rejected_slots_int32,
+                        entry.block_size,
+                        entry.block_stride,
+                        entry.page_stride,
+                        entry.head_stride,
+                        entry.kv_cache_dtype,
+                        rejected_k_scale,
+                        rejected_v_scale,
+                    )
 
             # Optional sync (ISSUE #6: Make conditional for debugging)
             import os
