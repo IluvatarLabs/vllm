@@ -260,6 +260,15 @@ class DraftCommitManager:
 
                 # Allocate log buffers lazily (first time for this layer)
                 max_size = 512  # Match CUDA graph allocation
+
+                # Validate against hardcoded buffer size to prevent overflow
+                if num_valid_drafts > max_size:
+                    logger.error(
+                        f"NWOR: Too many draft tokens ({num_valid_drafts} > {max_size}), "
+                        f"disabling NWOR for this window to prevent buffer overflow"
+                    )
+                    self.enabled = False
+                    return
                 if layer_idx not in self._log_key_buffers:
                     self._log_key_buffers[layer_idx] = torch.empty(
                         (max_size, key.shape[1], key.shape[2]),
