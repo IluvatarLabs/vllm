@@ -1,8 +1,11 @@
 """Draft Commit Manager for NWOR (greenfield implementation)."""
 
+from bisect import bisect_left
 from dataclasses import dataclass, replace
-from typing import Optional, List, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
+
 import torch
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -24,6 +27,7 @@ class DraftEntry:
     # Quantization
     scale_is_per_token: bool
     kv_cache_dtype: str
+    key_value_dtype: str
 
     # Keep tensors alive
     _key_ref: torch.Tensor
@@ -39,8 +43,10 @@ class DraftEntry:
     log_value_buffer: Optional[torch.Tensor] = None
     log_k_scale_buffer: Optional[torch.Tensor] = None  # For per-token FP8 scales
     log_v_scale_buffer: Optional[torch.Tensor] = None
-    draft_slot_indices: Optional[torch.Tensor] = None  # Full array with -1s for commit() masking
-    logged_slots: Optional[torch.Tensor] = None  # Filtered slots actually logged (no -1s)
+    chunk_global_indices: Optional[torch.Tensor] = None  # All draft indices for this chunk
+    chunk_local_positions: Optional[torch.Tensor] = None  # Chunk-local offsets for those indices
+    chunk_logged_indices: Optional[torch.Tensor] = None  # Positions within chunk_global_indices that were logged
+    chunk_logged_local: Optional[torch.Tensor] = None  # Chunk-local offsets for logged entries
 
 
 CacheKey = Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]
@@ -54,13 +60,20 @@ class DraftCacheEntry:
     num_layers: int
 
 
+@dataclass(frozen=True)
+class ChunkSlice:
+    """Chunk-local mapping for draft indices."""
+    global_indices: torch.Tensor  # Indices into _draft_positions for drafts in this chunk
+    local_positions: torch.Tensor  # Chunk-local offsets corresponding to global_indices
+
+
 class DraftCommitManager:
     """Manages draft buffers for NWOR with minimal overhead."""
 
     def __init__(self):
         import os
-        nwor_mode = os.getenv("VLLM_NWOR_MODE", "off")
-        self._nwor_enabled = (nwor_mode == "stage")  # Persistent config flag
+        nwor_mode = os.getenv("VLLM_NWOR_MODE", "").lower()
+        self._nwor_enabled = (nwor_mode != "off")  # Persistent config flag
         self.enabled = False  # Per-window active flag
         self._drafts: List[DraftEntry] = []
         self._logged_failure = False
@@ -84,6 +97,7 @@ class DraftCommitManager:
         self._log_k_scale_buffers: Dict[int, torch.Tensor] = {}
         self._log_v_scale_buffers: Dict[int, torch.Tensor] = {}
         self._slot_indices_buffers: Dict[int, torch.Tensor] = {}  # Persistent slot indices for CUDA graph
+        self._chunk_slices: Dict[Tuple[int, int, int], ChunkSlice] = {}
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
             if self._emit_metrics:
@@ -102,6 +116,7 @@ class DraftCommitManager:
         self._draft_positions.clear()
         self._cache_key = None
         self._capturing = False
+        self._chunk_slices.clear()
 
         if spec_decode_metadata is None:
             self.enabled = False
@@ -139,16 +154,23 @@ class DraftCommitManager:
 
         # ALWAYS recompute positions from live metadata (layout-specific)
         logits_list = logits_indices_cpu.tolist()
-        target_list = target_indices_cpu.tolist()
         positions: List[int] = []
-        for target_idx in target_list:
-            next_idx = target_idx + 1
-            assert next_idx < len(logits_list), (
-                f"Draft position out of bounds: target_idx={target_idx}, "
-                f"logits_len={len(logits_list)}"
+        token_cursor = 0
+        for num_drafts in spec_decode_metadata.num_draft_tokens:
+            assert token_cursor < len(logits_list), (
+                f"token_cursor {token_cursor} exceeds logits length {len(logits_list)}"
             )
-            positions.append(next_idx)
+            for offset in range(num_drafts):
+                idx = token_cursor + 1 + offset
+                assert idx < len(logits_list), (
+                    f"Draft position out of bounds: idx={idx}, logits_len={len(logits_list)}"
+                )
+                positions.append(int(logits_list[idx]))
+            token_cursor += num_drafts + 1
         self._draft_positions.extend(positions)
+        if __debug__:
+            assert self._draft_positions == sorted(self._draft_positions), \
+                "NWOR draft positions must be sorted"
 
         # Update or create cache entry with new positions
         if cached is None:
@@ -170,6 +192,50 @@ class DraftCommitManager:
         self.enabled = False
         self._cache_key = None
         self._capturing = False
+        self._chunk_slices.clear()
+
+    def _get_chunk_slice(self, slot_mapping: torch.Tensor) -> ChunkSlice:
+        """Return cached chunk metadata for the given slot mapping view."""
+        assert slot_mapping.dim() == 1 and slot_mapping.stride(0) == 1, \
+            "NWOR requires contiguous 1D slot_mapping views"
+        cache_key = (
+            slot_mapping.data_ptr(),
+            int(slot_mapping.storage_offset()),
+            int(slot_mapping.shape[0]),
+        )
+        chunk_slice = self._chunk_slices.get(cache_key)
+        if chunk_slice is not None:
+            return chunk_slice
+
+        chunk_start = int(slot_mapping.storage_offset())
+        chunk_len = int(slot_mapping.shape[0])
+        positions = self._draft_positions
+        device = slot_mapping.device
+
+        if chunk_len == 0:
+            global_indices = torch.empty(0, dtype=torch.long, device=device)
+            local_positions = torch.empty(0, dtype=torch.long, device=device)
+        else:
+            start_idx = bisect_left(positions, chunk_start)
+            end_idx = bisect_left(positions, chunk_start + chunk_len)
+            if end_idx > start_idx:
+                global_indices = torch.arange(start_idx, end_idx, dtype=torch.long, device=device)
+                local_offsets = torch.tensor(
+                    [positions[i] - chunk_start for i in range(start_idx, end_idx)],
+                    dtype=torch.long,
+                    device=device,
+                )
+                local_positions = local_offsets
+            else:
+                global_indices = torch.empty(0, dtype=torch.long, device=device)
+                local_positions = torch.empty(0, dtype=torch.long, device=device)
+
+        chunk_slice = ChunkSlice(
+            global_indices=global_indices,
+            local_positions=local_positions,
+        )
+        self._chunk_slices[cache_key] = chunk_slice
+        return chunk_slice
 
     def stage_layer(
         self,
@@ -223,8 +289,11 @@ class DraftCommitManager:
         # Detect per-token scale
         scale_is_per_token = k_scale is not None and k_scale.numel() > 1
 
-        # Map dtype
-        dtype_map = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
+        dtype_map = {
+            torch.float32: "fp32",
+            torch.float16: "fp16",
+            torch.bfloat16: "bf16",
+        }
         key_value_dtype = dtype_map.get(key.dtype, "fp16")
 
         # Copy-on-write: Log existing cache data at draft slots before we overwrite
@@ -233,104 +302,100 @@ class DraftCommitManager:
         log_value_buffer = None
         log_k_scale_buffer = None
         log_v_scale_buffer = None
-        draft_slot_indices = None
+        chunk_global_indices = None
+        chunk_local_positions = None
+        chunk_logged_indices = None
+        chunk_logged_local = None
 
-        if len(self._draft_positions) > 0:
-            # Get draft positions as tensor
-            draft_positions_tensor = torch.tensor(
-                self._draft_positions, dtype=torch.long, device=key.device
-            )
+        if self._draft_positions:
+            chunk_slice = self._get_chunk_slice(slot_mapping)
+            chunk_global_indices = chunk_slice.global_indices
+            chunk_local_positions = chunk_slice.local_positions
 
-            # Map draft positions to cache slots (avoid indexing with -1)
-            # slot_mapping shape: [num_tokens], draft_positions are indices into this
-            draft_slot_indices = slot_mapping[draft_positions_tensor]
+            if chunk_global_indices.numel() > 0 and not skip_nwor_logging:
+                current_slots = slot_mapping.index_select(0, chunk_local_positions)
+                valid_mask = current_slots >= 0
+                if valid_mask.any():
+                    logged_indices = valid_mask.nonzero(as_tuple=False).squeeze(1)
+                    num_logged = int(logged_indices.numel())
 
-            # Filter out -1 (padding) slots
-            valid_mask = draft_slot_indices >= 0
-            if valid_mask.any():
-                # Count valid slots first
-                num_valid_drafts = valid_mask.sum().item()
-
-                # Allocate log buffers lazily (first time for this layer)
-                max_size = 512  # Match CUDA graph allocation
-
-                # Validate against hardcoded buffer size to prevent overflow
-                if num_valid_drafts > max_size:
-                    logger.error(
-                        f"NWOR: Too many draft tokens ({num_valid_drafts} > {max_size}), "
-                        f"disabling NWOR for this window to prevent buffer overflow"
-                    )
-                    skip_nwor_logging = True
-
-                if not skip_nwor_logging and layer_idx not in self._log_key_buffers:
-                    self._log_key_buffers[layer_idx] = torch.empty(
-                        (max_size, key.shape[1], key.shape[2]),
-                        dtype=key.dtype, device=key.device
-                    )
-                    self._log_value_buffers[layer_idx] = torch.empty(
-                        (max_size, value.shape[1], value.shape[2]),
-                        dtype=value.dtype, device=value.device
-                    )
-                    # Persistent buffer for slot indices (CUDA graph requirement)
-                    self._slot_indices_buffers[layer_idx] = torch.empty(
-                        max_size, dtype=torch.int64, device=key.device
-                    )
-                    if scale_is_per_token:
-                        self._log_k_scale_buffers[layer_idx] = torch.empty(
-                            max_size, dtype=k_scale.dtype, device=k_scale.device
+                    max_size = 512  # Match CUDA graph allocation
+                    if num_logged > max_size:
+                        logger.error(
+                            f"NWOR: Too many draft tokens ({num_logged} > {max_size}), "
+                            "disabling NWOR for this window to prevent buffer overflow"
                         )
-                        self._log_v_scale_buffers[layer_idx] = torch.empty(
-                            max_size, dtype=v_scale.dtype, device=v_scale.device
-                        )
+                        skip_nwor_logging = True
+                    else:
+                        if layer_idx not in self._log_key_buffers:
+                            self._log_key_buffers[layer_idx] = torch.empty(
+                                (max_size, key.shape[1], key.shape[2]),
+                                dtype=key.dtype,
+                                device=key.device,
+                            )
+                            self._log_value_buffers[layer_idx] = torch.empty(
+                                (max_size, value.shape[1], value.shape[2]),
+                                dtype=value.dtype,
+                                device=value.device,
+                            )
+                            self._slot_indices_buffers[layer_idx] = torch.empty(
+                                max_size, dtype=torch.int64, device=key.device
+                            )
+                            if scale_is_per_token:
+                                assert k_scale is not None and v_scale is not None
+                                self._log_k_scale_buffers[layer_idx] = torch.empty(
+                                    max_size, dtype=k_scale.dtype, device=k_scale.device
+                                )
+                                self._log_v_scale_buffers[layer_idx] = torch.empty(
+                                    max_size, dtype=v_scale.dtype, device=v_scale.device
+                                )
 
-                # Only perform NWOR logging if not skipping
-                if not skip_nwor_logging:
-                    # Use persistent buffer for slot indices (CUDA graph requirement)
-                    # Fill buffer with valid slot indices
-                    slot_indices_buffer = self._slot_indices_buffers[layer_idx]
-                    slot_indices_buffer[:num_valid_drafts] = draft_slot_indices[valid_mask]
-                    valid_draft_slots = slot_indices_buffer[:num_valid_drafts]
+                        if not skip_nwor_logging:
+                            chunk_logged_local = chunk_local_positions[logged_indices]
+                            chunk_logged_indices = logged_indices
+                            logged_slots = current_slots[logged_indices].to(torch.int64)
 
-                    # Get log buffer slices for this window
-                    log_key_buffer = self._log_key_buffers[layer_idx][:num_valid_drafts]
-                    log_value_buffer = self._log_value_buffers[layer_idx][:num_valid_drafts]
+                            slot_indices_buffer = self._slot_indices_buffers[layer_idx]
+                            slot_indices_buffer[:num_logged] = logged_slots
+                            logged_slots_buffer = slot_indices_buffer[:num_logged]
 
-                    # Copy existing cache data to log using CUDA kernel
-                    # This kernel will be captured in CUDA graph and replay automatically
-                    # Fix stride order for Paged layout: stride(1) and stride(2) are swapped
-                    # FP8 support: Pass scales to kernel for proper dequantization
-                    torch.ops._C_cache_ops.log_cache_slots(
-                        key_cache,
-                        value_cache,
-                        valid_draft_slots,  # int64 slot indices from persistent buffer
-                        log_key_buffer,
-                        log_value_buffer,
-                        block_size,
-                        key_cache.stride(0),  # block_stride (same for both layouts)
-                        key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),  # page_stride
-                        key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),  # head_stride
-                        kv_cache_dtype,  # Pass dtype for FP8 dispatch
-                        k_scale if k_scale is not None else torch.empty(0, device=key.device),
-                        v_scale if v_scale is not None else torch.empty(0, device=key.device),
-                    )
+                            log_key_buffer = self._log_key_buffers[layer_idx][:num_logged]
+                            log_value_buffer = self._log_value_buffers[layer_idx][:num_logged]
 
-                    # Store which slots we actually logged (for clarity in commit())
-                    logged_slots = valid_draft_slots
+                            torch.ops._C_cache_ops.log_cache_slots(
+                                key_cache,
+                                value_cache,
+                                logged_slots_buffer,
+                                log_key_buffer,
+                                log_value_buffer,
+                                block_size,
+                                key_cache.stride(0),
+                                key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),
+                                key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),
+                                kv_cache_dtype,
+                                k_scale if k_scale is not None else torch.empty(0, device=key.device),
+                                v_scale if v_scale is not None else torch.empty(0, device=key.device),
+                            )
 
-                    # Log FP8 scales separately (Python is simpler than kernel for this)
-                    if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
-                        log_k_scale_buffer = self._log_k_scale_buffers[layer_idx][:num_valid_drafts]
-                        log_v_scale_buffer = self._log_v_scale_buffers[layer_idx][:num_valid_drafts]
-                        # Map draft positions to scale indices (only valid drafts)
-                        draft_positions_in_batch = draft_positions_tensor[valid_mask]
-                        log_k_scale_buffer.copy_(k_scale[draft_positions_in_batch])
-                        log_v_scale_buffer.copy_(v_scale[draft_positions_in_batch])
+                            if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
+                                assert k_scale is not None and v_scale is not None
+                                log_k_scale_buffer = self._log_k_scale_buffers[layer_idx][:num_logged]
+                                log_v_scale_buffer = self._log_v_scale_buffers[layer_idx][:num_logged]
+                                log_k_scale_buffer.copy_(k_scale.index_select(0, chunk_logged_local))
+                                log_v_scale_buffer.copy_(v_scale.index_select(0, chunk_logged_local))
 
         # ALWAYS write all tokens to real cache (attention will read this)
         # This must run even if NWOR logging is skipped (FP8, buffer overflow, etc.)
+        slot_mapping_kernel = (
+            slot_mapping if slot_mapping.dtype == torch.int64 else slot_mapping.to(torch.int64)
+        )
         torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key, value, key_cache, value_cache,
-            slot_mapping, kv_cache_dtype,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping_kernel,
+            kv_cache_dtype,
             k_scale if k_scale is not None else torch.empty(0, device=key.device),
             v_scale if v_scale is not None else torch.empty(0, device=key.device)
         )
@@ -340,6 +405,16 @@ class DraftCommitManager:
         if skip_nwor_logging:
             self.enabled = False
             return
+
+        if chunk_global_indices is None or chunk_global_indices.numel() == 0:
+            # No drafts in this chunk – nothing to track for commit.
+            return
+
+        # Ensure chunk-local metadata defaults
+        if chunk_logged_indices is None:
+            chunk_logged_indices = torch.empty(0, dtype=torch.long, device=key.device)
+        if chunk_logged_local is None:
+            chunk_logged_local = torch.empty(0, dtype=torch.long, device=key.device)
 
         # Create DraftEntry for NWOR restore (only if logging succeeded)
         self._drafts.append(DraftEntry(
@@ -351,6 +426,7 @@ class DraftCommitManager:
             layout_id=layout_id,
             scale_is_per_token=scale_is_per_token,
             kv_cache_dtype=kv_cache_dtype,
+            key_value_dtype=key_value_dtype,
             _key_ref=key,
             _value_ref=value,
             _slot_ref=slot_mapping,  # Live buffer, convert to int32 on-demand
@@ -363,8 +439,10 @@ class DraftCommitManager:
             log_value_buffer=log_value_buffer,
             log_k_scale_buffer=log_k_scale_buffer,
             log_v_scale_buffer=log_v_scale_buffer,
-            draft_slot_indices=draft_slot_indices,  # Full array with -1s for commit() masking
-            logged_slots=logged_slots if len(self._draft_positions) > 0 else None,  # Filtered slots actually logged
+            chunk_global_indices=chunk_global_indices,
+            chunk_local_positions=chunk_local_positions,
+            chunk_logged_indices=chunk_logged_indices,
+            chunk_logged_local=chunk_logged_local,
         ))
 
     def commit(self, mask: torch.Tensor) -> int:
@@ -419,77 +497,54 @@ class DraftCommitManager:
                 self._num_draft_accepted = int(draft_mask.sum().item())
                 self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
 
-            # Copy-on-write: Accepted tokens are already in cache from reshape_and_cache_flash
-            # Only restore rejected drafts from log
-            rejected_mask = ~draft_mask
-            rejected_indices = rejected_mask.nonzero(as_tuple=False).squeeze(1)
+            # Copy-on-write: Accepted tokens are already in cache from reshape_and_cache_flash.
+            # Only restore rejected drafts from log, using chunk-local metadata.
+            for entry in self._drafts:
+                if (
+                    entry.chunk_global_indices is None
+                    or entry.chunk_global_indices.numel() == 0
+                    or entry.chunk_logged_indices is None
+                    or entry.chunk_logged_indices.numel() == 0
+                    or entry.log_key_buffer is None
+                ):
+                    continue
 
-            if rejected_indices.numel() > 0:
-                # Restore rejected slots from log for each layer
-                for entry in self._drafts:
-                    # Skip if no log buffers (shouldn't happen, but be safe)
-                    if entry.draft_slot_indices is None or entry.log_key_buffer is None:
-                        continue
+                chunk_mask = draft_mask[entry.chunk_global_indices]
+                logged_mask = chunk_mask[entry.chunk_logged_indices]
+                if logged_mask.all():
+                    continue
 
-                    # Recompute draft_slot_indices from live buffer (fixes CUDA graph replay staleness)
-                    draft_positions_tensor = torch.tensor(self._draft_positions, dtype=torch.long, device=device)
-                    draft_slot_indices = entry._slot_ref[draft_positions_tensor]
+                rejected_rows = (~logged_mask).nonzero(as_tuple=False).squeeze(1)
+                if rejected_rows.numel() == 0:
+                    continue
 
-                    # Map rejected indices (original draft space) → log buffer indices (compressed space)
-                    # The log buffers only contain valid (non-padding) slots, so we need cumsum mapping
-                    # All operations stay on GPU for zero PCIe overhead
+                current_slots = entry._slot_ref.index_select(0, entry.chunk_logged_local)
+                rejected_slots_int32 = current_slots[rejected_rows].to(dtype=torch.int32)
 
-                    # Find valid slots (non-padding) - GPU op
-                    valid_mask = (draft_slot_indices >= 0)
-                    if not valid_mask.any():
-                        continue
+                rejected_log_key = entry.log_key_buffer[rejected_rows]
+                rejected_log_value = entry.log_value_buffer[rejected_rows]
 
-                    # Mark rejected drafts in original space - GPU op
-                    rejected_mask_full = torch.zeros_like(draft_slot_indices, dtype=torch.bool)
-                    if rejected_indices.numel() > 0:
-                        rejected_mask_full[rejected_indices] = True  # GPU[GPU] scatter
+                if entry.log_k_scale_buffer is not None:
+                    rejected_k_scale = entry.log_k_scale_buffer[rejected_rows]
+                    rejected_v_scale = entry.log_v_scale_buffer[rejected_rows]
+                else:
+                    rejected_k_scale = torch.empty(0, device=device)
+                    rejected_v_scale = torch.empty(0, device=device)
 
-                    # Combine: rejected AND valid - GPU op
-                    rejected_and_valid = rejected_mask_full & valid_mask
-                    if not rejected_and_valid.any():
-                        continue
-
-                    # Map original indices → compressed log buffer indices using cumsum - GPU op
-                    # valid_positions[i] = position of original index i in the compressed log array
-                    valid_positions = valid_mask.cumsum(dim=0) - 1
-                    rejected_log_indices = valid_positions[rejected_and_valid]
-
-                    # Extract slots and log data - all GPU operations
-                    rejected_slots = draft_slot_indices[rejected_and_valid]
-                    rejected_log_key = entry.log_key_buffer[rejected_log_indices]
-                    rejected_log_value = entry.log_value_buffer[rejected_log_indices]
-
-                    # Convert to int32 for kernel (stays on GPU)
-                    rejected_slots_int32 = rejected_slots.to(dtype=torch.int32)
-
-                    # Get scale buffers using same log indices (no placeholder allocations)
-                    if entry.log_k_scale_buffer is not None:
-                        rejected_k_scale = entry.log_k_scale_buffer[rejected_log_indices]
-                        rejected_v_scale = entry.log_v_scale_buffer[rejected_log_indices]
-                    else:
-                        rejected_k_scale = torch.empty(0, device=device)
-                        rejected_v_scale = torch.empty(0, device=device)
-
-                    # Launch restore kernel
-                    torch.ops._C_cache_ops.restore_rejected_drafts(
-                        rejected_log_key,
-                        rejected_log_value,
-                        entry._key_cache_ref,
-                        entry._value_cache_ref,
-                        rejected_slots_int32,
-                        entry.block_size,
-                        entry.block_stride,
-                        entry.page_stride,
-                        entry.head_stride,
-                        entry.kv_cache_dtype,
-                        rejected_k_scale,
-                        rejected_v_scale,
-                    )
+                torch.ops._C_cache_ops.restore_rejected_drafts(
+                    rejected_log_key,
+                    rejected_log_value,
+                    entry._key_cache_ref,
+                    entry._value_cache_ref,
+                    rejected_slots_int32,
+                    entry.block_size,
+                    entry.block_stride,
+                    entry.page_stride,
+                    entry.head_stride,
+                    entry.kv_cache_dtype,
+                    rejected_k_scale,
+                    rejected_v_scale,
+                )
 
             # Optional sync (ISSUE #6: Make conditional for debugging)
             import os
@@ -545,39 +600,47 @@ class DraftCommitManager:
 
     def _fallback_commit(self, mask: torch.Tensor) -> int:
         """Fallback to vanilla writer with sliced tensors."""
-        accepted_mask_indices = mask.nonzero(as_tuple=False).squeeze(1)
-        num_accepted = accepted_mask_indices.numel()
-        if num_accepted == 0:
+        if self._drafts:
+            device = self._drafts[0]._key_ref.device
+            if mask.dtype != torch.bool:
+                mask = mask.to(dtype=torch.bool)
+            mask = mask.to(device)
+        else:
             return 0
 
-        # FIX (ISSUE #4): Map mask indices to batch positions via _draft_positions
-        # accepted_mask_indices are indices into the mask (draft-only, shape [num_drafts])
-        # We need to map them to batch positions
-        accepted_batch_positions = torch.tensor(
-            [self._draft_positions[i] for i in accepted_mask_indices.tolist()],
-            dtype=torch.long,
-            device=accepted_mask_indices.device
-        )
-
+        total_accepted = 0
         for entry in self._drafts:
-            # Use batch positions instead of mask indices
-            key_accepted = entry._key_ref[accepted_batch_positions]
-            value_accepted = entry._value_ref[accepted_batch_positions]
-            slot_accepted = entry._slot_ref[accepted_batch_positions]
+            if entry.chunk_global_indices is None or entry.chunk_global_indices.numel() == 0:
+                continue
 
-            # reshape_and_cache_flash expects int64
+            chunk_mask = mask[entry.chunk_global_indices]
+            if not chunk_mask.any():
+                continue
+
+            accepted_rows = chunk_mask.nonzero(as_tuple=False).squeeze(1)
+            local_positions = entry.chunk_local_positions.index_select(0, accepted_rows)
+
+            key_accepted = entry._key_ref.index_select(0, local_positions)
+            value_accepted = entry._value_ref.index_select(0, local_positions)
+            slot_accepted = entry._slot_ref.index_select(0, local_positions)
             if slot_accepted.dtype != torch.int64:
                 slot_accepted = slot_accepted.to(dtype=torch.int64)
 
-            # Scale slicing ONLY in fallback
-            k_scale = None
-            v_scale = None
             if entry._k_scale_ref is not None:
-                k_scale = (entry._k_scale_ref[accepted_batch_positions] if entry.scale_is_per_token
-                          else entry._k_scale_ref)
+                if entry.scale_is_per_token:
+                    k_scale = entry._k_scale_ref.index_select(0, local_positions)
+                else:
+                    k_scale = entry._k_scale_ref
+            else:
+                k_scale = None
+
             if entry._v_scale_ref is not None:
-                v_scale = (entry._v_scale_ref[accepted_batch_positions] if entry.scale_is_per_token
-                          else entry._v_scale_ref)
+                if entry.scale_is_per_token:
+                    v_scale = entry._v_scale_ref.index_select(0, local_positions)
+                else:
+                    v_scale = entry._v_scale_ref
+            else:
+                v_scale = None
 
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key_accepted,
@@ -590,7 +653,9 @@ class DraftCommitManager:
                 v_scale,
             )
 
-        return num_accepted
+            total_accepted += int(accepted_rows.numel())
+
+        return total_accepted
 
 
 # Global singleton
