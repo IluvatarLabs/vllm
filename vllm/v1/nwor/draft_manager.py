@@ -146,7 +146,7 @@ class DraftCommitManager:
                 f"Draft position out of bounds: target_idx={target_idx}, "
                 f"logits_len={len(logits_list)}"
             )
-            positions.append(logits_list[next_idx])
+            positions.append(next_idx)
         self._draft_positions.extend(positions)
 
         # Update or create cache entry with new positions
