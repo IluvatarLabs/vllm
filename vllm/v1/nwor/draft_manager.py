@@ -39,7 +39,8 @@ class DraftEntry:
     log_value_buffer: Optional[torch.Tensor] = None
     log_k_scale_buffer: Optional[torch.Tensor] = None  # For per-token FP8 scales
     log_v_scale_buffer: Optional[torch.Tensor] = None
-    draft_slot_indices: Optional[torch.Tensor] = None  # Cache slots we logged
+    draft_slot_indices: Optional[torch.Tensor] = None  # Full array with -1s for commit() masking
+    logged_slots: Optional[torch.Tensor] = None  # Filtered slots actually logged (no -1s)
 
 
 CacheKey = Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]
@@ -271,7 +272,7 @@ class DraftCommitManager:
 
                 # Copy existing cache data to log using CUDA kernel
                 # This kernel will be captured in CUDA graph and replay automatically
-                # Uses layout-aware strides (same as we fixed for restore kernel)
+                # Pass real strides - kernel detects layout via head_stride == head_size
                 torch.ops._C_cache_ops.log_cache_slots(
                     key_cache,
                     value_cache,
@@ -280,9 +281,12 @@ class DraftCommitManager:
                     log_value_buffer,
                     block_size,
                     key_cache.stride(0),  # block_stride
-                    key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),  # page_stride
-                    key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),  # head_stride
+                    key_cache.stride(1),  # page_stride (kernel will detect layout)
+                    key_cache.stride(2),  # head_stride (kernel will detect layout)
                 )
+
+                # Store which slots we actually logged (for clarity in commit())
+                logged_slots = valid_draft_slots
 
                 # Log FP8 scales separately (Python is simpler than kernel for this)
                 if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
@@ -306,8 +310,8 @@ class DraftCommitManager:
             num_tokens=key.shape[0],
             block_size=block_size,
             block_stride=key_cache.stride(0),
-            page_stride=key_cache.stride(2) if layout_id == 1 else key_cache.stride(1),
-            head_stride=key_cache.stride(1) if layout_id == 1 else key_cache.stride(2),
+            page_stride=key_cache.stride(1),  # Pass real stride, kernel detects layout
+            head_stride=key_cache.stride(2),  # Pass real stride, kernel detects layout
             layout_id=layout_id,
             scale_is_per_token=scale_is_per_token,
             kv_cache_dtype=kv_cache_dtype,
@@ -323,7 +327,8 @@ class DraftCommitManager:
             log_value_buffer=log_value_buffer,
             log_k_scale_buffer=log_k_scale_buffer,
             log_v_scale_buffer=log_v_scale_buffer,
-            draft_slot_indices=draft_slot_indices,
+            draft_slot_indices=draft_slot_indices,  # Full array with -1s for commit() masking
+            logged_slots=logged_slots if len(self._draft_positions) > 0 else None,  # Filtered slots actually logged
         ))
 
     def commit(self, mask: torch.Tensor) -> int:

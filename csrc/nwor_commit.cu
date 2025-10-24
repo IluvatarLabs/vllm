@@ -131,7 +131,9 @@ void log_cache_slots(
     int64_t head_size = log_key.size(2);
 
     dim3 grid(static_cast<unsigned int>(num_slots));
-    dim3 block(static_cast<unsigned int>(std::min(num_heads * head_size, static_cast<int64_t>(512))));
+    // Clamp to at least 32 threads to keep warp loops efficient
+    dim3 block(static_cast<unsigned int>(std::max(static_cast<int64_t>(32),
+                                                   std::min(num_heads * head_size, static_cast<int64_t>(512)))));
 
     const at::cuda::OptionalCUDAGuard device_guard(key_cache.device());
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
