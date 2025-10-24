@@ -11,28 +11,20 @@
 #include <torch/extension.h>
 #include <string>
 
+namespace vllm {
+
 // Commit draft KV tensors for one layer based on acceptance mask.
 // This is called once per layer during speculative decoding commit phase.
 //
 // Args:
-//   key_ptr: Pointer to draft key tensor [num_tokens, num_heads, head_size]
-//   value_ptr: Pointer to draft value tensor
-//   key_cache_ptr: Pointer to key cache [layout-dependent, see cache.h]
-//   value_cache_ptr: Pointer to value cache
-//   mask_ptr: Pointer to bool mask [num_tokens] indicating accepted tokens
-//   slot_ptr: Pointer to int32 slot_mapping [num_tokens]
-//   k_scale_ptr: Pointer to quantization scale (0 if None)
-//   v_scale_ptr: Pointer to quantization scale (0 if None)
-//   scale_is_per_token: Whether scales are per-token or scalar
-//   num_tokens: Number of draft tokens
-//   num_heads: Number of attention heads
-//   head_size: Head dimension
-//   block_size: KV cache block size
-//   block_stride: Stride between blocks in cache
-//   page_stride: Stride between pages in cache
-//   head_stride: Stride between heads in cache
-//   layout: CacheLayout enum (0=Flash, 1=Paged)
-//   key_value_dtype: Source tensor dtype ("fp16", "bf16", "fp32")
+//   key: Draft key tensor [num_tokens, num_heads, head_size]
+//   value: Draft value tensor
+//   key_cache: Key cache [layout-dependent, see cache.h]
+//   value_cache: Value cache
+//   mask: Bool mask [num_tokens] indicating accepted tokens
+//   slot_mapping: int32 slot_mapping [num_tokens]
+//   k_scale: Quantization scale (empty if None)
+//   v_scale: Quantization scale (empty if None)
 //   kv_cache_dtype: Cache dtype ("auto", "fp8", or "fp8_e5m2")
 //
 // Returns: void (operates in-place on caches)
@@ -80,3 +72,5 @@ void restore_rejected_drafts(
     torch::Tensor& log_k_scale,
     torch::Tensor& log_v_scale
 );
+
+}  // namespace vllm

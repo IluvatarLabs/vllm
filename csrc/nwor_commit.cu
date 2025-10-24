@@ -353,8 +353,8 @@ __global__ void restore_rejected_drafts_kernel(
 #define CALL_RESTORE_REJECTED_KERNEL(KV_T, CACHE_T, KV_DTYPE)             \
     restore_rejected_drafts_kernel<KV_T, CACHE_T, KV_DTYPE>               \
         <<<grid, block, 0, stream>>>(                                      \
-            reinterpret_cast<KV_T*>(log_key.data_ptr()),                   \
-            reinterpret_cast<KV_T*>(log_value.data_ptr()),                 \
+            reinterpret_cast<const KV_T*>(log_key.data_ptr()),             \
+            reinterpret_cast<const KV_T*>(log_value.data_ptr()),           \
             reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),              \
             reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),            \
             slot_indices.data_ptr<int32_t>(),                              \

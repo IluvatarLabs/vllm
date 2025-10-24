@@ -40,8 +40,7 @@ class DraftEntry:
     # Keep tensors alive
     _key_ref: torch.Tensor
     _value_ref: torch.Tensor
-    _slot_ref: torch.Tensor
-    _slot_ref_original: Optional[torch.Tensor]  # Pre-conversion slot_mapping for replay refresh
+    _slot_ref: torch.Tensor  # Live buffer reference (convert to int32 on-demand)
     _key_cache_ref: torch.Tensor
     _value_cache_ref: torch.Tensor
     _k_scale_ref: Optional[torch.Tensor]
@@ -213,14 +212,7 @@ class DraftCommitManager:
                 self.enabled = False
                 return
 
-        # Store original slot_mapping before conversion (for replay refresh)
-        slot_mapping_original = slot_mapping
-
-        # Ensure int32 contiguous slots
-        if slot_mapping.dtype != torch.int32:
-            slot_mapping = slot_mapping.to(dtype=torch.int32)
-        if not slot_mapping.is_contiguous():
-            slot_mapping = slot_mapping.contiguous()
+        # No pre-conversion - store original and convert on-demand in kernel calls
 
         # Detect layout using num_heads from key tensor
         # Flash: [num_blocks, block_size, num_heads, head_size] - dim 2 is num_heads
@@ -340,8 +332,7 @@ class DraftCommitManager:
             key_value_dtype=key_value_dtype,
             _key_ref=key,
             _value_ref=value,
-            _slot_ref=slot_mapping,
-            _slot_ref_original=slot_mapping_original,
+            _slot_ref=slot_mapping,  # Live buffer, convert to int32 on-demand
             _key_cache_ref=key_cache,
             _value_cache_ref=value_cache,
             _k_scale_ref=k_scale,
@@ -367,21 +358,9 @@ class DraftCommitManager:
             self.cancel()  # Clean up state
             return 0
 
-        # Detect CUDA graph replay: stage_layer() never ran, so _capturing is still False
-        is_replay = not self._capturing
-
-        # On replay, refresh slot mappings from original persistent buffers
-        if is_replay and self._drafts:
-            for entry in self._drafts:
-                if entry._slot_ref_original is not None:
-                    # Copy fresh slot values from persistent buffer to cached converted buffer
-                    # Need to refresh the entire slot_mapping, not just draft positions
-                    if entry._slot_ref_original.dtype == torch.int32 and entry._slot_ref_original.is_contiguous():
-                        # Already int32 and contiguous, direct copy
-                        entry._slot_ref.copy_(entry._slot_ref_original)
-                    else:
-                        # Need conversion, do it inline
-                        entry._slot_ref.copy_(entry._slot_ref_original.to(dtype=torch.int32).contiguous())
+        # No need for replay refresh - _slot_ref points to live buffer
+        # CUDA graph replay automatically refills the buffer at the same address
+        # Our tensor reference sees the new data automatically
 
         try:
             device = self._drafts[0]._key_ref.device
@@ -455,6 +434,9 @@ class DraftCommitManager:
                         rejected_log_value = entry.log_value_buffer[rejected_valid_indices]
                         rejected_slots = valid_draft_slots[rejected_valid_indices]
 
+                        # Convert to int32 for kernel (kernel expects int32)
+                        rejected_slots_int32 = rejected_slots.to(dtype=torch.int32)
+
                         # Get scale buffers if needed
                         k_scale = entry._k_scale_ref if entry._k_scale_ref is not None else torch.empty(0, device=device)
                         v_scale = entry._v_scale_ref if entry._v_scale_ref is not None else torch.empty(0, device=device)
@@ -467,7 +449,7 @@ class DraftCommitManager:
                             rejected_log_value,
                             entry._key_cache_ref,
                             entry._value_cache_ref,
-                            rejected_slots,
+                            rejected_slots_int32,
                             entry.block_size,
                             entry.block_stride,
                             entry.page_stride,
