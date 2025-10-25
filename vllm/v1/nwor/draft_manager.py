@@ -173,13 +173,13 @@ class DraftCommitManager:
         # Update or create cache entry with new positions
         if cached is None:
             self._cache[cache_key] = DraftCacheEntry(
-                positions=list(positions),
+                positions=positions.copy(),
                 drafts=[],
                 num_layers=0,
             )
         else:
             # Update positions for this key
-            cached.positions = list(positions)
+            cached.positions = positions.copy()
 
         self.enabled = True
         return True
@@ -198,8 +198,8 @@ class DraftCommitManager:
             "NWOR requires contiguous 1D slot_mapping views"
         device = slot_mapping.device
         device_index = device.index if device.type == "cuda" else -1
-        chunk_start = int(slot_mapping.storage_offset())
-        chunk_len = int(slot_mapping.shape[0])
+        chunk_start = slot_mapping.storage_offset()
+        chunk_len = slot_mapping.shape[0]
         cache_key = (device_index, chunk_start, chunk_len)
         chunk_slice = self._chunk_slices.get(cache_key)
         if chunk_slice is not None:
@@ -249,18 +249,18 @@ class DraftCommitManager:
                 self._drafts.clear()
             self._capturing = True
 
+            # Validate storage only on first capture (not during CUDA graph replay)
+            for t, n in [(key, "key"), (value, "value"), (key_cache, "key_cache"),
+                         (value_cache, "value_cache"), (slot_mapping, "slot_mapping")]:
+                try:
+                    _ = t.data_ptr()
+                except RuntimeError:
+                    logger.error(f"NWOR: {n} has no storage")
+                    self.enabled = False
+                    return
+
         # Check if we should skip NWOR logging (but still write to cache)
         skip_nwor_logging = False
-
-        # Validate storage
-        for t, n in [(key, "key"), (value, "value"), (key_cache, "key_cache"),
-                     (value_cache, "value_cache"), (slot_mapping, "slot_mapping")]:
-            try:
-                _ = t.data_ptr()
-            except RuntimeError:
-                logger.error(f"NWOR: {n} has no storage")
-                self.enabled = False
-                return
 
         # No pre-conversion - store original and convert on-demand in kernel calls
 
@@ -300,7 +300,7 @@ class DraftCommitManager:
                 current_slots = slot_mapping[chunk_local_positions]
                 valid_mask = current_slots >= 0
                 logged_indices = valid_mask.nonzero(as_tuple=False).squeeze(1)
-                num_logged = int(logged_indices.numel())
+                num_logged = logged_indices.numel()
 
                 max_size = 512  # Match CUDA graph allocation
                 if num_logged > max_size:
@@ -456,24 +456,21 @@ class DraftCommitManager:
             draft_mask = mask.to(device=device, dtype=torch.bool)
 
             if self._emit_metrics:
-                mask_true = int(draft_mask.sum().item())
-                sample_positions = list(self._draft_positions)
-                sample_slots = []
-                for entry in self._drafts:
-                    sample_slots = entry._slot_ref.tolist()
-                    break
-                logger.debug(
-                    "NWOR commit window: drafts=%d mask_true=%d sample_pos=%s sample_slots=%s",
-                    len(self._draft_positions),
-                    mask_true,
-                    sample_positions,
-                    sample_slots,
-                )
+                mask_true = draft_mask.sum().item()
+                # Debug logging - avoid .tolist() GPU sync by limiting to verbose mode only
+                if logger.isEnabledFor(logging.DEBUG):
+                    sample_positions = list(self._draft_positions)
+                    logger.debug(
+                        "NWOR commit window: drafts=%d mask_true=%d sample_pos=%s",
+                        len(self._draft_positions),
+                        mask_true,
+                        sample_positions,
+                    )
 
             # Track draft-only metrics (only if metrics enabled)
             if self._emit_metrics:
                 self._num_draft_tokens = len(self._draft_positions)
-                self._num_draft_accepted = int(draft_mask.sum().item())
+                self._num_draft_accepted = draft_mask.sum().item()
                 self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
 
             # Copy-on-write: Accepted tokens are already in cache from reshape_and_cache_flash.
@@ -553,7 +550,7 @@ class DraftCommitManager:
                 if cached_entry is None:
                     cached_entry = DraftCacheEntry([], [], 0)
                     self._cache[self._cache_key] = cached_entry
-                cached_entry.positions = list(self._draft_positions)
+                cached_entry.positions = self._draft_positions.copy()
                 cached_entry.drafts = [replace(entry) for entry in self._drafts]
                 cached_entry.num_layers = len(self._drafts)
                 # Update fallback to most recent capture
