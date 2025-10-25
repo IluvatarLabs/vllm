@@ -166,7 +166,7 @@ __global__ void restore_rejected_drafts_kernel(
     const scalar_t* __restrict__ log_value,  // [num_rejected, num_heads, head_size]
     cache_t* __restrict__ key_cache,
     cache_t* __restrict__ value_cache,
-    const int32_t* __restrict__ slot_indices,  // [num_rejected] - cache slots to restore
+    const int64_t* __restrict__ slot_indices,  // [num_rejected] - cache slots to restore (int64 to match baseline)
     const float* log_k_scale,  // [num_rejected] or empty
     const float* log_v_scale,  // [num_rejected] or empty
     const bool scale_is_per_token,
@@ -256,7 +256,7 @@ __global__ void restore_rejected_drafts_kernel(
             reinterpret_cast<const KV_T*>(log_value.data_ptr()),           \
             reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),              \
             reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),            \
-            slot_indices.data_ptr<int32_t>(),                              \
+            slot_indices.data_ptr<int64_t>(),                              \
             log_k_scale.numel() > 0 ?                                      \
                 reinterpret_cast<const float*>(log_k_scale.data_ptr()) : nullptr, \
             log_v_scale.numel() > 0 ?                                      \
@@ -281,8 +281,8 @@ void restore_rejected_drafts(
     torch::Tensor& log_v_scale
 ) {
     // Validate inputs
-    TORCH_CHECK(slot_indices.dtype() == torch::kInt32,
-                "slot_indices must have dtype torch.int32");
+    TORCH_CHECK(slot_indices.dtype() == torch::kInt64,
+                "slot_indices must have dtype torch.int64");
     TORCH_CHECK(log_key.device() == log_value.device(),
                 "log_key and log_value must be on the same device");
     TORCH_CHECK(log_key.device() == key_cache.device(),

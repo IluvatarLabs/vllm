@@ -1,5 +1,6 @@
 """Draft Commit Manager for NWOR (greenfield implementation)."""
 
+import logging
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
@@ -178,9 +179,8 @@ class DraftCommitManager:
                 drafts=[],
                 num_layers=0,
             )
-        else:
-            # Update positions for this key
-            cached.positions = positions.copy()
+        # Note: positions are deterministic from cache_key and will be updated
+        # in commit()'s finally block (line ~562), so no update needed here
 
         self.enabled = True
         return True
@@ -461,23 +461,21 @@ class DraftCommitManager:
             # Combine dtype and device conversion in single operation
             draft_mask = mask.to(device=device, dtype=torch.bool)
 
+            # Track draft-only metrics (only if metrics enabled)
             if self._emit_metrics:
-                mask_true = draft_mask.sum().item()
+                self._num_draft_tokens = len(self._draft_positions)
+                self._num_draft_accepted = draft_mask.sum().item()
+                self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
+
                 # Debug logging - avoid .tolist() GPU sync by limiting to verbose mode only
                 if logger.isEnabledFor(logging.DEBUG):
                     sample_positions = list(self._draft_positions)
                     logger.debug(
                         "NWOR commit window: drafts=%d mask_true=%d sample_pos=%s",
                         len(self._draft_positions),
-                        mask_true,
+                        self._num_draft_accepted,  # Reuse computed value
                         sample_positions,
                     )
-
-            # Track draft-only metrics (only if metrics enabled)
-            if self._emit_metrics:
-                self._num_draft_tokens = len(self._draft_positions)
-                self._num_draft_accepted = draft_mask.sum().item()
-                self._num_draft_rejected = self._num_draft_tokens - self._num_draft_accepted
 
             # Copy-on-write: Accepted tokens are already in cache from reshape_and_cache_flash.
             # Only restore rejected drafts from log, using chunk-local metadata.
@@ -499,7 +497,10 @@ class DraftCommitManager:
                     continue
 
                 current_slots = entry._slot_ref.index_select(0, entry.chunk_logged_local)
-                rejected_slots_int32 = current_slots[rejected_rows].to(dtype=torch.int32)
+                rejected_slots = current_slots[rejected_rows]
+                # Ensure int64 for kernel (slot_mapping can be int32 or int64)
+                if rejected_slots.dtype != torch.int64:
+                    rejected_slots = rejected_slots.to(dtype=torch.int64)
 
                 rejected_log_key = entry.log_key_buffer[rejected_rows]
                 rejected_log_value = entry.log_value_buffer[rejected_rows]
@@ -516,7 +517,7 @@ class DraftCommitManager:
                     rejected_log_value,
                     entry._key_cache_ref,
                     entry._value_cache_ref,
-                    rejected_slots_int32,
+                    rejected_slots,
                     entry.block_size,
                     entry.block_stride,
                     entry.page_stride,
