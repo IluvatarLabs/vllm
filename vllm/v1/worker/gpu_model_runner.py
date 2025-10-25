@@ -1621,6 +1621,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
+        layout_key = (
+            tuple(int(x) for x in logits_indices.tolist()),
+            tuple(int(x) for x in target_logits_indices.tolist()),
+            tuple(int(x) for x in num_draft_tokens.tolist()),
+        )
+
         # TODO: Optimize the CPU -> GPU copy.
         cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
             self.device, non_blocking=True
@@ -1647,6 +1653,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            cache_key=layout_key,
         )
         return metadata
 

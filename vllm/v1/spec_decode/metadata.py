@@ -20,6 +20,8 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
+    # Optional cache key for layout reuse
+    cache_key: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
