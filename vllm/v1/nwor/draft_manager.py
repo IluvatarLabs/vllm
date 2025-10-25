@@ -90,12 +90,13 @@ class DraftCommitManager:
         self._cache_key: Optional[CacheKey] = None
         self._capturing = False
         self._fallback_cached_drafts: List[DraftEntry] = []  # Most recent capture's DraftEntries
-        # Copy-on-write log buffers (allocated lazily per layer, persistent across replays)
-        self._log_key_buffers: Dict[int, torch.Tensor] = {}
-        self._log_value_buffers: Dict[int, torch.Tensor] = {}
-        self._log_k_scale_buffers: Dict[int, torch.Tensor] = {}
-        self._log_v_scale_buffers: Dict[int, torch.Tensor] = {}
-        self._slot_indices_buffers: Dict[int, torch.Tensor] = {}  # Persistent slot indices for CUDA graph
+        # Copy-on-write log buffers (allocated lazily per (layer, device), persistent across replays)
+        # Keyed by (layer_idx, device_idx) to support tensor parallelism
+        self._log_key_buffers: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._log_value_buffers: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._log_k_scale_buffers: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._log_v_scale_buffers: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._slot_indices_buffers: Dict[Tuple[int, int], torch.Tensor] = {}  # Persistent slot indices for CUDA graph
         self._chunk_slices: Dict[Tuple[int, int, int], ChunkSlice] = {}
         if self._nwor_enabled:
             logger.info(f"NWOR enabled (VLLM_NWOR_MODE={nwor_mode})")
@@ -282,6 +283,11 @@ class DraftCommitManager:
 
         # Copy-on-write: Log existing cache data at draft slots before we overwrite
         layer_idx = len(self._drafts)  # Current layer index
+        # For tensor parallelism: key buffers by (layer_idx, device_idx)
+        device = key.device
+        device_idx = device.index if device.type == "cuda" else -1
+        buffer_key = (layer_idx, device_idx)
+
         log_key_buffer = None
         log_value_buffer = None
         log_k_scale_buffer = None
@@ -310,26 +316,26 @@ class DraftCommitManager:
                     )
                     skip_nwor_logging = True
                 else:
-                    if layer_idx not in self._log_key_buffers:
-                        self._log_key_buffers[layer_idx] = torch.empty(
+                    if buffer_key not in self._log_key_buffers:
+                        self._log_key_buffers[buffer_key] = torch.empty(
                             (max_size, key.shape[1], key.shape[2]),
                             dtype=key.dtype,
                             device=key.device,
                         )
-                        self._log_value_buffers[layer_idx] = torch.empty(
+                        self._log_value_buffers[buffer_key] = torch.empty(
                             (max_size, value.shape[1], value.shape[2]),
                             dtype=value.dtype,
                             device=value.device,
                         )
-                        self._slot_indices_buffers[layer_idx] = torch.empty(
+                        self._slot_indices_buffers[buffer_key] = torch.empty(
                             max_size, dtype=torch.int64, device=key.device
                         )
                         if scale_is_per_token:
                             assert k_scale is not None and v_scale is not None
-                            self._log_k_scale_buffers[layer_idx] = torch.empty(
+                            self._log_k_scale_buffers[buffer_key] = torch.empty(
                                 max_size, dtype=k_scale.dtype, device=k_scale.device
                             )
-                            self._log_v_scale_buffers[layer_idx] = torch.empty(
+                            self._log_v_scale_buffers[buffer_key] = torch.empty(
                                 max_size, dtype=v_scale.dtype, device=v_scale.device
                             )
 
@@ -338,12 +344,12 @@ class DraftCommitManager:
                         chunk_logged_indices = logged_indices
                         logged_slots = current_slots[logged_indices].to(torch.int64)
 
-                        slot_indices_buffer = self._slot_indices_buffers[layer_idx]
+                        slot_indices_buffer = self._slot_indices_buffers[buffer_key]
                         slot_indices_buffer[:num_logged] = logged_slots
                         logged_slots_buffer = slot_indices_buffer[:num_logged]
 
-                        log_key_buffer = self._log_key_buffers[layer_idx][:num_logged]
-                        log_value_buffer = self._log_value_buffers[layer_idx][:num_logged]
+                        log_key_buffer = self._log_key_buffers[buffer_key][:num_logged]
+                        log_value_buffer = self._log_value_buffers[buffer_key][:num_logged]
 
                         torch.ops._C_cache_ops.log_cache_slots(
                             key_cache,
@@ -360,10 +366,10 @@ class DraftCommitManager:
                             v_scale if v_scale is not None else torch.empty(0, dtype=value.dtype, device=value.device),
                         )
 
-                        if scale_is_per_token and layer_idx in self._log_k_scale_buffers:
+                        if scale_is_per_token and buffer_key in self._log_k_scale_buffers:
                             assert k_scale is not None and v_scale is not None
-                            log_k_scale_buffer = self._log_k_scale_buffers[layer_idx][:num_logged]
-                            log_v_scale_buffer = self._log_v_scale_buffers[layer_idx][:num_logged]
+                            log_k_scale_buffer = self._log_k_scale_buffers[buffer_key][:num_logged]
+                            log_v_scale_buffer = self._log_v_scale_buffers[buffer_key][:num_logged]
                             log_k_scale_buffer[:num_logged] = k_scale[chunk_logged_local]
                             log_v_scale_buffer[:num_logged] = v_scale[chunk_logged_local]
 
