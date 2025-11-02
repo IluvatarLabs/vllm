@@ -616,6 +616,10 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             ",".join(metric_names),
             "--target-processes",
             "all",
+            # Limit profiling to avoid massive output that causes hangs
+            # Skip first 100 launches (warmup), then profile next 50
+            "--launch-skip", "100",
+            "--launch-count", "50",
             "-o",
             str(rep_path),
             sys.executable,
@@ -645,6 +649,11 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
 
 
 def parse_ncu_csv(path: Path, metric_names: list[str]) -> dict[str, float]:
+    """Parse NCU CSV output and sum metrics across all kernel launches.
+
+    NCU --csv outputs one line per kernel launch per metric. We sum all values
+    to get total bandwidth/operations across the profiled kernel launches.
+    """
     metrics: dict[str, float] = {}
     if not path.exists():
         return metrics
@@ -657,7 +666,8 @@ def parse_ncu_csv(path: Path, metric_names: list[str]) -> dict[str, float]:
             name, _unit, value = parts[:3]
             if name in metric_names:
                 try:
-                    metrics[name] = float(value)
+                    # Sum values across multiple kernel launches
+                    metrics[name] = metrics.get(name, 0.0) + float(value)
                 except ValueError:
                     pass
     return metrics
