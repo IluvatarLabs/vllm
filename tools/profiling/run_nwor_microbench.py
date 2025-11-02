@@ -612,8 +612,6 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             ncu_cmd,
             "-f",  # Force overwrite existing report files
             "--csv",
-            "--log-file",
-            str(csv_path),
             "--metrics",
             ",".join(metric_names),
             "--target-processes",
@@ -624,12 +622,21 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             str(script_path),
         ] + args
         try:
-            subprocess.run(cmd, check=True, env=env)
+            # NCU outputs CSV metrics to stdout, so we must capture it
+            result = subprocess.run(cmd, check=True, env=env,
+                                  capture_output=True, text=True)
+            # Write captured CSV output to file
+            csv_path.write_text(result.stdout, encoding="utf-8")
+            # Log any stderr output for debugging
+            if result.stderr:
+                print(f"[INFO] NCU stderr for scv_mode={scv_mode}:\n{result.stderr}")
         except FileNotFoundError as exc:
             print(f"[WARN] {ncu_cmd} not found: {exc}. Skipping NCU collection.")
             return {}
         except subprocess.CalledProcessError as exc:
-            print(f"[WARN] nv-nsight-cu-cli failed for scv_mode={scv_mode}: {exc}")
+            print(f"[WARN] {ncu_cmd} failed for scv_mode={scv_mode}: {exc}")
+            if exc.stderr:
+                print(f"[WARN] stderr: {exc.stderr}")
             continue
 
         metrics = parse_ncu_csv(csv_path, metric_names)
