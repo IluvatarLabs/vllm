@@ -606,8 +606,15 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             profile_only=True,
             override_scv_mode=scv_mode,
         )
-        # Try ncu first (modern CUDA), fallback to nv-nsight-cu-cli (older)
-        ncu_cmd = "ncu" if shutil.which("ncu") else "nv-nsight-cu-cli"
+        # Try ncu in common locations
+        ncu_cmd = None
+        for candidate in ["/usr/local/cuda/bin/ncu", "ncu", "nv-nsight-cu-cli"]:
+            if Path(candidate).exists() or shutil.which(candidate):
+                ncu_cmd = candidate
+                break
+        if not ncu_cmd:
+            print("[WARN] NCU not found. Skipping NCU collection.")
+            return {}
         cmd = [
             ncu_cmd,
             "-f",  # Force overwrite existing report files
@@ -626,20 +633,40 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             str(script_path),
         ] + args
         try:
-            # NCU outputs CSV metrics to stdout, so we must capture it
+            # Step 1: Run NCU profiling to create binary report
+            # Note: --csv doesn't output to stdout with --target-processes all
             result = subprocess.run(cmd, check=True, env=env,
                                   capture_output=True, text=True)
-            # Write captured CSV output to file
-            csv_path.write_text(result.stdout, encoding="utf-8")
-            # Log any stderr output for debugging
             if result.stderr:
-                print(f"[INFO] NCU stderr for scv_mode={scv_mode}:\n{result.stderr}")
+                print(f"[INFO] NCU capture stderr for scv_mode={scv_mode}:\n{result.stderr}")
+
+            # Step 2: Export CSV from binary report
+            # Multi-process profiling requires separate export step
+            if not rep_path.exists():
+                print(f"[WARN] NCU report not created: {rep_path}")
+                continue
+
+            export_cmd = [
+                ncu_cmd,
+                "--import", str(rep_path),
+                "--csv",
+                "--page", "raw",
+            ]
+            export_result = subprocess.run(export_cmd, check=True,
+                                          capture_output=True, text=True)
+
+            # Write exported CSV to file
+            csv_path.write_text(export_result.stdout, encoding="utf-8")
+
+            if not export_result.stdout.strip():
+                print(f"[WARN] NCU export produced empty CSV for scv_mode={scv_mode}")
+
         except FileNotFoundError as exc:
             print(f"[WARN] {ncu_cmd} not found: {exc}. Skipping NCU collection.")
             return {}
         except subprocess.CalledProcessError as exc:
             print(f"[WARN] {ncu_cmd} failed for scv_mode={scv_mode}: {exc}")
-            if exc.stderr:
+            if hasattr(exc, 'stderr') and exc.stderr:
                 print(f"[WARN] stderr: {exc.stderr}")
             continue
 
