@@ -642,24 +642,44 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
 
             # Step 2: Export CSV from binary report
             # Multi-process profiling requires separate export step
+            import time
+            # Wait a moment for file system sync
+            time.sleep(0.5)
+
             if not rep_path.exists():
                 print(f"[WARN] NCU report not created: {rep_path}")
                 continue
 
+            print(f"[INFO] Exporting CSV from NCU report: {rep_path}")
             export_cmd = [
                 ncu_cmd,
                 "--import", str(rep_path),
                 "--csv",
                 "--page", "raw",
             ]
-            export_result = subprocess.run(export_cmd, check=True,
-                                          capture_output=True, text=True)
 
-            # Write exported CSV to file
-            csv_path.write_text(export_result.stdout, encoding="utf-8")
+            try:
+                export_result = subprocess.run(export_cmd, check=False,
+                                              capture_output=True, text=True,
+                                              timeout=300)
 
-            if not export_result.stdout.strip():
-                print(f"[WARN] NCU export produced empty CSV for scv_mode={scv_mode}")
+                if export_result.returncode != 0:
+                    print(f"[WARN] NCU export failed with return code {export_result.returncode}")
+                    print(f"[WARN] stderr: {export_result.stderr}")
+                    continue
+
+                # Write exported CSV to file
+                csv_path.write_text(export_result.stdout, encoding="utf-8")
+
+                if not export_result.stdout.strip():
+                    print(f"[WARN] NCU export produced empty CSV for scv_mode={scv_mode}")
+                else:
+                    lines = len(export_result.stdout.strip().split('\n'))
+                    print(f"[INFO] NCU export successful: {lines} lines written to {csv_path}")
+
+            except subprocess.TimeoutExpired:
+                print(f"[WARN] NCU export timed out after 300 seconds")
+                continue
 
         except FileNotFoundError as exc:
             print(f"[WARN] {ncu_cmd} not found: {exc}. Skipping NCU collection.")
