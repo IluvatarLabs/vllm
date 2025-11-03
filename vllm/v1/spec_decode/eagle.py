@@ -70,9 +70,9 @@ class EagleProposer:
         self.confidence_threshold = self.speculative_config.draft_confidence_threshold
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
-        # Metrics for confidence-based early stopping
-        self.total_tokens_stopped = 0
-        self.total_confidence_checks = 0
+        # Metrics for confidence-based early stopping (keep on GPU to avoid sync)
+        self.tokens_stopped_tensor = torch.tensor(0, dtype=torch.int64, device=device)
+        self.confidence_checks_tensor = torch.tensor(0, dtype=torch.int64, device=device)
 
         logger.info(f"EAGLE confidence threshold: {self.confidence_threshold} "
                    f"(0.0 = disabled, >0.0 = early exit enabled)")
@@ -510,11 +510,11 @@ class EagleProposer:
             confidence = probs.max(dim=-1).values
 
             # Track early stopping metrics before updating mask
+            # Keep counters on GPU to avoid sync in hot loop
             if self.confidence_threshold > 0.0:
                 stopped_this_step = confidence < self.confidence_threshold
-                num_stopped = stopped_this_step.sum().item()
-                self.total_tokens_stopped += num_stopped
-                self.total_confidence_checks += batch_size
+                self.tokens_stopped_tensor += stopped_this_step.sum()
+                self.confidence_checks_tensor += batch_size
 
             self.continue_mask[:batch_size] &= (confidence >= self.confidence_threshold)
             draft_token_ids_list.append(draft_token_ids)
@@ -522,13 +522,15 @@ class EagleProposer:
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
 
-        # Log early stopping statistics periodically
-        if self.confidence_threshold > 0.0 and self.total_confidence_checks > 0:
-            if self.total_confidence_checks % 10000 == 0:  # Log every 10k checks
-                stop_rate = (self.total_tokens_stopped / self.total_confidence_checks) * 100
+        # Log early stopping statistics periodically (sync once here)
+        if self.confidence_threshold > 0.0:
+            total_checks = self.confidence_checks_tensor.item()
+            if total_checks > 0 and total_checks % 10000 < batch_size:  # Just crossed 10k boundary
+                total_stopped = self.tokens_stopped_tensor.item()
+                stop_rate = (total_stopped / total_checks) * 100
                 logger.info(
-                    f"Confidence early exit stats: {self.total_tokens_stopped} tokens stopped "
-                    f"out of {self.total_confidence_checks} checks ({stop_rate:.2f}%)"
+                    f"Confidence early exit stats: {total_stopped} tokens stopped "
+                    f"out of {total_checks} checks ({stop_rate:.2f}%)"
                 )
 
         return draft_token_ids
@@ -536,8 +538,8 @@ class EagleProposer:
     def get_early_exit_stats(self) -> dict[str, int]:
         """Return early exit statistics for metrics tracking."""
         return {
-            "tokens_stopped_by_confidence": self.total_tokens_stopped,
-            "total_confidence_checks": self.total_confidence_checks,
+            "tokens_stopped_by_confidence": self.tokens_stopped_tensor.item(),
+            "total_confidence_checks": self.confidence_checks_tensor.item(),
         }
 
     def prepare_next_token_ids_cpu(
