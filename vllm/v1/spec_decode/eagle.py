@@ -69,6 +69,13 @@ class EagleProposer:
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
         self.confidence_threshold = self.speculative_config.draft_confidence_threshold
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # Metrics for confidence-based early stopping
+        self.total_tokens_stopped = 0
+        self.total_confidence_checks = 0
+
+        logger.info(f"EAGLE confidence threshold: {self.confidence_threshold} "
+                   f"(0.0 = disabled, >0.0 = early exit enabled)")
         self.token_arange_np = np.arange(self.max_num_tokens)
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -501,12 +508,37 @@ class EagleProposer:
             # Compute confidence and update continue mask for early stopping
             probs = logits.softmax(dim=-1, dtype=torch.float32)
             confidence = probs.max(dim=-1).values
+
+            # Track early stopping metrics before updating mask
+            if self.confidence_threshold > 0.0:
+                stopped_this_step = confidence < self.confidence_threshold
+                num_stopped = stopped_this_step.sum().item()
+                self.total_tokens_stopped += num_stopped
+                self.total_confidence_checks += batch_size
+
             self.continue_mask[:batch_size] &= (confidence >= self.confidence_threshold)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+
+        # Log early stopping statistics periodically
+        if self.confidence_threshold > 0.0 and self.total_confidence_checks > 0:
+            if self.total_confidence_checks % 10000 == 0:  # Log every 10k checks
+                stop_rate = (self.total_tokens_stopped / self.total_confidence_checks) * 100
+                logger.info(
+                    f"Confidence early exit stats: {self.total_tokens_stopped} tokens stopped "
+                    f"out of {self.total_confidence_checks} checks ({stop_rate:.2f}%)"
+                )
+
         return draft_token_ids
+
+    def get_early_exit_stats(self) -> dict[str, int]:
+        """Return early exit statistics for metrics tracking."""
+        return {
+            "tokens_stopped_by_confidence": self.total_tokens_stopped,
+            "total_confidence_checks": self.total_confidence_checks,
+        }
 
     def prepare_next_token_ids_cpu(
         self,
