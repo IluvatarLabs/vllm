@@ -3893,41 +3893,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
                 and cudagraph_mode.separate_routine()
             ):
-                max_num_tokens = (
-                    self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
-                )
-                decode_cudagraph_batch_sizes = [
-                    x
-                    for x in self.cudagraph_batch_sizes
-                    if max_num_tokens >= x >= self.min_uniform_decode_query_len
-                ]
-                draft_lengths_for_capture = self.uniform_decode_draft_lengths
-                # Filter batch sizes for compatibility with each draft_length:
-                # 1. Must be exact multiple of (1 + draft_length) for uniform decode
-                # 2. Must not exceed max_num_seqs requests
-                compilation_cases_decode = []
-                for draft_length in draft_lengths_for_capture:
+                compilation_cases_decode: list[tuple[int, bool, int]] = []
+                for draft_length in self.uniform_decode_draft_lengths:
                     max_query_len = 1 + draft_length
-                    max_num_tokens_for_draft = (
+                    max_tokens_for_len = (
                         self.scheduler_config.max_num_seqs * max_query_len
                     )
-
                     valid_num_tokens = [
                         x
-                        for x in decode_cudagraph_batch_sizes
-                        if x % max_query_len == 0 and x <= max_num_tokens_for_draft
+                        for x in self.cudagraph_batch_sizes
+                        if x % max_query_len == 0 and x <= max_tokens_for_len
                     ]
-
+                    if not valid_num_tokens:
+                        continue
                     for num_tokens in reversed(valid_num_tokens):
-                        for lora in lora_cases:
+                        for has_lora in lora_cases:
                             compilation_cases_decode.append(
-                                (num_tokens, lora, draft_length)
+                                (num_tokens, has_lora, draft_length)
                             )
-                self._capture_cudagraphs(
-                    compilation_cases=compilation_cases_decode,
-                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
-                    uniform_decode=True,
-                )
+
+                if compilation_cases_decode:
+                    self._capture_cudagraphs(
+                        compilation_cases=compilation_cases_decode,
+                        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                        uniform_decode=True,
+                    )
 
             torch.cuda.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -4232,12 +4222,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if len(self.uniform_decode_draft_lengths) > 1
             else None
         )
-        for query_len in self.uniform_decode_query_lens:
-            self.cudagraph_dispatcher.initialize_cudagraph_keys(
-                self.compilation_config.cudagraph_mode,
-                query_len,
-                draft_lengths_for_dispatch,
-            )
+        self.cudagraph_dispatcher.initialize_cudagraph_keys(
+            self.compilation_config.cudagraph_mode,
+            draft_lengths_for_dispatch,
+        )
 
     def calculate_reorder_batch_threshold(self) -> None:
         """

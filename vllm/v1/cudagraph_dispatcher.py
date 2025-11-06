@@ -66,7 +66,6 @@ class CudagraphDispatcher:
     def initialize_cudagraph_keys(
         self,
         cudagraph_mode: CUDAGraphMode,
-        uniform_decode_query_len: int,
         draft_lengths: list[int] | None = None,
     ):
         # This should be called only after attention backend is initialized.
@@ -112,27 +111,32 @@ class CudagraphDispatcher:
             cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
             and cudagraph_mode.separate_routine()
         ):
-            max_num_tokens = (
-                uniform_decode_query_len
-                * self.vllm_config.scheduler_config.max_num_seqs
-            )
-            cudagraph_capture_sizes_for_decode = [
-                x
-                for x in self.compilation_config.cudagraph_capture_sizes
-                if x <= max_num_tokens and x >= uniform_decode_query_len
-            ]
-            for bs, has_lora, draft_len in product(
-                cudagraph_capture_sizes_for_decode, lora_cases, draft_cases
-            ):
-                self.add_cudagraph_key(
-                    CUDAGraphMode.FULL,
-                    BatchDescriptor(
-                        num_tokens=bs,
-                        uniform_decode=True,
-                        has_lora=has_lora,
-                        draft_length=draft_len,
-                    ),
+            # For uniform decode, each draft_length has a specific query_len.
+            # Filter batch sizes per draft_length to ensure they are valid
+            # multiples that can be used at runtime.
+            for draft_len in draft_cases:
+                query_len = 1 + draft_len
+                max_num_tokens = (
+                    query_len * self.vllm_config.scheduler_config.max_num_seqs
                 )
+                # Filter batch sizes that:
+                # 1. Are exact multiples of query_len (uniform decode requirement)
+                # 2. Don't exceed max_num_seqs requests
+                valid_batch_sizes = [
+                    x
+                    for x in self.compilation_config.cudagraph_capture_sizes
+                    if x % query_len == 0 and x <= max_num_tokens
+                ]
+                for bs, has_lora in product(valid_batch_sizes, lora_cases):
+                    self.add_cudagraph_key(
+                        CUDAGraphMode.FULL,
+                        BatchDescriptor(
+                            num_tokens=bs,
+                            uniform_decode=True,
+                            has_lora=has_lora,
+                            draft_length=draft_len,
+                        ),
+                    )
         self.keys_initialized = True
 
     def dispatch(
