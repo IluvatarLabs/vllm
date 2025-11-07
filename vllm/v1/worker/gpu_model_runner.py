@@ -2519,10 +2519,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dp_rank = self.parallel_config.data_parallel_rank
             if ubatch_slices:
                 assert num_tokens_across_dp is not None
-                num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+                num_input_tokens_raw = int(num_tokens_across_dp[dp_rank].item())
+                num_input_tokens = self._get_num_input_tokens(
+                    num_input_tokens_raw,
+                    max_query_len=max_query_len if preliminary_uniform_decode else None,
+                )
                 self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
             elif num_tokens_across_dp is not None:
-                num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+                num_input_tokens_raw = int(num_tokens_across_dp[dp_rank].item())
+                num_input_tokens = self._get_num_input_tokens(
+                    num_input_tokens_raw,
+                    max_query_len=max_query_len if preliminary_uniform_decode else None,
+                )
             else:
                 num_input_tokens = self._get_num_input_tokens(
                     scheduler_output.total_num_scheduled_tokens,
