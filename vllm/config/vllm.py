@@ -207,7 +207,7 @@ class VllmConfig:
         self,
         batch_size: int,
         alignment: int | None = None,
-    ) -> int:
+    ) -> int | None:
         # if batch_size > self.compilation_config.max_cudagraph_capture_size,
         # it should raise an IndexError.
         # the caller should make sure the batch_size is within the range,
@@ -228,10 +228,8 @@ class VllmConfig:
             if size % alignment == 0:
                 return size
 
-        raise RuntimeError(
-            "Unable to find cudagraph capture size "
-            f">= {batch_size} that is divisible by alignment {alignment}."
-        )
+        # No aligned capture size found - caller will fall back to eager mode
+        return None
 
     def enable_trace_function_call_for_thread(self) -> None:
         """

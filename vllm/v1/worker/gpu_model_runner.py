@@ -2118,11 +2118,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             and self.cudagraph_batch_sizes
             and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
         ):
-            # Use CUDA graphs.
-            # Add padding to the batch size.
-            return self.vllm_config.pad_for_cudagraph(
+            # Try to use CUDA graphs with alignment if needed.
+            padded_size = self.vllm_config.pad_for_cudagraph(
                 num_scheduled_tokens, alignment=max_query_len
             )
+            if padded_size is not None:
+                return padded_size
+            # No aligned graph available - fall through to eager mode
 
         # Eager mode.
         # Pad tokens to multiple of tensor_parallel_size when
