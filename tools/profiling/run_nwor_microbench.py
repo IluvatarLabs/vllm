@@ -282,10 +282,11 @@ def diff_metrics(
     return diff
 
 
-def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tuple[str, str], dict[str, float]]]:
+def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tuple[str, str], dict[str, float]], dict[tuple[str, str], float]]:
     prompts = pick_prompts(config)
     results: list[dict[str, Any]] = []
     metrics_delta: dict[tuple[str, str], dict[str, float]] = {}
+    peak_memory: dict[tuple[str, str], float] = {}
 
     # Set NWOR environment variables from config
     os.environ["VLLM_NWOR_ADAPTIVE_DRAFT_LENGTH"] = str(config.adaptive_draft_length)
@@ -301,6 +302,10 @@ def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tu
         os.environ["VLLM_SCV_MODE"] = scv_mode or "off"
 
         engine = build_engine(config)
+
+        # Reset peak memory stats after engine initialization
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         prompt_offset = 0
         # Warmup (not recorded)
@@ -324,11 +329,25 @@ def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tu
         delta = diff_metrics(metrics_after, metrics_before)
         metrics_delta[(scv_mode, nwor_label)] = delta
 
+        # Capture peak memory usage across all GPUs
+        if torch.cuda.is_available():
+            if torch.cuda.device_count() > 1:
+                peak_mem_gb = max(
+                    torch.cuda.max_memory_allocated(device=i) / 1024**3
+                    for i in range(torch.cuda.device_count())
+                )
+            else:
+                peak_mem_gb = torch.cuda.max_memory_allocated() / 1024**3
+        else:
+            peak_mem_gb = 0.0
+
+        peak_memory[(scv_mode, nwor_label)] = peak_mem_gb
+
         # Explicitly delete engine to free GPU memory before next iteration
         del engine
         gc.collect()
 
-    return results, metrics_delta
+    return results, metrics_delta, peak_memory
 
 
 def parse_args() -> RunConfig:
@@ -448,6 +467,7 @@ def parse_args() -> RunConfig:
 def summarize_results(
     results: list[dict[str, Any]],
     metrics_delta: dict[tuple[str, str], dict[str, float]],
+    peak_memory: dict[tuple[str, str], float] | None = None,
     ncu_metrics: dict[tuple[str, str], dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     summary: dict[tuple[str, str], dict[str, Any]] = {}
@@ -506,6 +526,7 @@ def summarize_results(
         )
 
         metrics_extra = (ncu_metrics or {}).get((scv_mode, nwor_mode), {})
+        peak_mem_gb = (peak_memory or {}).get((scv_mode, nwor_mode), 0.0)
         summary_output.append(
             {
                 "scv_mode": scv_mode,
@@ -522,6 +543,7 @@ def summarize_results(
                 "spec_num_accepted_tokens": spec_accepted_tokens,
                 "spec_avg_accepted_per_window": avg_acceptance_per_window,
                 "spec_acceptance_ratio": acceptance_ratio,
+                "peak_memory_gb": peak_mem_gb,
                 "ncu_metrics": metrics_extra,
             }
         )
@@ -798,13 +820,13 @@ def main() -> None:
 
     output_json = output_dir / output_base
 
-    results, metrics_delta = run_microbenchmark(config)
+    results, metrics_delta, peak_memory = run_microbenchmark(config)
     ncu_metrics_map: dict[tuple[str, str], dict[str, float]] | None = None
 
     if config.enable_ncu and not config.profile_only:
         ncu_metrics_map = run_ncu_profiles(config, output_json)
 
-    summary = summarize_results(results, metrics_delta, ncu_metrics=ncu_metrics_map)
+    summary = summarize_results(results, metrics_delta, peak_memory=peak_memory, ncu_metrics=ncu_metrics_map)
 
     with output_json.open("w", encoding="utf-8") as f:
         json.dump(

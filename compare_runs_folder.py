@@ -304,7 +304,9 @@ def aggregate_comparison_metrics(seed_data_list: List[Dict]) -> Dict:
     metrics = [
         'exact_match', 'bertscore_f1_mean', 'bertscore_f1_std', 'bertscore_f1_min', 'bertscore_f1_max',
         'cosine_mean', 'cosine_median', 'cosine_std', 'cosine_min',
-        'baseline_quality_mean', 'adaptive_quality_mean', 'quality_pvalue'
+        'baseline_quality_mean', 'adaptive_quality_mean', 'quality_pvalue',
+        'baseline_acceptance_ratio', 'adaptive_acceptance_ratio',
+        'baseline_peak_memory_gb', 'adaptive_peak_memory_gb'
     ]
 
     for metric in metrics:
@@ -381,6 +383,9 @@ def print_aggregate_section(title: str, aggregated_results: List[Dict], comparis
     all_exact = []
     all_f1 = []
     all_cosine = []
+    all_accept = []
+    all_memory_baseline = []
+    all_memory_adaptive = []
 
     for r in valid_results:
         comp = r[comparison_key]
@@ -390,6 +395,12 @@ def print_aggregate_section(title: str, aggregated_results: List[Dict], comparis
             all_f1.append(comp['bertscore_f1_mean']['mean'])
         if 'cosine_mean' in comp:
             all_cosine.append(comp['cosine_mean']['mean'])
+        if 'adaptive_acceptance_ratio' in comp:
+            all_accept.append(comp['adaptive_acceptance_ratio']['mean'] * 100)
+        if 'baseline_peak_memory_gb' in comp:
+            all_memory_baseline.append(comp['baseline_peak_memory_gb']['mean'])
+        if 'adaptive_peak_memory_gb' in comp:
+            all_memory_adaptive.append(comp['adaptive_peak_memory_gb']['mean'])
 
     print(f"\nAggregate Metrics Across All Configurations (N={num_seeds} seeds):")
     if all_exact:
@@ -398,11 +409,15 @@ def print_aggregate_section(title: str, aggregated_results: List[Dict], comparis
         print(f"  BERTScore F1 (average):  {np.mean(all_f1):.4f} ± {np.std(all_f1, ddof=1):.4f}")
     if all_cosine:
         print(f"  Cosine sim (average):    {np.mean(all_cosine):.4f} ± {np.std(all_cosine, ddof=1):.4f}")
+    if all_accept:
+        print(f"  Acceptance rate (avg):   {np.mean(all_accept):.1f}% ± {np.std(all_accept, ddof=1):.1f}%")
+    if all_memory_baseline and all_memory_adaptive:
+        print(f"  Peak memory (avg):       {np.mean(all_memory_baseline):.1f} GB (baseline), {np.mean(all_memory_adaptive):.1f} GB (adaptive)")
 
     # Per-configuration summary table with mean ± std
     print(f"\nPer-Configuration Summary:")
-    print(f"  {'Config':<15} {'Exact%':<18} {'F1':<18} {'Cosine':<18} {'Quality_p':<18} {'N':<3}")
-    print(f"  {'-'*92}")
+    print(f"  {'Config':<15} {'Exact%':<18} {'F1':<18} {'Cosine':<18} {'Accept%':<12} {'Mem(GB)':<12} {'N':<3}")
+    print(f"  {'-'*100}")
 
     for r in valid_results:
         comp = r[comparison_key]
@@ -412,7 +427,9 @@ def print_aggregate_section(title: str, aggregated_results: List[Dict], comparis
         exact = comp.get('exact_match', {})
         f1 = comp.get('bertscore_f1_mean', {})
         cosine = comp.get('cosine_mean', {})
-        quality_p = comp.get('quality_pvalue', {})
+        accept = comp.get('adaptive_acceptance_ratio', {})
+        mem_baseline = comp.get('baseline_peak_memory_gb', {})
+        mem_adaptive = comp.get('adaptive_peak_memory_gb', {})
 
         n = exact.get('n', 0)
         flag = "  ⚠" if n < num_seeds else "   "
@@ -420,9 +437,10 @@ def print_aggregate_section(title: str, aggregated_results: List[Dict], comparis
         exact_str = f"{exact.get('mean', 0)*100:.1f} ± {exact.get('std', 0)*100:.1f}" if 'mean' in exact else "N/A"
         f1_str = f"{f1.get('mean', 0):.4f} ± {f1.get('std', 0):.4f}" if 'mean' in f1 else "N/A"
         cosine_str = f"{cosine.get('mean', 0):.4f} ± {cosine.get('std', 0):.4f}" if 'mean' in cosine else "N/A"
-        quality_str = f"{quality_p.get('mean', 0):.3f} ± {quality_p.get('std', 0):.3f}" if 'mean' in quality_p else "N/A"
+        accept_str = f"{accept.get('mean', 0)*100:.1f}" if 'mean' in accept else "N/A"
+        mem_str = f"{mem_adaptive.get('mean', 0):.1f}" if 'mean' in mem_adaptive else "N/A"
 
-        print(f"  {config:<15} {exact_str:<18} {f1_str:<18} {cosine_str:<18} {quality_str:<18} {n:<3}{flag}")
+        print(f"  {config:<15} {exact_str:<18} {f1_str:<18} {cosine_str:<18} {accept_str:<12} {mem_str:<12} {n:<3}{flag}")
 
     if any(r[comparison_key].get('exact_match', {}).get('n', num_seeds) < num_seeds for r in valid_results):
         print(f"\n  Note: ⚠ indicates fewer than {num_seeds} seeds available for this configuration")

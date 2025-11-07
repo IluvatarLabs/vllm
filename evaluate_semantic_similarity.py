@@ -306,6 +306,32 @@ def compare_two_runs(baseline_json: str, adaptive_json: str,
     baseline_outputs = load_json_outputs(baseline_json)
     adaptive_outputs = load_json_outputs(adaptive_json)
 
+    # Extract memory stats from JSONs
+    baseline_memory = 0.0
+    adaptive_memory = 0.0
+    baseline_acceptance = 0.0
+    adaptive_acceptance = 0.0
+
+    try:
+        with open(baseline_json) as f:
+            baseline_data = json.load(f)
+            if 'summary' in baseline_data and 'per_mode' in baseline_data['summary']:
+                mode_data = baseline_data['summary']['per_mode'][0]
+                baseline_memory = mode_data.get('peak_memory_gb', 0.0)
+                baseline_acceptance = mode_data.get('spec_acceptance_ratio', 0.0)
+    except Exception:
+        pass
+
+    try:
+        with open(adaptive_json) as f:
+            adaptive_data = json.load(f)
+            if 'summary' in adaptive_data and 'per_mode' in adaptive_data['summary']:
+                mode_data = adaptive_data['summary']['per_mode'][0]
+                adaptive_memory = mode_data.get('peak_memory_gb', 0.0)
+                adaptive_acceptance = mode_data.get('spec_acceptance_ratio', 0.0)
+    except Exception:
+        pass
+
     # Handle mismatched lengths
     if len(baseline_outputs) != len(adaptive_outputs):
         if verbose:
@@ -362,6 +388,8 @@ def compare_two_runs(baseline_json: str, adaptive_json: str,
     if verbose:
         print(f"    Quality scores: baseline={baseline_quality_mean:.4f}, "
               f"adaptive={adaptive_quality_mean:.4f} (p={p_value:.4f})")
+        print(f"    Acceptance rate: baseline={baseline_acceptance*100:.1f}%, adaptive={adaptive_acceptance*100:.1f}%")
+        print(f"    Peak memory: baseline={baseline_memory:.2f} GB, adaptive={adaptive_memory:.2f} GB")
 
     # Return all metrics as dict
     return {
@@ -379,6 +407,10 @@ def compare_two_runs(baseline_json: str, adaptive_json: str,
         'baseline_quality_mean': baseline_quality_mean,
         'adaptive_quality_mean': adaptive_quality_mean,
         'quality_pvalue': p_value,
+        'baseline_acceptance_ratio': baseline_acceptance,
+        'adaptive_acceptance_ratio': adaptive_acceptance,
+        'baseline_peak_memory_gb': baseline_memory,
+        'adaptive_peak_memory_gb': adaptive_memory,
         'cosine_distribution': sem_metrics['cosine_distribution'],
         # Raw scores for further analysis
         'bertscore_f1_scores': sem_metrics['bertscore_f1'].tolist(),
