@@ -6,6 +6,34 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 
 
+def compute_valid_cudagraph_sizes(
+    capture_sizes: list[int],
+    query_len: int,
+    max_num_seqs: int,
+) -> list[int]:
+    """
+    Filter CUDA graph capture sizes to only include those compatible with
+    uniform decode batches for a given query_len.
+
+    Args:
+        capture_sizes: List of configured CUDA graph capture sizes
+        query_len: Query length for uniform decode (1 + draft_length)
+        max_num_seqs: Maximum number of sequences per batch
+
+    Returns:
+        List of valid capture sizes that are:
+        1. At least query_len (minimum batch size for one request)
+        2. At most max_num_seqs * query_len (maximum uniform batch)
+        3. Exact multiples of query_len (uniform decode requirement)
+    """
+    max_num_tokens = query_len * max_num_seqs
+    return [
+        size
+        for size in capture_sizes
+        if query_len <= size <= max_num_tokens and size % query_len == 0
+    ]
+
+
 class CudagraphDispatcher:
     """
     Runtime cudagraph dispatcher to dispatch keys for multiple set of
@@ -116,14 +144,11 @@ class CudagraphDispatcher:
             # multiples that can be used at runtime.
             for draft_len in draft_cases:
                 query_len = 1 + draft_len
-                max_num_tokens = (
-                    query_len * self.vllm_config.scheduler_config.max_num_seqs
+                valid_batch_sizes = compute_valid_cudagraph_sizes(
+                    self.compilation_config.cudagraph_capture_sizes,
+                    query_len,
+                    self.vllm_config.scheduler_config.max_num_seqs,
                 )
-                valid_batch_sizes = [
-                    x
-                    for x in self.compilation_config.cudagraph_capture_sizes
-                    if query_len <= x <= max_num_tokens and x % query_len == 0
-                ]
                 if not valid_batch_sizes:
                     continue
                 for bs, has_lora in product(reversed(valid_batch_sizes), lora_cases):

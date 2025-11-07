@@ -90,7 +90,10 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
 )
-from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.cudagraph_dispatcher import (
+    compute_valid_cudagraph_sizes,
+    CudagraphDispatcher,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -2125,6 +2128,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if padded_size is not None:
                 return padded_size
             # No aligned graph available - fall through to eager mode
+            logger.debug(
+                "No aligned CUDA graph for batch_size=%d with alignment=%s. "
+                "Falling back to eager mode for this batch.",
+                num_scheduled_tokens,
+                max_query_len,
+            )
 
         # Eager mode.
         # Pad tokens to multiple of tensor_parallel_size when
@@ -2548,6 +2557,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(
                 scheduler_output, num_input_tokens, intermediate_tensors
+            )
+
+            # Verify that _preprocess didn't modify the token count
+            # (preliminary_uniform_decode relies on this assumption)
+            assert (
+                num_scheduled_tokens == scheduler_output.total_num_scheduled_tokens
+            ), (
+                f"_preprocess modified token count: "
+                f"{scheduler_output.total_num_scheduled_tokens} → {num_scheduled_tokens}"
             )
 
             uniform_decode = (
@@ -3922,15 +3940,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 compilation_cases_decode: list[tuple[int, bool, int]] = []
                 for draft_length in self.uniform_decode_draft_lengths:
                     max_query_len = 1 + draft_length
-                    max_tokens_for_len = (
-                        self.scheduler_config.max_num_seqs * max_query_len
+                    valid_num_tokens = compute_valid_cudagraph_sizes(
+                        self.cudagraph_batch_sizes,
+                        max_query_len,
+                        self.scheduler_config.max_num_seqs,
                     )
-                    valid_num_tokens = [
-                        x
-                        for x in self.cudagraph_batch_sizes
-                        if max_query_len <= x <= max_tokens_for_len
-                        and x % max_query_len == 0
-                    ]
                     if not valid_num_tokens:
                         continue
                     for num_tokens in reversed(valid_num_tokens):
