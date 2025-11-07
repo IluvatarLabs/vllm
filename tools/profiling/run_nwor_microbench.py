@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, List
 
@@ -71,6 +71,35 @@ SCENARIOS = {
         min_chars=1,
         max_chars=None,
     ),
+      "squad": dict(
+      dataset="squad",
+      split="train",
+      fields=["context", "question"],
+      min_chars=200,
+      max_chars=1500,
+    ),
+      "coding": dict(
+      dataset="bigcode/bigcodebench",
+      name="v0.1.4",
+      split="train",
+      fields=["instruct_prompt"],  # Contains natural language instructions
+      min_chars=50,
+      max_chars=1000,
+    ),
+      "alpaca": dict(
+      dataset="tatsu-lab/alpaca",
+      split="train",
+      fields=["instruction", "input"],
+      min_chars=50,
+      max_chars=1000,
+    ),
+    "quora": dict(
+        dataset="quora/questions",
+        split="train",
+        fields=["question1", "question2"],
+        min_chars=50,
+        max_chars=1000,
+    ),
 }
 
 
@@ -95,11 +124,13 @@ class RunConfig:
     scv_modes: List[str]
     adaptive_draft_length: int
     confidence_threshold: float
+    no_speculation: bool
     enable_ncu: bool
     ncu_metrics: str
     enable_nsys: bool
     profile_only: bool
     output_path: str
+    seed: int
 
 
 def pick_prompts(config: RunConfig) -> List[str]:
@@ -145,18 +176,22 @@ def pick_prompts(config: RunConfig) -> List[str]:
 
 
 def build_engine(config: RunConfig) -> LLM:
-    speculative_config = {
-        "method": config.spec_method,
-        "model": config.drafter_model,
-        "num_speculative_tokens": config.draft_tokens,
-    }
     llm_kwargs: dict[str, Any] = {
         "model": config.target_model,
         "tensor_parallel_size": config.tensor_parallel_size,
-        "speculative_config": speculative_config,
         # Enable Prometheus stats so NWOR metrics appear in microbench output.
         "disable_log_stats": False,
     }
+
+    # Only add speculative_config if speculation is enabled
+    if not config.no_speculation:
+        speculative_config = {
+            "method": config.spec_method,
+            "model": config.drafter_model,
+            "num_speculative_tokens": config.draft_tokens,
+        }
+        llm_kwargs["speculative_config"] = speculative_config
+
     if config.max_model_len is not None:
         llm_kwargs["max_model_len"] = config.max_model_len
     return LLM(**llm_kwargs)
@@ -257,7 +292,10 @@ def run_microbenchmark(config: RunConfig) -> tuple[list[dict[str, Any]], dict[tu
     os.environ["VLLM_NWOR_CONFIDENCE_THRESHOLD"] = str(config.confidence_threshold)
 
     # Generate descriptive label for results
-    nwor_label = f"adaptive={config.adaptive_draft_length},threshold={config.confidence_threshold}"
+    if config.no_speculation:
+        nwor_label = "vanilla"
+    else:
+        nwor_label = f"adaptive={config.adaptive_draft_length},threshold={config.confidence_threshold}"
 
     for scv_mode in config.scv_modes:
         os.environ["VLLM_SCV_MODE"] = scv_mode or "off"
@@ -338,6 +376,17 @@ def parse_args() -> RunConfig:
         help="Speculative method to use (default: eagle).",
     )
     parser.add_argument(
+        "--no-speculation",
+        action="store_true",
+        help="Disable speculative decoding entirely (vanilla vLLM, no draft model).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for reproducibility (default: 0).",
+    )
+    parser.add_argument(
         "--enable-ncu",
         action="store_true",
         help="Run an additional pass under Nsight Compute (nv-nsight-cu-cli).",
@@ -386,11 +435,13 @@ def parse_args() -> RunConfig:
         scv_modes=scv_modes or ["off"],
         adaptive_draft_length=args.adaptive_draft_length,
         confidence_threshold=args.confidence_threshold,
+        no_speculation=args.no_speculation,
         enable_ncu=args.enable_ncu,
         ncu_metrics=args.ncu_metrics,
         enable_nsys=args.enable_nsys,
         profile_only=args.profile_only,
         output_path=args.output,
+        seed=args.seed,
     )
 
 
@@ -578,9 +629,13 @@ def config_to_args(
         str(config.confidence_threshold),
         "--scv-modes",
         override_scv_mode or ",".join(config.scv_modes),
+        "--seed",
+        str(config.seed),
         "--output",
         output_path,
     ])
+    if config.no_speculation:
+        args.append("--no-speculation")
     if profile_only:
         args.append("--profile-only")
     return args
@@ -593,7 +648,10 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
     metric_names = [m.strip() for m in config.ncu_metrics.split(",") if m.strip()]
 
     # Generate NWOR label for this configuration
-    nwor_label = f"adaptive={config.adaptive_draft_length},threshold={config.confidence_threshold}"
+    if config.no_speculation:
+        nwor_label = "vanilla"
+    else:
+        nwor_label = f"adaptive={config.adaptive_draft_length},threshold={config.confidence_threshold}"
 
     for scv_mode in config.scv_modes:
         suffix = f".{scv_mode or 'off'}-adaptive{config.adaptive_draft_length}-t{config.confidence_threshold}"
@@ -722,9 +780,26 @@ def parse_ncu_csv(path: Path, metric_names: list[str]) -> dict[str, float]:
 
 def main() -> None:
     config = parse_args()
+
+    # Build output directory structure: sweeps/{target_model}/{dataset}/seed_{seed}/
+    target_name = Path(config.target_model).name
+    model_pair = target_name  # Use target model only, not draft model
+
+    output_dir = Path("sweeps") / model_pair / config.scenario / f"seed_{config.seed}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use specified output filename, or generate simple default
+    if config.output_path != "nwor_microbench.json":
+        output_base = Path(config.output_path).name
+    else:
+        # Simple default (scripts should pass --output for descriptive names)
+        spec_type = "vanilla" if config.no_speculation else f"adaptive{config.adaptive_draft_length}"
+        output_base = f"run_{spec_type}.json"
+
+    output_json = output_dir / output_base
+
     results, metrics_delta = run_microbenchmark(config)
     ncu_metrics_map: dict[tuple[str, str], dict[str, float]] | None = None
-    output_json = Path(config.output_path)
 
     if config.enable_ncu and not config.profile_only:
         ncu_metrics_map = run_ncu_profiles(config, output_json)
