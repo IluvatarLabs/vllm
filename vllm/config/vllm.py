@@ -203,12 +203,35 @@ class VllmConfig:
         ).hexdigest()[:10]
         return hash_str
 
-    def pad_for_cudagraph(self, batch_size: int) -> int:
+    def pad_for_cudagraph(
+        self,
+        batch_size: int,
+        alignment: int | None = None,
+    ) -> int:
         # if batch_size > self.compilation_config.max_cudagraph_capture_size,
         # it should raise an IndexError.
         # the caller should make sure the batch_size is within the range,
         # i.e., batch_size <= self.compilation_config.max_cudagraph_capture_size
-        return self.compilation_config.bs_to_padded_graph_size[batch_size]
+        if alignment is None or alignment <= 1:
+            return self.compilation_config.bs_to_padded_graph_size[batch_size]
+
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        max_size = self.compilation_config.max_cudagraph_capture_size
+        if batch_size > max_size:
+            raise IndexError(
+                f"batch_size {batch_size} exceeds max cudagraph capture size {max_size}"
+            )
+
+        for size in capture_sizes:
+            if size < batch_size:
+                continue
+            if size % alignment == 0:
+                return size
+
+        raise RuntimeError(
+            "Unable to find cudagraph capture size "
+            f">= {batch_size} that is divisible by alignment {alignment}."
+        )
 
     def enable_trace_function_call_for_thread(self) -> None:
         """

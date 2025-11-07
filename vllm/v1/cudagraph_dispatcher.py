@@ -119,15 +119,14 @@ class CudagraphDispatcher:
                 max_num_tokens = (
                     query_len * self.vllm_config.scheduler_config.max_num_seqs
                 )
-                # Filter batch sizes that:
-                # 1. Are exact multiples of query_len (uniform decode requirement)
-                # 2. Don't exceed max_num_seqs requests
                 valid_batch_sizes = [
                     x
                     for x in self.compilation_config.cudagraph_capture_sizes
-                    if x % query_len == 0 and x <= max_num_tokens
+                    if query_len <= x <= max_num_tokens and x % query_len == 0
                 ]
-                for bs, has_lora in product(valid_batch_sizes, lora_cases):
+                if not valid_batch_sizes:
+                    continue
+                for bs, has_lora in product(reversed(valid_batch_sizes), lora_cases):
                     self.add_cudagraph_key(
                         CUDAGraphMode.FULL,
                         BatchDescriptor(
