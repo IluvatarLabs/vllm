@@ -703,10 +703,10 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             ",".join(metric_names),
             "--target-processes",
             "all",
-            # Limit profiling to avoid massive output that causes hangs
-            # Skip first 100 launches (warmup), then profile next 50
-            "--launch-skip", "100",
-            "--launch-count", "50",
+            # Filter to only KV cache write kernels for faster profiling
+            "--kernel-name", "regex:reshape_and_cache.*",
+            "--launch-skip", "5000",   # Skip warmup cache kernels (~4,320)
+            "--launch-count", "2000",  # Profile ~33 measurement requests
             "-o",
             str(rep_path),
             sys.executable,
