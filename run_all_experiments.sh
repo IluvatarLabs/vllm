@@ -8,11 +8,15 @@ set -e
 TARGET_MODEL="${TARGET_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 DRAFT_MODEL="${DRAFT_MODEL:-yuhuili/EAGLE-LLaMA3.1-Instruct-8B}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
+NUM_SEEDS="${NUM_SEEDS:-3}"
+SCENARIO="${SCENARIO:-short}"
 
 # Export for child scripts
 export TARGET_MODEL
 export DRAFT_MODEL
 export TENSOR_PARALLEL_SIZE
+export NUM_SEEDS
+export SCENARIO
 
 # Master log
 MASTER_LOG="sweeps/master_experiment.log"
@@ -29,15 +33,26 @@ log "Configuration:"
 log "  Target Model: ${TARGET_MODEL}"
 log "  Draft Model: ${DRAFT_MODEL}"
 log "  Tensor Parallel Size: ${TENSOR_PARALLEL_SIZE}"
+log "  Scenario: ${SCENARIO}"
+log "  Number of Seeds: ${NUM_SEEDS}"
 log "========================================"
 log ""
 
+# Extract model name for path display
+model_name=$(basename "${TARGET_MODEL}")
+
 # Print time estimates
+# Calculate total hours (using bc for floating point or integer approximation)
+adaptive_hours=$((NUM_SEEDS * 1))
+early_exit_hours=$((NUM_SEEDS * 5 / 2))  # 2.5 hours/seed
+oneoff_hours=$((NUM_SEEDS * 1))
+total_hours=$((adaptive_hours + early_exit_hours + oneoff_hours))
+
 log "Estimated Time:"
-log "  - Adaptive Grid (16 runs):      ~1 hour"
-log "  - Early Exit Grid (7 runs):     ~2.5 hours (NCU enabled)"
-log "  - One-Off Scenarios (4 runs):   ~1 hour"
-log "  - Total:                         ~4.5 hours"
+log "  - Adaptive Grid (22 runs × ${NUM_SEEDS} seeds):      ~${adaptive_hours} hours"
+log "  - Early Exit Grid (7 runs × ${NUM_SEEDS} seeds):     ~${early_exit_hours} hours (NCU enabled)"
+log "  - One-Off Scenarios (4 runs × ${NUM_SEEDS} seeds):   ~${oneoff_hours} hours"
+log "  - Total:                                              ~${total_hours} hours"
 log ""
 
 read -p "Press Enter to start, or Ctrl+C to cancel..."
@@ -83,9 +98,9 @@ log "All Experiments Complete!"
 log "========================================"
 log ""
 log "Results Location:"
-log "  - Adaptive Grid:     sweeps/adaptive_grid/"
-log "  - Early Exit Grid:   sweeps/early_exit_grid/"
-log "  - One-Off Scenarios: sweeps/oneoff_scenarios/"
+log "  - All results: sweeps/${model_name}/${SCENARIO}/seed_*/"
+log "  - Logs:        sweeps/logs/"
+log "  - Master Log:  ${MASTER_LOG}"
 log ""
 log "Next Steps for Analysis:"
 log ""
