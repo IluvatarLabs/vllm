@@ -736,6 +736,7 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
                 "--import", str(rep_path),
                 "--csv",
                 "--page", "raw",
+                "--metrics", ",".join(metric_names),
             ]
 
             try:
