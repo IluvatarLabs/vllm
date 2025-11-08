@@ -257,7 +257,7 @@ def compute_quality_scores(baseline: List[str], adaptive: List[str],
             # Truncate long outputs
             truncated = output[:1000] if len(output) > 1000 else output
             score = reward_model(truncated)[0]['score']
-            baseline_quality.append(score)
+            baseline_quality.append(float(score))
         except Exception:
             baseline_quality.append(0.0)
 
@@ -267,7 +267,7 @@ def compute_quality_scores(baseline: List[str], adaptive: List[str],
         try:
             truncated = output[:1000] if len(output) > 1000 else output
             score = reward_model(truncated)[0]['score']
-            adaptive_quality.append(score)
+            adaptive_quality.append(float(score))
         except Exception:
             adaptive_quality.append(0.0)
 
@@ -395,22 +395,22 @@ def compare_two_runs(baseline_json: str, adaptive_json: str,
     return {
         'config_name': config_name,
         'num_outputs': len(baseline_outputs),
-        'exact_match': exact_match,
-        'bertscore_f1_mean': f1_mean,
-        'bertscore_f1_std': f1_std,
-        'bertscore_f1_min': f1_min,
-        'bertscore_f1_max': f1_max,
-        'cosine_mean': cosine_mean,
-        'cosine_median': cosine_median,
-        'cosine_std': cosine_std,
-        'cosine_min': cosine_min,
-        'baseline_quality_mean': baseline_quality_mean,
-        'adaptive_quality_mean': adaptive_quality_mean,
-        'quality_pvalue': p_value,
-        'baseline_acceptance_ratio': baseline_acceptance,
-        'adaptive_acceptance_ratio': adaptive_acceptance,
-        'baseline_peak_memory_gb': baseline_memory,
-        'adaptive_peak_memory_gb': adaptive_memory,
+        'exact_match': float(exact_match),
+        'bertscore_f1_mean': float(f1_mean),
+        'bertscore_f1_std': float(f1_std),
+        'bertscore_f1_min': float(f1_min),
+        'bertscore_f1_max': float(f1_max),
+        'cosine_mean': float(cosine_mean),
+        'cosine_median': float(cosine_median),
+        'cosine_std': float(cosine_std),
+        'cosine_min': float(cosine_min),
+        'baseline_quality_mean': float(baseline_quality_mean),
+        'adaptive_quality_mean': float(adaptive_quality_mean),
+        'quality_pvalue': float(p_value),
+        'baseline_acceptance_ratio': float(baseline_acceptance),
+        'adaptive_acceptance_ratio': float(adaptive_acceptance),
+        'baseline_peak_memory_gb': float(baseline_memory),
+        'adaptive_peak_memory_gb': float(adaptive_memory),
         'cosine_distribution': sem_metrics['cosine_distribution'],
         # Raw scores for further analysis
         'bertscore_f1_scores': sem_metrics['bertscore_f1'].tolist(),

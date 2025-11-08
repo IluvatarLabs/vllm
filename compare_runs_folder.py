@@ -106,16 +106,44 @@ def load_runs_from_folder(folder: Path) -> List[RunData]:
 
 def group_by_workload(runs: List[RunData]) -> Dict[Tuple, Dict[str, RunData]]:
     """
-    Group runs by workload parameters (requests, tokens, temperature).
+    Group runs by workload parameters with special handling for vanilla.
+
+    Vanilla runs are grouped by (r, t, temp) and attached to ALL spec decode groups
+    with matching (r, t, temp) regardless of draft_tokens.
+
+    Spec decode runs are grouped by (r, t, temp, draft_tokens).
 
     Returns:
-        Dict: {(requests, tokens, temp): {experiment_type: RunData}}
+        Dict: {(requests, tokens, temp, draft): {experiment_type: RunData}}
     """
-    grouped = defaultdict(dict)
+    # Separate vanilla and spec decode runs
+    vanilla_runs = []
+    spec_runs = []
 
     for run in runs:
+        if run.experiment_type == "vanilla":
+            vanilla_runs.append(run)
+        else:
+            spec_runs.append(run)
+
+    # Group vanilla by (r, t, temp) only
+    vanilla_groups = {}
+    for run in vanilla_runs:
         key = (run.requests, run.tokens, run.temperature)
+        vanilla_groups[key] = run  # Keep last one if duplicates
+
+    # Group spec decode by (r, t, temp, draft)
+    grouped = defaultdict(dict)
+    for run in spec_runs:
+        key = (run.requests, run.tokens, run.temperature, run.draft_tokens)
         grouped[key][run.experiment_type] = run
+
+    # Attach vanilla to all matching spec groups
+    for key in grouped.keys():
+        r, t, temp, draft = key
+        vanilla_key = (r, t, temp)
+        if vanilla_key in vanilla_groups:
+            grouped[key]['vanilla'] = vanilla_groups[vanilla_key]
 
     return grouped
 
@@ -140,7 +168,7 @@ def compare_workload_group(workload_key: Tuple, runs: Dict[str, RunData],
     Returns:
         Dict with all comparison results for this workload, or warnings if skipped
     """
-    requests, tokens, temp = workload_key
+    requests, tokens, temp, draft = workload_key
 
     vanilla = runs.get("vanilla")
     adaptive_off = runs.get("adaptive-off")
@@ -151,8 +179,9 @@ def compare_workload_group(workload_key: Tuple, runs: Dict[str, RunData],
             'requests': requests,
             'tokens': tokens,
             'temperature': temp,
+            'draft_tokens': draft,
         },
-        'config_name': f"r{requests}_t{tokens}_d10",
+        'config_name': f"r{requests}_t{tokens}_temp{temp}_d{draft}",
     }
 
     # 1. Direct comparison: adaptive-on vs adaptive-off
@@ -589,8 +618,8 @@ def main():
         # Compare each workload group
         seed_results = []
         for workload_key in sorted(grouped.keys()):
-            requests, tokens, temp = workload_key
-            print(f"\nWorkload: r{requests}_t{tokens}_temp{temp}")
+            requests, tokens, temp, draft = workload_key
+            print(f"\nWorkload: r{requests}_t{tokens}_temp{temp}_d{draft}")
 
             result = compare_workload_group(
                 workload_key,
