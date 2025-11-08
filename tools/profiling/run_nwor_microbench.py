@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import time
+import torch
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,8 +81,7 @@ SCENARIOS = {
     ),
       "coding": dict(
       dataset="bigcode/bigcodebench",
-      name="v0.1.4",
-      split="train",
+      split="v0.1.4",  # BigCodeBench uses versions as splits
       fields=["instruct_prompt"],  # Contains natural language instructions
       min_chars=50,
       max_chars=1000,
