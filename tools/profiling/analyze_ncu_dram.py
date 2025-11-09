@@ -364,35 +364,63 @@ def aggregate_across_seeds(per_seed_runs: Dict[str, List[NCURunData]]) -> Dict[s
 def print_results(aggregated: Dict[str, Dict], num_seeds: int):
     """Print formatted table of results."""
     print("\n" + "="*110)
-    print("NCU DRAM WRITE SAVINGS (Early Exit Grid)")
+    print("RAW METRICS (All Configurations)")
     print("="*110)
 
     print(f"\nAggregate Metrics Across {num_seeds} Seeds:\n")
-    print(f"  {'Config':<35} {'Savings%':<20} {'Total DRAM (MB)':<25} {'Kernels':<15} {'N':<3}")
-    print(f"  {'-'*100}")
+    print(f"  {'Config':<35} {'Total DRAM (MB)':<25} {'Kernels':<15} {'N':<3}")
+    print(f"  {'-'*80}")
 
     for config_key in sorted(aggregated.keys()):
         data = aggregated[config_key]
 
         total = data['total_mb']
-        savings = data['savings_pct']
         kernels = data['num_kernels']
 
         n = total['n']
         flag = "  ⚠" if n < num_seeds else ""
 
-        if savings and savings['n'] > 0:
-            savings_str = f"{savings['mean']:.1f}% ± {savings['std']:.1f}%"
-        else:
-            savings_str = "0.0% (baseline)"
-
         total_str = f"{total['mean']:.1f} ± {total['std']:.1f}"
         kernels_str = f"{int(kernels['mean'])} ± {int(kernels['std'])}"
 
-        print(f"  {config_key:<35} {savings_str:<20} {total_str:<25} {kernels_str:<15} {n:<3}{flag}")
+        print(f"  {config_key:<35} {total_str:<25} {kernels_str:<15} {n:<3}{flag}")
 
     if any(data['total_mb']['n'] < num_seeds for data in aggregated.values()):
         print(f"\n  Note: ⚠ indicates fewer than {num_seeds} seeds available for this configuration")
+
+    print("\n" + "="*110)
+
+
+def print_comparison_results(aggregated: Dict[str, Dict], num_seeds: int):
+    """Print formatted table of DRAM savings comparisons (thresh=X vs thresh=0.0)."""
+    print("\n" + "="*110)
+    print("ON VS OFF COMPARISONS (DRAM Bandwidth Savings)")
+    print("="*110)
+
+    # Only show non-baseline configs (those with savings data)
+    comparisons = {k: v for k, v in aggregated.items() if v['savings_pct'] is not None and v['savings_pct']['n'] > 0}
+
+    if comparisons:
+        print(f"\nEarly Exit Comparisons (thresh=X vs thresh=0.0):\n")
+        print(f"  {'Config':<35} {'DRAM Savings%':<20} {'N':<3}")
+        print(f"  {'-'*60}")
+
+        for config_key in sorted(comparisons.keys()):
+            data = comparisons[config_key]
+            savings = data['savings_pct']
+
+            n = savings['n']
+            flag = "  ⚠" if n < num_seeds else ""
+
+            savings_str = f"{savings['mean']:.1f}% ± {savings['std']:.1f}%"
+
+            print(f"  {config_key:<35} {savings_str:<20} {n:<3}{flag}")
+
+        if any(data['savings_pct']['n'] < num_seeds for data in comparisons.values()):
+            print(f"\n  Note: ⚠ indicates fewer than {num_seeds} seeds available for this comparison")
+            print(f"  Note: DRAM Savings% = bandwidth reduction compared to thresh=0.0 baseline")
+    else:
+        print("\n  ⚠ No comparisons found (need matching baseline thresh=0.0)")
 
     print("\n" + "="*110)
 
@@ -460,6 +488,7 @@ def main():
 
     # Print results
     print_results(aggregated, len(seed_folders))
+    print_comparison_results(aggregated, len(seed_folders))
 
     # Save detailed results
     detailed_output = parent_folder / "ncu_dram_analysis_detailed.json"
