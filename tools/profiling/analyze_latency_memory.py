@@ -23,7 +23,9 @@ from collections import defaultdict
 class RunMetrics:
     """Metrics extracted from a single run."""
     filepath: Path
-    config_key: str  # Unique identifier: "thresh=X_temp=Y" or "adaptive=X_d=Y"
+    config_key: str  # Unique identifier: "r{requests}_t{tokens}_temp{temp}_thresh{thresh}" or "r{requests}_t{tokens}_temp{temp}_adaptive{adaptive}_d{draft}"
+    num_requests: int
+    max_new_tokens: int
     threshold: Optional[float]
     temperature: float
     adaptive: int
@@ -82,24 +84,29 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
 
         mode_data = per_mode[0]  # Take first mode
 
-        # Build config key
+        # Extract full config
+        num_requests = config.get('num_requests', 0)
+        max_new_tokens = config.get('max_new_tokens', 0)
         threshold = config.get('confidence_threshold')
         temperature = config.get('temperature', 0.0)
         adaptive = config.get('adaptive_draft_length', 0)
         draft_tokens = config.get('draft_tokens', 10)
 
+        # Build config key with ALL parameters to avoid grouping different workloads
         # Distinguish between early exit grid and adaptive grid
         if config.get('enable_ncu'):  # Early exit grid
             if threshold is None:
                 print(f"  ⚠ WARNING: Missing threshold in NCU run {json_path.name}")
                 return None
-            config_key = f"thresh={threshold:.1f}_temp={temperature:.1f}"
+            config_key = f"r{num_requests}_t{max_new_tokens}_temp{temperature:.1f}_thresh{threshold:.1f}"
         else:  # Adaptive grid
-            config_key = f"adaptive={adaptive}_d={draft_tokens}_temp={temperature:.1f}"
+            config_key = f"r{num_requests}_t{max_new_tokens}_temp{temperature:.1f}_adaptive{adaptive}_d{draft_tokens}"
 
         return RunMetrics(
             filepath=json_path,
             config_key=config_key,
+            num_requests=num_requests,
+            max_new_tokens=max_new_tokens,
             threshold=threshold,
             temperature=temperature,
             adaptive=adaptive,
@@ -188,6 +195,8 @@ def aggregate_metrics(per_seed_metrics: Dict[str, List[RunMetrics]]) -> Dict[str
             # Store config info (same for all seeds)
             if group['config_info'] is None:
                 group['config_info'] = {
+                    'num_requests': metrics.num_requests,
+                    'max_new_tokens': metrics.max_new_tokens,
                     'threshold': metrics.threshold,
                     'temperature': metrics.temperature,
                     'adaptive': metrics.adaptive,

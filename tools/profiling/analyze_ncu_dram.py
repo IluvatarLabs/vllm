@@ -15,8 +15,25 @@ import re
 import csv
 import numpy as np
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 from collections import defaultdict
+
+
+@dataclass
+class NCURunData:
+    """Data for a single NCU run with config and DRAM stats."""
+    json_path: Path
+    csv_path: Path
+    config_key: str  # "r{requests}_t{tokens}_temp{temp}_thresh{thresh}"
+    num_requests: int
+    max_new_tokens: int
+    temperature: float
+    threshold: float
+    total_mb: float
+    num_kernels: int
+    mean_mb: float
+    std_mb: float
 
 
 def find_seed_folders(parent_folder: Path) -> List[Path]:
@@ -42,12 +59,31 @@ def find_seed_folders(parent_folder: Path) -> List[Path]:
     return seed_folders
 
 
-def extract_threshold_from_filename(filename: str) -> float:
-    """Extract threshold value from CSV filename (e.g., run1_thresh0.5.csv -> 0.5)"""
-    match = re.search(r'thresh([0-9]+(?:\.[0-9]+)?)', filename)
-    if match:
-        return float(match.group(1))
-    return None
+def find_csv_for_json(json_path: Path) -> Optional[Path]:
+    """
+    Find the corresponding CSV file for a JSON metadata file.
+
+    For run1_r36_t128_temp0.0_thresh0.0.json, looks for run1_thresh0.0.csv
+    """
+    # Extract run number from JSON filename
+    match = re.search(r'(run\d+)', json_path.name)
+    if not match:
+        return None
+
+    run_prefix = match.group(1)
+
+    # Look for CSV files with this run prefix and _thresh
+    csv_files = list(json_path.parent.glob(f"{run_prefix}_thresh*.csv"))
+
+    if not csv_files:
+        return None
+
+    if len(csv_files) > 1:
+        # If multiple CSVs, try to match by threshold value
+        # For now, just use the first one and warn
+        print(f"  ⚠ WARNING: Multiple CSV files found for {run_prefix}, using {csv_files[0].name}")
+
+    return csv_files[0]
 
 
 def is_anomalous_run(filename: str, num_kernels: int) -> bool:
@@ -104,128 +140,205 @@ def analyze_csv_dram_writes(csv_path: Path) -> Dict:
         print(f"  ⚠ SKIPPING anomalous run: {csv_path.name} (only {len(dram_writes)} kernels, likely wrong capture window)")
         return None
 
+    # Use nansum/nanmean/nanstd to skip NaN values from NCU profiling errors
+    dram_array = np.array(dram_writes)
+    nan_count = np.isnan(dram_array).sum()
+    if nan_count > 0:
+        print(f"  ⚠ WARNING: {nan_count} NaN values found, skipping them")
+
     return {
-        'total_mb': sum(dram_writes),
+        'total_mb': float(np.nansum(dram_array)),
         'num_kernels': len(dram_writes),
-        'mean_mb': np.mean(dram_writes),
-        'std_mb': np.std(dram_writes, ddof=1) if len(dram_writes) > 1 else 0.0,
+        'mean_mb': float(np.nanmean(dram_array)),
+        'std_mb': float(np.nanstd(dram_array, ddof=1)) if len(dram_writes) > 1 else 0.0,
     }
 
 
-def analyze_seed_folder(seed_folder: Path) -> Dict[float, Dict]:
+def load_ncu_run(json_path: Path) -> Optional[NCURunData]:
     """
-    Analyze all NCU CSV files in a single seed folder.
+    Load a single NCU run from JSON metadata and corresponding CSV.
 
     Returns:
-        Dict mapping threshold -> DRAM stats
+        NCURunData object, or None if load fails or run is anomalous
     """
-    results = {}
+    try:
+        # Load JSON metadata
+        with open(json_path) as f:
+            data = json.load(f)
 
-    csv_files = list(seed_folder.glob("run*_thresh*.csv"))
+        config = data.get('config', {})
 
-    if not csv_files:
-        print(f"  ⚠ WARNING: No CSV files found in {seed_folder.name}")
-        return results
+        # Skip if not an NCU run
+        if not config.get('enable_ncu'):
+            return None
 
-    print(f"\n  Found {len(csv_files)} CSV files:")
+        # Extract config
+        num_requests = config.get('num_requests', 0)
+        max_new_tokens = config.get('max_new_tokens', 0)
+        temperature = config.get('temperature', 0.0)
+        threshold = config.get('confidence_threshold')
 
-    for csv_path in sorted(csv_files):
-        threshold = extract_threshold_from_filename(csv_path.name)
         if threshold is None:
-            print(f"  ⚠ Skipping {csv_path.name}: couldn't extract threshold")
-            continue
+            print(f"  ⚠ WARNING: Missing threshold in {json_path.name}")
+            return None
 
-        print(f"    Processing {csv_path.name}...", end=" ")
+        # Find corresponding CSV
+        csv_path = find_csv_for_json(json_path)
+        if not csv_path:
+            print(f"  ⚠ WARNING: No CSV file found for {json_path.name}")
+            return None
 
-        stats = analyze_csv_dram_writes(csv_path)
-        if stats:
-            results[threshold] = stats
-            print(f"✓ {stats['num_kernels']} kernels, {stats['total_mb']:.1f} MB total")
-        else:
-            print("✗ (skipped)")
+        # Analyze CSV for DRAM stats
+        dram_stats = analyze_csv_dram_writes(csv_path)
+        if not dram_stats:
+            return None
 
-    return results
+        # Build config key
+        config_key = f"r{num_requests}_t{max_new_tokens}_temp{temperature:.1f}_thresh{threshold:.1f}"
+
+        return NCURunData(
+            json_path=json_path,
+            csv_path=csv_path,
+            config_key=config_key,
+            num_requests=num_requests,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            threshold=threshold,
+            total_mb=dram_stats['total_mb'],
+            num_kernels=dram_stats['num_kernels'],
+            mean_mb=dram_stats['mean_mb'],
+            std_mb=dram_stats['std_mb'],
+        )
+
+    except Exception as e:
+        print(f"  ⚠ ERROR: Could not load {json_path.name}: {e}")
+        return None
 
 
-def compute_per_seed_savings(seed_results: Dict[float, Dict]) -> Dict[float, float]:
+def analyze_seed_folder(seed_folder: Path) -> List[NCURunData]:
+    """
+    Analyze all NCU runs in a single seed folder by loading JSON metadata.
+
+    Returns:
+        List of NCURunData objects
+    """
+    runs = []
+
+    # Find all JSON files for NCU runs (run*.json, but exclude .ncu.json files)
+    json_files = [f for f in seed_folder.glob("run*.json") if '.ncu.json' not in f.name]
+
+    if not json_files:
+        print(f"  ⚠ WARNING: No JSON files found in {seed_folder.name}")
+        return runs
+
+    print(f"\n  Found {len(json_files)} JSON files")
+
+    for json_path in sorted(json_files):
+        run_data = load_ncu_run(json_path)
+        if run_data:
+            runs.append(run_data)
+            print(f"    ✓ {json_path.name}: {run_data.config_key} - {run_data.num_kernels} kernels, {run_data.total_mb:.1f} MB total")
+
+    return runs
+
+
+def compute_per_seed_savings(seed_runs: List[NCURunData]) -> Dict[str, float]:
     """
     Compute DRAM savings percentages vs baseline (thresh=0.0) for a single seed.
 
+    Args:
+        seed_runs: List of NCURunData for one seed
+
     Returns:
-        Dict mapping threshold -> savings_pct
+        Dict mapping config_key -> savings_pct
     """
-    if 0.0 not in seed_results:
-        print("  ⚠ WARNING: No baseline (thresh=0.0) found, cannot compute savings")
-        return {}
+    # Group by config to find baselines (thresh=0.0) for each workload
+    baselines = {}  # (requests, tokens, temp) -> baseline_mb
+    savings = {}  # config_key -> savings_pct
 
-    baseline_mb = seed_results[0.0]['total_mb']
+    for run in seed_runs:
+        workload_key = (run.num_requests, run.max_new_tokens, run.temperature)
+        if run.threshold == 0.0:
+            baselines[workload_key] = run.total_mb
 
-    if baseline_mb == 0:
-        print("  ⚠ WARNING: Baseline DRAM write is 0 MB, cannot compute savings percentage")
-        return {}
+    # Compute savings for each run
+    for run in seed_runs:
+        workload_key = (run.num_requests, run.max_new_tokens, run.temperature)
 
-    savings = {}
+        if workload_key not in baselines:
+            continue  # No baseline for this workload
 
-    for threshold, stats in seed_results.items():
-        total_mb = stats['total_mb']
-        savings_pct = ((baseline_mb - total_mb) / baseline_mb) * 100
-        savings[threshold] = savings_pct
+        baseline_mb = baselines[workload_key]
+
+        if baseline_mb == 0:
+            continue  # Can't compute savings
+
+        savings_pct = ((baseline_mb - run.total_mb) / baseline_mb) * 100
+        savings[run.config_key] = savings_pct
 
     return savings
 
 
-def aggregate_across_seeds(per_seed_data: Dict[str, Dict]) -> Dict[float, Dict]:
+def aggregate_across_seeds(per_seed_runs: Dict[str, List[NCURunData]]) -> Dict[str, Dict]:
     """
     Aggregate DRAM statistics across seeds.
 
     Args:
-        per_seed_data: Dict mapping seed_name -> {threshold -> stats}
+        per_seed_runs: Dict mapping seed_name -> List[NCURunData]
 
     Returns:
-        Dict mapping threshold -> aggregated stats with mean ± std
+        Dict mapping config_key -> aggregated stats with mean ± std
     """
-    # Group by threshold
-    threshold_groups = defaultdict(lambda: {
+    # Group by config_key
+    config_groups = defaultdict(lambda: {
         'total_mb_values': [],
         'savings_pct_values': [],
         'num_kernels_values': [],
-        'seed_data': {}
+        'seed_data': {
+            'total_mb': {},
+            'savings_pct': {}
+        },
+        'config_info': None,
     })
 
-    for seed_name, seed_results in per_seed_data.items():
-        savings = compute_per_seed_savings(seed_results)
+    for seed_name, seed_runs in per_seed_runs.items():
+        savings = compute_per_seed_savings(seed_runs)
 
-        for threshold, stats in seed_results.items():
-            group = threshold_groups[threshold]
+        for run in seed_runs:
+            group = config_groups[run.config_key]
 
-            group['total_mb_values'].append(stats['total_mb'])
-            group['num_kernels_values'].append(stats['num_kernels'])
-
-            if threshold in savings:
-                group['savings_pct_values'].append(savings[threshold])
+            group['total_mb_values'].append(run.total_mb)
+            group['num_kernels_values'].append(run.num_kernels)
 
             # Store per-seed data
-            if 'total_mb' not in group['seed_data']:
-                group['seed_data']['total_mb'] = {}
-            if 'savings_pct' not in group['seed_data']:
-                group['seed_data']['savings_pct'] = {}
+            group['seed_data']['total_mb'][seed_name] = run.total_mb
 
-            group['seed_data']['total_mb'][seed_name] = stats['total_mb']
-            if threshold in savings:
-                group['seed_data']['savings_pct'][seed_name] = savings[threshold]
+            if run.config_key in savings:
+                group['savings_pct_values'].append(savings[run.config_key])
+                group['seed_data']['savings_pct'][seed_name] = savings[run.config_key]
+
+            # Store config info (same for all seeds with this config_key)
+            if group['config_info'] is None:
+                group['config_info'] = {
+                    'num_requests': run.num_requests,
+                    'max_new_tokens': run.max_new_tokens,
+                    'temperature': run.temperature,
+                    'threshold': run.threshold,
+                }
 
     # Compute aggregates
     aggregated = {}
 
-    for threshold in sorted(threshold_groups.keys()):
-        group = threshold_groups[threshold]
+    for config_key in sorted(config_groups.keys()):
+        group = config_groups[config_key]
 
         total_mb_vals = group['total_mb_values']
         savings_vals = group['savings_pct_values']
         kernels_vals = group['num_kernels_values']
 
-        aggregated[threshold] = {
-            'threshold': threshold,
+        aggregated[config_key] = {
+            'config_key': config_key,
+            'config_info': group['config_info'],
             'total_mb': {
                 **group['seed_data']['total_mb'],
                 'mean': float(np.mean(total_mb_vals)),
@@ -248,18 +361,18 @@ def aggregate_across_seeds(per_seed_data: Dict[str, Dict]) -> Dict[float, Dict]:
     return aggregated
 
 
-def print_results(aggregated: Dict[float, Dict], num_seeds: int):
+def print_results(aggregated: Dict[str, Dict], num_seeds: int):
     """Print formatted table of results."""
-    print("\n" + "="*90)
+    print("\n" + "="*110)
     print("NCU DRAM WRITE SAVINGS (Early Exit Grid)")
-    print("="*90)
+    print("="*110)
 
     print(f"\nAggregate Metrics Across {num_seeds} Seeds:\n")
-    print(f"  {'Threshold':<12} {'Savings%':<20} {'Total DRAM (MB)':<25} {'Kernels':<15} {'N':<3}")
-    print(f"  {'-'*85}")
+    print(f"  {'Config':<35} {'Savings%':<20} {'Total DRAM (MB)':<25} {'Kernels':<15} {'N':<3}")
+    print(f"  {'-'*100}")
 
-    for threshold in sorted(aggregated.keys()):
-        data = aggregated[threshold]
+    for config_key in sorted(aggregated.keys()):
+        data = aggregated[config_key]
 
         total = data['total_mb']
         savings = data['savings_pct']
@@ -276,12 +389,12 @@ def print_results(aggregated: Dict[float, Dict], num_seeds: int):
         total_str = f"{total['mean']:.1f} ± {total['std']:.1f}"
         kernels_str = f"{int(kernels['mean'])} ± {int(kernels['std'])}"
 
-        print(f"  {threshold:<12.1f} {savings_str:<20} {total_str:<25} {kernels_str:<15} {n:<3}{flag}")
+        print(f"  {config_key:<35} {savings_str:<20} {total_str:<25} {kernels_str:<15} {n:<3}{flag}")
 
     if any(data['total_mb']['n'] < num_seeds for data in aggregated.values()):
-        print(f"\n  Note: ⚠ indicates fewer than {num_seeds} seeds available for this threshold")
+        print(f"\n  Note: ⚠ indicates fewer than {num_seeds} seeds available for this configuration")
 
-    print("\n" + "="*90)
+    print("\n" + "="*110)
 
 
 def main():
@@ -326,11 +439,11 @@ def main():
         print(f"PROCESSING {seed_name}")
         print(f"{'='*90}")
 
-        seed_results = analyze_seed_folder(seed_folder)
+        seed_runs = analyze_seed_folder(seed_folder)
 
-        if seed_results:
-            per_seed_data[seed_name] = seed_results
-            print(f"\n  ✓ Processed {len(seed_results)} thresholds for {seed_name}")
+        if seed_runs:
+            per_seed_data[seed_name] = seed_runs
+            print(f"\n  ✓ Loaded {len(seed_runs)} NCU runs for {seed_name}")
         else:
             print(f"\n  ⚠ No valid data for {seed_name}")
 
@@ -356,10 +469,19 @@ def main():
             'seeds': seed_names,
             'num_seeds': len(seed_folders),
             'per_seed_data': {
-                seed: {str(k): v for k, v in data.items()}
-                for seed, data in per_seed_data.items()
+                seed: [
+                    {
+                        'json_path': str(run.json_path),
+                        'csv_path': str(run.csv_path),
+                        'config_key': run.config_key,
+                        'total_mb': run.total_mb,
+                        'num_kernels': run.num_kernels,
+                    }
+                    for run in runs
+                ]
+                for seed, runs in per_seed_data.items()
             },
-            'aggregated_results': {str(k): v for k, v in aggregated.items()},
+            'aggregated_results': aggregated,
         }, f, indent=2)
 
     print(f"\nDetailed results saved to: {detailed_output}")
@@ -371,7 +493,7 @@ def main():
             'parent_folder': str(parent_folder),
             'seeds': seed_names,
             'num_seeds': len(seed_folders),
-            'aggregated_summary': {str(k): v for k, v in aggregated.items()},
+            'aggregated_summary': aggregated,
         }, f, indent=2)
 
     print(f"Summary results saved to: {summary_output}")
