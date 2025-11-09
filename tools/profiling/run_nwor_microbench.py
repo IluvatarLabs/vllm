@@ -824,7 +824,7 @@ def main() -> None:
     results, metrics_delta, peak_memory = run_microbenchmark(config)
     ncu_metrics_map: dict[tuple[str, str], dict[str, float]] | None = None
 
-    if config.enable_ncu and not config.profile_only:
+    if config.enable_ncu:
         ncu_metrics_map = run_ncu_profiles(config, output_json)
 
     summary = summarize_results(results, metrics_delta, peak_memory=peak_memory, ncu_metrics=ncu_metrics_map)
