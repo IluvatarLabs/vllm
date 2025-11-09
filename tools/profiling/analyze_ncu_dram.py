@@ -44,7 +44,7 @@ def find_seed_folders(parent_folder: Path) -> List[Path]:
 
 def extract_threshold_from_filename(filename: str) -> float:
     """Extract threshold value from CSV filename (e.g., run1_thresh0.5.csv -> 0.5)"""
-    match = re.search(r'thresh([0-9.]+)', filename)
+    match = re.search(r'thresh([0-9]+(?:\.[0-9]+)?)', filename)
     if match:
         return float(match.group(1))
     return None
@@ -74,15 +74,22 @@ def analyze_csv_dram_writes(csv_path: Path) -> Dict:
 
     with open(csv_path, 'r') as f:
         reader = csv.reader(f)
-        header = next(reader)  # Skip header
+        header = next(reader)  # Read header
         next(reader)  # Skip units row
 
+        # Find column index dynamically (CSV reader handles quoted fields correctly)
+        try:
+            write_col_idx = header.index('dram__bytes_write.sum')
+        except ValueError:
+            print(f"  ⚠ ERROR: Column 'dram__bytes_write.sum' not found in {csv_path.name}")
+            return None
+
         for row in reader:
-            if len(row) < 33:
+            if len(row) <= write_col_idx:
                 continue
 
-            # Column 33 is dram__bytes_write.sum (kernel name has commas, shifts columns)
-            write_mb = row[32].strip('"')
+            # Get DRAM write value from the correct column
+            write_mb = row[write_col_idx].strip().strip('"')
             if write_mb:
                 try:
                     dram_writes.append(float(write_mb))
@@ -101,7 +108,7 @@ def analyze_csv_dram_writes(csv_path: Path) -> Dict:
         'total_mb': sum(dram_writes),
         'num_kernels': len(dram_writes),
         'mean_mb': np.mean(dram_writes),
-        'std_mb': np.std(dram_writes),
+        'std_mb': np.std(dram_writes, ddof=1) if len(dram_writes) > 1 else 0.0,
     }
 
 
@@ -152,6 +159,11 @@ def compute_per_seed_savings(seed_results: Dict[float, Dict]) -> Dict[float, flo
         return {}
 
     baseline_mb = seed_results[0.0]['total_mb']
+
+    if baseline_mb == 0:
+        print("  ⚠ WARNING: Baseline DRAM write is 0 MB, cannot compute savings percentage")
+        return {}
+
     savings = {}
 
     for threshold, stats in seed_results.items():

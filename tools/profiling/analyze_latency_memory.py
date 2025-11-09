@@ -73,6 +73,11 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
         # Get per-mode metrics (should only be one mode in early exit runs)
         per_mode = summary.get('per_mode', [])
         if not per_mode:
+            print(f"  ⚠ WARNING: No per_mode data in {json_path.name}")
+            return None
+
+        if len(per_mode) == 0:
+            print(f"  ⚠ WARNING: Empty per_mode array in {json_path.name}")
             return None
 
         mode_data = per_mode[0]  # Take first mode
@@ -85,6 +90,9 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
 
         # Distinguish between early exit grid and adaptive grid
         if config.get('enable_ncu'):  # Early exit grid
+            if threshold is None:
+                print(f"  ⚠ WARNING: Missing threshold in NCU run {json_path.name}")
+                return None
             config_key = f"thresh={threshold:.1f}_temp={temperature:.1f}"
         else:  # Adaptive grid
             config_key = f"adaptive={adaptive}_d={draft_tokens}_temp={temperature:.1f}"

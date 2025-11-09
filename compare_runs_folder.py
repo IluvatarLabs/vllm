@@ -130,12 +130,16 @@ def group_by_workload(runs: List[RunData]) -> Dict[Tuple, Dict[str, RunData]]:
     vanilla_groups = {}
     for run in vanilla_runs:
         key = (run.requests, run.tokens, run.temperature)
+        if key in vanilla_groups:
+            print(f"  ⚠ WARNING: Duplicate vanilla run for r={key[0]}, t={key[1]}, temp={key[2]} - using latest")
         vanilla_groups[key] = run  # Keep last one if duplicates
 
     # Group spec decode by (r, t, temp, draft)
     grouped = defaultdict(dict)
     for run in spec_runs:
         key = (run.requests, run.tokens, run.temperature, run.draft_tokens)
+        if run.experiment_type in grouped[key]:
+            print(f"  ⚠ WARNING: Duplicate {run.experiment_type} run for r={key[0]}, t={key[1]}, temp={key[2]}, d={key[3]} - using latest")
         grouped[key][run.experiment_type] = run
 
     # Attach vanilla to all matching spec groups
@@ -330,6 +334,9 @@ def aggregate_comparison_metrics(seed_data_list: List[Dict]) -> Dict:
     aggregated = {}
 
     # Define metrics to aggregate
+    # NOTE: Includes statistics-of-statistics (bertscore_f1_std, cosine_std, etc.)
+    # These show per-seed variance for reference. Mean-of-stds is included for
+    # completeness but should be interpreted carefully (shows typical within-seed variance).
     metrics = [
         'exact_match', 'bertscore_f1_mean', 'bertscore_f1_std', 'bertscore_f1_min', 'bertscore_f1_max',
         'cosine_mean', 'cosine_median', 'cosine_std', 'cosine_min',
