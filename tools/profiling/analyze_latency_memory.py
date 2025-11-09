@@ -25,6 +25,7 @@ class RunMetrics:
     filepath: Path
     config_key: str  # Unique identifier: "r{requests}_t{tokens}_temp{temp}_thresh{thresh}" or "r{requests}_t{tokens}_temp{temp}_adaptive{adaptive}_d{draft}"
     is_early_exit: bool  # True if enable_ncu (early exit grid), False if adaptive grid
+    is_scenario: bool  # True if one-off scenario run
     num_requests: int
     max_new_tokens: int
     threshold: Optional[float]
@@ -73,6 +74,10 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
         config = data.get('config', {})
         summary = data.get('summary', {})
 
+        # Skip vanilla runs (used only for semantic similarity comparison)
+        if config.get('no_speculation', False):
+            return None
+
         # Get per-mode metrics (should only be one mode in early exit runs)
         per_mode = summary.get('per_mode', [])
         if not per_mode:
@@ -93,10 +98,14 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
         adaptive = config.get('adaptive_draft_length', 0)
         draft_tokens = config.get('draft_tokens', 10)
         is_early_exit = config.get('enable_ncu', False)
+        is_scenario = 'scenario' in json_path.name
 
         # Build config key with ALL parameters to avoid grouping different workloads
-        # Distinguish between early exit grid and adaptive grid
-        if is_early_exit:  # Early exit grid
+        # Distinguish between early exit grid, adaptive grid, and scenarios
+        if is_scenario:
+            # Scenarios use filename as unique identifier
+            config_key = json_path.stem  # e.g., "scenario_a_r24_t64_temp0.0_d10_adaptive1"
+        elif is_early_exit:  # Early exit grid
             if threshold is None:
                 print(f"  ⚠ WARNING: Missing threshold in NCU run {json_path.name}")
                 return None
@@ -108,6 +117,7 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
             filepath=json_path,
             config_key=config_key,
             is_early_exit=is_early_exit,
+            is_scenario=is_scenario,
             num_requests=num_requests,
             max_new_tokens=max_new_tokens,
             threshold=threshold,
@@ -133,7 +143,8 @@ def load_seed_metrics(seed_folder: Path) -> List[RunMetrics]:
     """Load all run metrics from a single seed folder."""
     metrics = []
 
-    json_files = list(seed_folder.glob("run*.json"))
+    # Load both grid runs and one-off scenarios
+    json_files = list(seed_folder.glob("run*.json")) + list(seed_folder.glob("scenario_*.json"))
 
     # Filter out NCU-specific JSONs (e.g., *.ncu.json)
     json_files = [f for f in json_files if '.ncu.json' not in f.name]
