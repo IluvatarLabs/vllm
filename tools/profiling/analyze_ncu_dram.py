@@ -64,16 +64,17 @@ def find_csv_for_json(json_path: Path) -> Optional[Path]:
     Find the corresponding CSV file for a JSON metadata file.
 
     For run1_r36_t128_temp0.0_thresh0.0.json, looks for run1_thresh0.0.csv
+    For scenario_c_r60_t128_temp0.0_d10_adaptive1_thresh0.5.json, looks for scenario_c_thresh0.5.csv
     """
-    # Extract run number from JSON filename
-    match = re.search(r'(run\d+)', json_path.name)
+    # Extract prefix (everything before _r\d+)
+    match = re.search(r'^([^_]+(?:_[^_]+)?)_r\d+', json_path.name)
     if not match:
         return None
 
-    run_prefix = match.group(1)
+    prefix = match.group(1)
 
-    # Look for CSV files with this run prefix and _thresh
-    csv_files = list(json_path.parent.glob(f"{run_prefix}_thresh*.csv"))
+    # Look for CSV files with this prefix and _thresh
+    csv_files = list(json_path.parent.glob(f"{prefix}_thresh*.csv"))
 
     if not csv_files:
         return None
@@ -81,7 +82,7 @@ def find_csv_for_json(json_path: Path) -> Optional[Path]:
     if len(csv_files) > 1:
         # If multiple CSVs, try to match by threshold value
         # For now, just use the first one and warn
-        print(f"  ⚠ WARNING: Multiple CSV files found for {run_prefix}, using {csv_files[0].name}")
+        print(f"  ⚠ WARNING: Multiple CSV files found for {prefix}, using {csv_files[0].name}")
 
     return csv_files[0]
 
@@ -193,8 +194,12 @@ def load_ncu_run(json_path: Path) -> Optional[NCURunData]:
         if not dram_stats:
             return None
 
-        # Build config key
-        config_key = f"r{num_requests}_t{max_new_tokens}_temp{temperature:.1f}_thresh{threshold:.1f}"
+        # Build config key - use filename for scenarios, standard format for grid runs
+        is_scenario = 'scenario' in json_path.name
+        if is_scenario:
+            config_key = json_path.stem  # Use full filename for scenarios
+        else:
+            config_key = f"r{num_requests}_t{max_new_tokens}_temp{temperature:.1f}_thresh{threshold:.1f}"
 
         return NCURunData(
             json_path=json_path,
@@ -224,8 +229,9 @@ def analyze_seed_folder(seed_folder: Path) -> List[NCURunData]:
     """
     runs = []
 
-    # Find all JSON files for NCU runs (run*.json, but exclude .ncu.json files)
-    json_files = [f for f in seed_folder.glob("run*.json") if '.ncu.json' not in f.name]
+    # Find all JSON files (exclude .ncu.json metadata files)
+    # The enable_ncu check in load_ncu_run() filters to only NCU runs
+    json_files = [f for f in seed_folder.glob("*.json") if '.ncu.json' not in f.name]
 
     if not json_files:
         print(f"  ⚠ WARNING: No JSON files found in {seed_folder.name}")
