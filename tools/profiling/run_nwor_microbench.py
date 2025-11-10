@@ -678,7 +678,8 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
     for scv_mode in config.scv_modes:
         suffix = f".{scv_mode or 'off'}-adaptive{config.adaptive_draft_length}-t{config.confidence_threshold}"
         csv_path = output_json.with_suffix(f"{suffix}.ncu.csv")
-        rep_path = output_json.with_suffix(f"{suffix}.ncu")
+        ncu_output_base = output_json.with_suffix(f"{suffix}.ncu")  # What we tell NCU
+        rep_path = output_json.with_suffix(f"{suffix}.ncu.ncu-rep")  # What NCU actually creates
         profile_json = output_json.with_suffix(f"{suffix}.ncu.json")
         args = config_to_args(
             config,
@@ -708,7 +709,7 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             "--launch-skip", "4500",   # Skip all warmup (4,320) with safety margin
             "--launch-count", "2000",  # Capture steady-state measurement phase
             "-o",
-            str(rep_path),
+            str(ncu_output_base),  # NCU will append .ncu-rep to create actual file
             sys.executable,
             str(script_path),
         ] + args

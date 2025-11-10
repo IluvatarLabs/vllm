@@ -51,16 +51,16 @@ def classify_experiment(config: Dict, filename: str) -> Tuple[str, str]:
     Classify experiment into (category, experiment_type).
 
     Categories:
-        - "adaptive": Adaptive draft length experiments (threshold=0.0)
-        - "early_exit": Early exit experiments (adaptive=0, threshold>0)
+        - "adaptive": Adaptive draft length experiments (enable_ncu=false)
+        - "early_exit": Early exit experiments (enable_ncu=true)
         - "vanilla": No speculation baseline
         - "oneoff": One-off scenarios (EXCLUDED from analysis)
 
     Experiment types:
         - "vanilla": No speculation
-        - "adaptive-off": adaptive=0, threshold=0.0
-        - "adaptive-on": adaptive=1, threshold=0.0
-        - "thresh{X}": adaptive=0, threshold=X (e.g., "thresh0.3")
+        - "adaptive-off": adaptive=0, threshold=0.0, enable_ncu=false
+        - "adaptive-on": adaptive=1, threshold=0.0, enable_ncu=false
+        - "thresh{X}": adaptive=0, threshold=X, enable_ncu=true (e.g., "thresh0.0", "thresh0.3")
 
     Returns:
         (category, experiment_type)
@@ -71,6 +71,7 @@ def classify_experiment(config: Dict, filename: str) -> Tuple[str, str]:
     no_spec = config.get('no_speculation', False)
     adaptive = config.get('adaptive_draft_length', 0)
     threshold = config.get('confidence_threshold', 0.0)
+    enable_ncu = config.get('enable_ncu', False)
 
     # ONE-OFF SCENARIOS: Excluded from semantic similarity analysis
     if Path(filename).name.startswith('scenario_'):
@@ -80,8 +81,17 @@ def classify_experiment(config: Dict, filename: str) -> Tuple[str, str]:
     if no_spec:
         return "vanilla", "vanilla"
 
-    # ADAPTIVE SET: threshold=0.0, adaptive varies
-    if threshold == 0.0:
+    # EARLY EXIT SET: enable_ncu=True (includes thresh=0.0 baseline)
+    # Must check BEFORE adaptive set to avoid misclassification
+    if enable_ncu:
+        if adaptive == 0:
+            return "early_exit", f"thresh{threshold}"
+        else:
+            # Hybrid mode in one-offs (adaptive=1, enable_ncu=true)
+            return "oneoff", "hybrid"
+
+    # ADAPTIVE SET: enable_ncu=False, threshold=0.0, adaptive varies
+    if threshold == 0.0 and not enable_ncu:
         if adaptive == 1:
             return "adaptive", "adaptive-on"
         elif adaptive == 0:
@@ -89,16 +99,8 @@ def classify_experiment(config: Dict, filename: str) -> Tuple[str, str]:
         else:
             raise ValueError(f"Invalid adaptive value: {adaptive}")
 
-    # EARLY EXIT SET: adaptive=0, threshold>0
-    if adaptive == 0 and threshold > 0.0:
-        return "early_exit", f"thresh{threshold}"
-
-    # HYBRID: adaptive=1 and threshold>0 (should only exist in one-offs)
-    if adaptive == 1 and threshold > 0.0:
-        return "oneoff", "hybrid"
-
     raise ValueError(
-        f"Unknown experiment type: adaptive={adaptive}, threshold={threshold}, no_spec={no_spec}, file={filename}"
+        f"Unknown experiment type: adaptive={adaptive}, threshold={threshold}, enable_ncu={enable_ncu}, no_spec={no_spec}, file={filename}"
     )
 
 

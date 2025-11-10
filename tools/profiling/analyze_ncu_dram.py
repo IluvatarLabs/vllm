@@ -63,26 +63,25 @@ def find_csv_for_json(json_path: Path) -> Optional[Path]:
     """
     Find the corresponding CSV file for a JSON metadata file.
 
-    For run1_r36_t128_temp0.0_thresh0.0.json, looks for run1_thresh0.0.csv
-    For scenario_c_r60_t128_temp0.0_d10_adaptive1_thresh0.5.json, looks for scenario_c_thresh0.5.csv
+    For run1_r36_t128_temp0.0_thresh0.0.json,
+    looks for run1_r36_t128_temp0.0_thresh0.0.off-adaptive0-t0.0.csv
+
+    NCU CSVs are named: {json_stem}.off-adaptive{A}-t{T}.csv
     """
-    # Extract prefix (everything before _r\d+)
-    match = re.search(r'^([^_]+(?:_[^_]+)?)_r\d+', json_path.name)
-    if not match:
-        return None
+    # Get JSON stem (filename without .json)
+    json_stem = json_path.stem
 
-    prefix = match.group(1)
-
-    # Look for CSV files with this prefix and _thresh
-    csv_files = list(json_path.parent.glob(f"{prefix}_thresh*.csv"))
+    # Look for CSV files that start with the JSON stem
+    # Pattern: {json_stem}*.csv (handles .off-adaptive*-t*.csv suffix)
+    csv_files = list(json_path.parent.glob(f"{json_stem}*.csv"))
 
     if not csv_files:
         return None
 
     if len(csv_files) > 1:
-        # If multiple CSVs, try to match by threshold value
-        # For now, just use the first one and warn
-        print(f"  ⚠ WARNING: Multiple CSV files found for {prefix}, using {csv_files[0].name}")
+        # Multiple CSVs may exist for different scv_modes (off, stage, etc.)
+        # For now, just use the first one
+        print(f"  ⚠ WARNING: Multiple CSV files found for {json_stem}, using {csv_files[0].name}")
 
     return csv_files[0]
 
