@@ -27,6 +27,9 @@ class SpecDecodingStats:
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+    # Global acceptance rate tracking for adaptive draft length
+    acceptance_rate_ewma: float = 0.5  # Bootstrap at 50%
+    num_requests_tracked: int = 0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -36,12 +39,70 @@ class SpecDecodingStats:
         )
 
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
+        """Observe a single draft for logging purposes.
+
+        Note: This does NOT update acceptance_rate_ewma. The EWMA should be
+        updated at batch level using update_acceptance_ewma() to avoid
+        applying exponential decay multiple times per batch.
+        """
         self.num_drafts += 1
         self.num_draft_tokens += num_draft_tokens
         self.num_accepted_tokens += num_accepted_tokens
         assert num_accepted_tokens <= self.num_spec_tokens
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
+
+    def update_acceptance_ewma(self, batch_acceptance_rate: float, batch_count: int):
+        """Update acceptance EWMA with batch-level acceptance rate.
+
+        This should be called once per batch after observing all drafts.
+
+        Args:
+            batch_acceptance_rate: Mean acceptance rate for the batch
+            batch_count: Number of requests in the batch
+        """
+        # Use alpha=0.1 for smoothing (90% history, 10% current)
+        self.acceptance_rate_ewma = (
+            0.9 * self.acceptance_rate_ewma + 0.1 * batch_acceptance_rate
+        )
+        self.num_requests_tracked += batch_count
+
+    def compute_optimal_draft_length(
+        self, draft_length_options: list[int]
+    ) -> int:
+        """Compute optimal draft length based on acceptance rate.
+
+        Uses threshold-based selection:
+        - High acceptance (>0.7): Use longest draft length
+        - Medium acceptance (0.5-0.7): Use medium draft length
+        - Low acceptance (0.3-0.5): Use shorter draft length
+        - Very low acceptance (<0.3): Use shortest draft length
+
+        Args:
+            draft_length_options: Sorted list of available draft lengths
+
+        Returns:
+            Optimal draft length for current acceptance rate
+        """
+        if not draft_length_options:
+            return self.num_spec_tokens
+
+        # Sort to ensure consistent ordering
+        sorted_options = sorted(draft_length_options)
+
+        # Threshold-based selection
+        if self.acceptance_rate_ewma > 0.7:
+            return sorted_options[-1]  # Longest
+        elif self.acceptance_rate_ewma > 0.5:
+            # Medium: use middle option
+            mid_idx = len(sorted_options) // 2
+            return sorted_options[mid_idx]
+        elif self.acceptance_rate_ewma > 0.3:
+            # Short: use second option if available
+            idx = min(1, len(sorted_options) - 1)
+            return sorted_options[idx]
+        else:
+            return sorted_options[0]  # Shortest
 
 
 class SpecDecodingLogging:
