@@ -1,7 +1,7 @@
 #!/bin/bash
-# Experiment Grid 2: Confidence Early Exit (Token Savings Focus)
-# Tests confidence-based early exit by tracking tokens stopped
-# Total: 8 runs × NUM_SEEDS (different thresholds and temperatures × seeds)
+# Experiment Grid 2: Confidence Early Exit (Bandwidth Focus)
+# Tests confidence-based early exit with NCU bandwidth profiling
+# Total: 7 runs × NUM_SEEDS (different thresholds and workloads × seeds)
 
 set -e
 
@@ -41,7 +41,6 @@ run_benchmark() {
     # For early exit, we always use adaptive=0, threshold varies
     local output_file="run${run_id}_r${requests}_t${tokens}_temp${temp}_thresh${threshold}.json"
     local expected_output="sweeps/${model_pair}/${SCENARIO}/seed_${seed}/${output_file}"
-    local run_log="sweeps/${model_pair}/${SCENARIO}/seed_${seed}/run${run_id}.log"
 
     # Skip if already completed
     if [ -f "${expected_output}" ]; then
@@ -49,7 +48,8 @@ run_benchmark() {
         return 0
     fi
 
-    log "START: Seed ${seed}, Run ${run_id}/8 - ${desc}, threshold=${threshold}"
+    log "START: Seed ${seed}, Run ${run_id}/7 - ${desc}, threshold=${threshold}"
+    log "  [NCU PROFILING ENABLED - This will take ~20-30 minutes]"
 
     if python3 tools/profiling/run_nwor_microbench.py \
         --target-model "${TARGET_MODEL}" \
@@ -70,7 +70,9 @@ run_benchmark() {
         --adaptive-draft-length 0 \
         --confidence-threshold "${threshold}" \
         --seed "${seed}" \
-        --output "${output_file}" 2>&1 | tee "${run_log}"; then
+        --enable-ncu \
+        --ncu-metrics "dram__bytes_write.sum,dram__bytes_read.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,l1tex__t_bytes.sum" \
+        --output "${output_file}" 2>&1 | tee -a "${LOG_FILE}"; then
         log "COMPLETE: Seed ${seed}, Run ${run_id} (${desc}, threshold=${threshold})"
 
         # Extract and log key metrics
@@ -78,40 +80,6 @@ run_benchmark() {
             local dram_writes=$(grep -o '"dram__bytes_write.sum": [0-9.e+]*' "${expected_output}" | head -1 | grep -o '[0-9.e+]*$' || echo "N/A")
             log "  -> DRAM writes: ${dram_writes} bytes"
         fi
-
-        # Extract early exit stats from THIS run's log (get LAST occurrence = cumulative final count)
-        if [ "${threshold}" != "0.0" ]; then
-            local stats_line=$(grep "Confidence early exit stats:" "${run_log}" | tail -1 || true)
-
-            if [ -n "$stats_line" ]; then
-                local tokens_stopped=$(echo "$stats_line" | sed -n 's/.*Confidence early exit stats: \([0-9]*\) tokens stopped.*/\1/p')
-                local total_checks=$(echo "$stats_line" | sed -n 's/.*out of \([0-9]*\) checks.*/\1/p')
-
-                if [ -n "$tokens_stopped" ] && [ -n "$total_checks" ]; then
-                    # Add to JSON (log stats are cumulative: warmup + measurement)
-                    python3 -c "
-import json, sys
-with open('${expected_output}', 'r') as f:
-    data = json.load(f)
-
-# Add early exit metrics
-data['summary']['per_mode'][0]['tokens_stopped_by_confidence'] = int('${tokens_stopped}')
-data['summary']['per_mode'][0]['total_confidence_checks'] = int('${total_checks}')
-
-with open('${expected_output}', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-                    if [ $? -eq 0 ]; then
-                        log "  -> Tokens stopped: ${tokens_stopped} / ${total_checks}"
-                    else
-                        log "  -> WARNING: Failed to add tokens_stopped to JSON"
-                    fi
-                fi
-            fi
-        fi
-
-        # Append run log to master log
-        cat "${run_log}" >> "${LOG_FILE}"
     else
         log "ERROR: Seed ${seed}, Run ${run_id} (${desc}, threshold=${threshold}) failed"
         return 1
@@ -127,16 +95,14 @@ log "Draft Model: ${DRAFT_MODEL}"
 log "Tensor Parallel Size: ${TENSOR_PARALLEL_SIZE}"
 log "Scenario: ${SCENARIO}"
 log "Number of Seeds: ${NUM_SEEDS}"
-log "Total Runs: $((8 * NUM_SEEDS))"
+log "Total Runs: $((4 * NUM_SEEDS))"
 log "Output Directory: sweeps/"
-log "Token Tracking: ENABLED (via log parsing)"
+log "NCU Profiling: ENABLED"
 log "========================================"
 log ""
-log "Grid: 2 temperatures × 4 thresholds = 8 runs per seed"
-log "  - temp=0.0: thresh=[0.0, 0.3, 0.5, 0.7]"
-log "  - temp=0.7: thresh=[0.0, 0.3, 0.5, 0.7]"
-log "Total estimated time per seed: ~30-40 minutes"
-log "Total estimated time: ~$((2 * NUM_SEEDS)) hours"
+log "WARNING: Each run takes longer with full NCU capture (no skip/count limits)"
+log "Total estimated time per seed: 2-4 hours (depending on kernel count)"
+log "Total estimated time: $((3 * NUM_SEEDS)) hours"
 log ""
 
 # Run experiments with multiple seeds
@@ -157,17 +123,14 @@ for seed in $(seq 0 $((NUM_SEEDS - 1))); do
     # Run 4: Aggressive threshold
     run_benchmark "${seed}" 4 "Aggressive threshold" 36 128 0.0 0.7 || true
 
-    # Run 5: Creative baseline (temp=0.7)
-    run_benchmark "${seed}" 5 "Creative baseline" 36 128 0.7 0.0 || true
+    # Run 5: Creative baseline (DISABLED - temp=0.7 runs are inconsistent)
+    # run_benchmark "${seed}" 5 "Creative baseline" 36 128 0.7 0.0 || true
 
-    # Run 6: Creative + conservative threshold
-    run_benchmark "${seed}" 6 "Creative + conservative" 36 128 0.7 0.3 || true
+    # Run 6: Creative + early exit (DISABLED - temp=0.7 runs are inconsistent)
+    # run_benchmark "${seed}" 6 "Creative + early exit" 36 128 0.7 0.5 || true
 
-    # Run 7: Creative + moderate threshold
-    run_benchmark "${seed}" 7 "Creative + moderate" 36 128 0.7 0.5 || true
-
-    # Run 8: Creative + aggressive threshold
-    run_benchmark "${seed}" 8 "Creative + aggressive" 36 128 0.7 0.7 || true
+    # Run 7: Long sequence (DISABLED - no baseline for t=256)
+    # run_benchmark "${seed}" 7 "Long sequence" 36 256 0.0 0.5 || true
 
     log "Completed seed ${seed}/${NUM_SEEDS}"
     log ""
@@ -180,12 +143,13 @@ log "Results: sweeps/"
 log "========================================"
 log ""
 log "Key results to check:"
-log "  - Baseline (thresh=0.0) vs Early Exit (thresh=0.3/0.5/0.7)"
-log "  - tokens_stopped_by_confidence / total_confidence_checks = stop rate"
+log "  - Run 1 (baseline) vs Run 2/3/4 (thresholds 0.3/0.5/0.7)"
+log "  - Post-process CSVs to filter steady-state (middle 50% of kernels)"
+log "  - Compare dram__bytes_write.sum (bandwidth savings)"
 log "  - Compare latency_avg_s (overhead cost)"
-log "  - Both temp=0.0 (deterministic) and temp=0.7 (creative)"
+log "  - Check instrumentation logs for tokens_stopped count"
 log ""
 log "Next steps:"
-log "  1. Analyze tokens saved across thresholds"
-log "  2. Calculate percentage of draft tokens stopped"
-log "  3. Evaluate latency vs bandwidth savings tradeoff"
+log "  1. Compare DRAM writes across thresholds"
+log "  2. Calculate bandwidth savings percentage"
+log "  3. Evaluate if savings justify latency cost"

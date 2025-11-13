@@ -55,8 +55,8 @@ log "  - One-Off Scenarios (4 runs × ${NUM_SEEDS} seeds):   ~${oneoff_hours} ho
 log "  - Total:                                              ~${total_hours} hours"
 log ""
 
-read -p "Press Enter to start, or Ctrl+C to cancel..."
-log ""
+# read -p "Press Enter to start, or Ctrl+C to cancel..."
+# log ""
 
 # Phase 1: Adaptive Draft Length Grid
 log "========================================"

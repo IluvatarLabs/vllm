@@ -706,8 +706,8 @@ def run_ncu_profiles(config: RunConfig, output_json: Path) -> dict[tuple[str, st
             "all",
             # Filter to only KV cache write kernels for faster profiling
             "--kernel-name", "regex:reshape_and_cache.*",
-            "--launch-skip", "4500",   # Skip all warmup (4,320) with safety margin
-            "--launch-count", "2000",  # Capture steady-state measurement phase
+            # "--launch-skip", "4500",   # Skip all warmup (4,320) with safety margin
+            # "--launch-count", "2000",  # Capture steady-state measurement phase
             "-o",
             str(ncu_output_base),  # NCU will append .ncu-rep to create actual file
             sys.executable,

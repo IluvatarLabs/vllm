@@ -97,7 +97,8 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
         temperature = config.get('temperature', 0.0)
         adaptive = config.get('adaptive_draft_length', 0)
         draft_tokens = config.get('draft_tokens', 10)
-        is_early_exit = config.get('enable_ncu', False)
+        # Detect early exit runs by filename pattern (more reliable than config flags)
+        is_early_exit = 'thresh' in json_path.name
         is_scenario = 'scenario' in json_path.name
 
         # Build config key with ALL parameters to avoid grouping different workloads
@@ -107,7 +108,7 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
             config_key = json_path.stem  # e.g., "scenario_a_r24_t64_temp0.0_d10_adaptive1"
         elif is_early_exit:  # Early exit grid
             if threshold is None:
-                print(f"  ⚠ WARNING: Missing threshold in NCU run {json_path.name}")
+                print(f"  ⚠ WARNING: Missing threshold in early exit run {json_path.name}")
                 return None
             config_key = f"r{num_requests}_t{max_new_tokens}_temp{temperature:.1f}_thresh{threshold:.1f}"
         else:  # Adaptive grid
@@ -141,8 +142,6 @@ def load_run_metrics(json_path: Path) -> Optional[RunMetrics]:
 
 def load_seed_metrics(seed_folder: Path) -> List[RunMetrics]:
     """Load all run metrics from a single seed folder."""
-    metrics = []
-
     # Load both grid runs and one-off scenarios
     json_files = list(seed_folder.glob("run*.json")) + list(seed_folder.glob("scenario_*.json"))
 
@@ -151,14 +150,30 @@ def load_seed_metrics(seed_folder: Path) -> List[RunMetrics]:
 
     if not json_files:
         print(f"  ⚠ WARNING: No JSON files found in {seed_folder.name}")
-        return metrics
+        return []
 
     print(f"\n  Found {len(json_files)} JSON files")
+
+    # Use dict to deduplicate by config_key (keeps last occurrence)
+    metrics_dict = {}
 
     for json_path in sorted(json_files):
         run_metrics = load_run_metrics(json_path)
         if run_metrics:
-            metrics.append(run_metrics)
+            # Check for duplicates
+            if run_metrics.config_key in metrics_dict:
+                prev_file = metrics_dict[run_metrics.config_key].filepath.name
+                print(f"  ⚠ WARNING: Duplicate config {run_metrics.config_key}")
+                print(f"    Previous: {prev_file}")
+                print(f"    Current:  {json_path.name}")
+                print(f"    → Keeping current (last occurrence)")
+
+            metrics_dict[run_metrics.config_key] = run_metrics
+
+    metrics = list(metrics_dict.values())
+
+    if len(metrics) < len(json_files):
+        print(f"  → Deduplicated: {len(json_files)} files → {len(metrics)} unique configs")
 
     return metrics
 

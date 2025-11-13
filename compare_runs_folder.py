@@ -81,17 +81,27 @@ def classify_experiment(config: Dict, filename: str) -> Tuple[str, str]:
     if no_spec:
         return "vanilla", "vanilla"
 
-    # EARLY EXIT SET: enable_ncu=True (includes thresh=0.0 baseline)
+    # EARLY EXIT SET: Detect by filename pattern (thresh in filename)
     # Must check BEFORE adaptive set to avoid misclassification
-    if enable_ncu:
+    if 'thresh' in Path(filename).name:
         if adaptive == 0:
             return "early_exit", f"thresh{threshold}"
         else:
-            # Hybrid mode in one-offs (adaptive=1, enable_ncu=true)
+            # Hybrid mode (adaptive=1, with threshold)
             return "oneoff", "hybrid"
 
-    # ADAPTIVE SET: enable_ncu=False, threshold=0.0, adaptive varies
-    if threshold == 0.0 and not enable_ncu:
+    # ORIGINAL LOGIC (COMMENTED OUT - enable_ncu not reliable):
+    # # EARLY EXIT SET: enable_ncu=True (includes thresh=0.0 baseline)
+    # # Must check BEFORE adaptive set to avoid misclassification
+    # if enable_ncu:
+    #     if adaptive == 0:
+    #         return "early_exit", f"thresh{threshold}"
+    #     else:
+    #         # Hybrid mode in one-offs (adaptive=1, enable_ncu=true)
+    #         return "oneoff", "hybrid"
+
+    # ADAPTIVE SET: No threshold in filename, threshold=0.0, adaptive varies
+    if threshold == 0.0 and 'thresh' not in Path(filename).name:
         if adaptive == 1:
             return "adaptive", "adaptive-on"
         elif adaptive == 0:

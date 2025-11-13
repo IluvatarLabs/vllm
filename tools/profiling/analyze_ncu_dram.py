@@ -90,11 +90,11 @@ def is_anomalous_run(filename: str, num_kernels: int) -> bool:
     """
     Check if this is an anomalous run to skip.
 
-    Anomalous runs have only ~2000 kernels (run4_thresh0.7, run7_thresh0.5_t256)
-    due to different NCU capture window (larger batch sizes).
+    NCU is configured with --launch-count 2000, so we expect ~2000 kernels.
+    Early exit may reduce this count, so allow down to ~100 kernels minimum.
     """
-    # Skip if kernel count is suspiciously low
-    if num_kernels < 5000:
+    # Skip if kernel count is suspiciously low (< 100 means severe capture failure)
+    if num_kernels < 100:
         return True
     return False
 
@@ -124,11 +124,12 @@ def analyze_csv_dram_writes(csv_path: Path) -> Dict:
             if len(row) <= write_col_idx:
                 continue
 
-            # Get DRAM write value from the correct column
-            write_mb = row[write_col_idx].strip().strip('"')
-            if write_mb:
+            # Get DRAM write value from the correct column (in Kbyte)
+            write_kb = row[write_col_idx].strip().strip('"')
+            if write_kb:
                 try:
-                    dram_writes.append(float(write_mb))
+                    # Convert Kbyte -> MB
+                    dram_writes.append(float(write_kb) / 1024.0)
                 except ValueError:
                     continue
 
@@ -251,6 +252,8 @@ def compute_per_seed_savings(seed_runs: List[NCURunData]) -> Dict[str, float]:
     """
     Compute DRAM savings percentages vs baseline (thresh=0.0) for a single seed.
 
+    Uses MEAN MB per kernel to account for different capture window sizes.
+
     Args:
         seed_runs: List of NCURunData for one seed
 
@@ -258,13 +261,13 @@ def compute_per_seed_savings(seed_runs: List[NCURunData]) -> Dict[str, float]:
         Dict mapping config_key -> savings_pct
     """
     # Group by config to find baselines (thresh=0.0) for each workload
-    baselines = {}  # (requests, tokens, temp) -> baseline_mb
+    baselines = {}  # (requests, tokens, temp) -> baseline_mean_mb
     savings = {}  # config_key -> savings_pct
 
     for run in seed_runs:
         workload_key = (run.num_requests, run.max_new_tokens, run.temperature)
         if run.threshold == 0.0:
-            baselines[workload_key] = run.total_mb
+            baselines[workload_key] = run.mean_mb
 
     # Compute savings for each run
     for run in seed_runs:
@@ -273,12 +276,12 @@ def compute_per_seed_savings(seed_runs: List[NCURunData]) -> Dict[str, float]:
         if workload_key not in baselines:
             continue  # No baseline for this workload
 
-        baseline_mb = baselines[workload_key]
+        baseline_mean_mb = baselines[workload_key]
 
-        if baseline_mb == 0:
+        if baseline_mean_mb == 0:
             continue  # Can't compute savings
 
-        savings_pct = ((baseline_mb - run.total_mb) / baseline_mb) * 100
+        savings_pct = ((baseline_mean_mb - run.mean_mb) / baseline_mean_mb) * 100
         savings[run.config_key] = savings_pct
 
     return savings
