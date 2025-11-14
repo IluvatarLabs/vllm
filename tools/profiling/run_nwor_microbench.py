@@ -131,6 +131,7 @@ class RunConfig:
     profile_only: bool
     output_path: str
     seed: int
+    gpu_memory_utilization: float
 
 
 def pick_prompts(config: RunConfig) -> List[str]:
@@ -179,6 +180,7 @@ def build_engine(config: RunConfig) -> LLM:
     llm_kwargs: dict[str, Any] = {
         "model": config.target_model,
         "tensor_parallel_size": config.tensor_parallel_size,
+        "gpu_memory_utilization": config.gpu_memory_utilization,
         # Enable Prometheus stats so NWOR metrics appear in microbench output.
         "disable_log_stats": False,
     }
@@ -406,6 +408,12 @@ def parse_args() -> RunConfig:
         help="Random seed for reproducibility (default: 0).",
     )
     parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="Fraction of GPU memory to use for model weights and KV cache (default: 0.9).",
+    )
+    parser.add_argument(
         "--enable-ncu",
         action="store_true",
         help="Run an additional pass under Nsight Compute (nv-nsight-cu-cli).",
@@ -461,6 +469,7 @@ def parse_args() -> RunConfig:
         profile_only=args.profile_only,
         output_path=args.output,
         seed=args.seed,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
 
