@@ -404,6 +404,9 @@ class EagleProposer:
         # Initialize continue mask for confidence-based early stopping
         self.continue_mask[:batch_size] = True
         for token_index in range(draft_length - 1):
+            # Snapshot which requests are still emitting draft tokens before this
+            # iteration mutates the continue mask.
+            active_mask = self.continue_mask[:batch_size]
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -438,9 +441,13 @@ class EagleProposer:
                 exceeds_max_model_len = positions >= self.max_model_len
                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
-            # Increment the sequence lengths.
-            common_attn_metadata.seq_lens += 1
-            common_attn_metadata.seq_lens_cpu += 1
+            # Increment sequence lengths only for active requests so metadata stays
+            # consistent with actual KV writes (inactive ones are masked out).
+            length_increments = active_mask.to(common_attn_metadata.seq_lens.dtype)
+            common_attn_metadata.seq_lens += length_increments
+            common_attn_metadata.seq_lens_cpu += active_mask.cpu().to(
+                common_attn_metadata.seq_lens_cpu.dtype
+            )
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
 
