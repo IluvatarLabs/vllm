@@ -376,6 +376,7 @@ class GPUModelRunner(
             self.rejection_sampler = RejectionSampler(self.sampler)
             # Initialize spec decoding stats for adaptive draft length
             from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
             self.spec_decoding_stats = SpecDecodingStats.new(
                 self.speculative_config.num_speculative_tokens
             )
@@ -2403,7 +2404,9 @@ class GPUModelRunner(
                             batch_count += 1
                     # Update EWMA once with batch-level acceptance rate
                     if batch_count > 0 and batch_total_drafts > 0:
-                        batch_acceptance_rate = batch_total_accepted / batch_total_drafts
+                        batch_acceptance_rate = (
+                            batch_total_accepted / batch_total_drafts
+                        )
                         self.spec_decoding_stats.update_acceptance_ewma(
                             batch_acceptance_rate, batch_count
                         )
